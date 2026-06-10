@@ -420,6 +420,9 @@ impl XmlParser {
             self.handle_menu_item(tag);
         } else if tag.starts_with("<LaunchURL ") {
             self.handle_launch_url(tag, elements);
+        } else if tag.starts_with("<indicator ") {
+            // Handle status indicators: <indicator id='IconBLEEDING' visible='y'/>
+            self.handle_indicator(tag, elements);
         }
         // Handle inventory tags - need to discard content between <inv> and </inv>
         else if tag.starts_with("<inv ") {
@@ -597,7 +600,7 @@ impl XmlParser {
                     }
                 }
             }
-            // Handle Icon* status indicators
+            // Handle Icon* status indicators (via dialogData - legacy format)
             if id.starts_with("Icon") {
                 let status = id.strip_prefix("Icon").unwrap_or(&id).to_lowercase();
                 if let Some(value) = Self::extract_attribute(tag, "value") {
@@ -789,6 +792,29 @@ impl XmlParser {
         if let Some(value_str) = Self::extract_attribute(tag, "value") {
             if let Ok(value) = value_str.parse::<u32>() {
                 elements.push(ParsedElement::CastTime { value });
+            }
+        }
+    }
+
+    fn handle_indicator(&mut self, tag: &str, elements: &mut Vec<ParsedElement>) {
+        // <indicator id='IconBLEEDING' visible='y'/>
+        // <indicator id='IconSTUNNED' visible='n'/>
+        if let Some(id) = Self::extract_attribute(tag, "id") {
+            // Strip "Icon" prefix and lowercase for status name
+            if id.starts_with("Icon") {
+                let status = id.strip_prefix("Icon").unwrap_or(&id).to_lowercase();
+
+                // Check for visible attribute (y/n)
+                let active = if let Some(visible) = Self::extract_attribute(tag, "visible") {
+                    visible == "y"
+                } else {
+                    // Fallback: check value attribute
+                    Self::extract_attribute(tag, "value")
+                        .map(|v| v == "1" || v == "active")
+                        .unwrap_or(false)
+                };
+
+                elements.push(ParsedElement::StatusIndicator { id: status, active });
             }
         }
     }
