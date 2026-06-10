@@ -1232,6 +1232,7 @@ impl TextWindow {
         selection_state: Option<&crate::selection::SelectionState>,
         selection_bg_color: &str,
         window_index: usize,
+        focused_border_color: &str,
     ) {
         // Clear the area to prevent bleed-through from windows behind
         Clear.render(area, buf);
@@ -1369,15 +1370,18 @@ impl TextWindow {
 
         // Apply border color
         let mut border_style = Style::default();
-        if let Some(ref color_hex) = self.border_color {
+        if focused {
+            // Use global focused border color when focused
+            if let Some(color) = Self::parse_hex_color(focused_border_color) {
+                border_style = border_style.fg(color).add_modifier(Modifier::BOLD);
+            } else {
+                border_style = border_style.fg(Color::Yellow).add_modifier(Modifier::BOLD);
+            }
+        } else if let Some(ref color_hex) = self.border_color {
+            // Use window's border color when not focused
             if let Some(color) = Self::parse_hex_color(color_hex) {
                 border_style = border_style.fg(color);
             }
-        }
-
-        // Override with focus color if focused
-        if focused {
-            border_style = border_style.fg(Color::Yellow).add_modifier(Modifier::BOLD);
         }
 
         if self.show_border {
@@ -1467,6 +1471,6 @@ impl TextWindow {
 impl Widget for &mut TextWindow {
     fn render(self, area: Rect, buf: &mut Buffer) {
         // No selection highlighting for basic Widget trait render
-        self.render_with_focus(area, buf, false, None, "#4a4a4a", 0);
+        self.render_with_focus(area, buf, false, None, "#4a4a4a", 0, "#ffff00");
     }
 }

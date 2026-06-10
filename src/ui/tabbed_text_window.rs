@@ -362,23 +362,26 @@ impl TabbedTextWindow {
     }
 
     /// Render the tab bar
-    fn render_tab_bar(&self, area: Rect, buf: &mut Buffer) {
+    fn render_tab_bar(&self, area: Rect, buf: &mut Buffer, focused_border_color: &str) {
         let tab_titles: Vec<Line> = self
             .tabs
             .iter()
             .enumerate()
             .map(|(idx, tab)| {
                 if idx == self.active_tab_index {
-                    // Active tab: bold + highlight color
-                    let color = self
-                        .tab_active_color
-                        .as_ref()
-                        .and_then(|c| Self::parse_color(c))
-                        .unwrap_or(Color::Yellow);
+                    // Active tab: use focused border color (or tab_active_color as fallback)
+                    let color = if let Some(color) = Self::parse_color(focused_border_color) {
+                        color
+                    } else {
+                        self.tab_active_color
+                            .as_ref()
+                            .and_then(|c| Self::parse_color(c))
+                            .unwrap_or(Color::Yellow)
+                    };
 
                     Line::from(Span::styled(
                         tab.name.clone(),
-                        Style::default().fg(color).add_modifier(Modifier::BOLD),
+                        Style::default().fg(color),
                     ))
                 } else if tab.has_unread {
                     // Inactive with unread: indicator prefix + color
@@ -408,8 +411,15 @@ impl TabbedTextWindow {
             })
             .collect();
 
+        // Use focused border color for selected tab highlight (bold, no background)
+        let highlight_color = Self::parse_color(focused_border_color).unwrap_or(Color::Yellow);
+        let highlight_style = Style::default()
+            .fg(highlight_color)
+            .add_modifier(Modifier::BOLD);
+
         let tabs_widget = Tabs::new(tab_titles)
             .select(self.active_tab_index)
+            .highlight_style(highlight_style)
             .divider("|");
 
         tabs_widget.render(area, buf);
@@ -431,6 +441,7 @@ impl TabbedTextWindow {
         selection_state: Option<&crate::selection::SelectionState>,
         selection_bg_color: &str,
         window_index: usize,
+        focused_border_color: &str,
     ) {
         // Create border block
         let mut block = Block::default();
@@ -457,18 +468,21 @@ impl TabbedTextWindow {
             }
 
             // Apply border color
-            if let Some(color_str) = &self.border_color {
+            let border_style = if focused {
+                // Use global focused border color when focused
+                let color = Self::parse_color(focused_border_color).unwrap_or(Color::Yellow);
+                Style::default().fg(color).add_modifier(Modifier::BOLD)
+            } else if let Some(color_str) = &self.border_color {
+                // Use window's border color when not focused
                 if let Some(color) = Self::parse_color(color_str) {
-                    let border_style = if focused {
-                        Style::default().fg(color).add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default().fg(color)
-                    };
-                    block = block.border_style(border_style);
+                    Style::default().fg(color)
+                } else {
+                    Style::default()
                 }
-            } else if focused {
-                block = block.border_style(Style::default().add_modifier(Modifier::BOLD));
-            }
+            } else {
+                Style::default()
+            };
+            block = block.border_style(border_style);
 
             // Only set title when borders are shown
             block = block.title(self.title.clone());
@@ -530,11 +544,11 @@ impl TabbedTextWindow {
         }
 
         // Render tab bar
-        self.render_tab_bar(tab_bar_area, buf);
+        self.render_tab_bar(tab_bar_area, buf, focused_border_color);
 
         // Render active tab's content
         if let Some(tab) = self.tabs.get_mut(self.active_tab_index) {
-            tab.window.render_with_focus(content_area, buf, focused, selection_state, selection_bg_color, window_index);
+            tab.window.render_with_focus(content_area, buf, focused, selection_state, selection_bg_color, window_index, focused_border_color);
         }
     }
 

@@ -38,10 +38,11 @@ impl Widget {
         selection_state: Option<&crate::selection::SelectionState>,
         selection_bg_color: &str,
         window_index: usize,
+        focused_border_color: &str,
     ) {
         match self {
-            Widget::Text(w) => w.render_with_focus(area, buf, focused, selection_state, selection_bg_color, window_index),
-            Widget::Tabbed(w) => w.render_with_focus(area, buf, focused, selection_state, selection_bg_color, window_index),
+            Widget::Text(w) => w.render_with_focus(area, buf, focused, selection_state, selection_bg_color, window_index, focused_border_color),
+            Widget::Tabbed(w) => w.render_with_focus(area, buf, focused, selection_state, selection_bg_color, window_index, focused_border_color),
             Widget::Progress(w) => w.render_with_focus(area, buf, focused),
             Widget::Countdown(w) => w.render_with_focus(area, buf, focused, server_time_offset),
             Widget::Indicator(w) => w.render_with_focus(area, buf, focused),
@@ -708,6 +709,9 @@ impl WindowManager {
                     hands.set_border_sides(config.border_sides.clone());
                     hands.set_background_color(config.background_color.clone());
                     hands.set_text_color(config.text_color.clone());
+                    // Set highlights
+                    let highlights_vec: Vec<_> = highlights.values().cloned().collect();
+                    hands.set_highlights(highlights_vec);
                     Widget::Hands(hands)
                 }
                 "lefthand" => {
@@ -723,6 +727,9 @@ impl WindowManager {
                     }
                     hand.set_background_color(config.background_color.clone());
                     hand.set_text_color(config.text_color.clone());
+                    // Set highlights
+                    let highlights_vec: Vec<_> = highlights.values().cloned().collect();
+                    hand.set_highlights(highlights_vec);
                     Widget::Hand(hand)
                 }
                 "righthand" => {
@@ -738,6 +745,9 @@ impl WindowManager {
                     }
                     hand.set_background_color(config.background_color.clone());
                     hand.set_text_color(config.text_color.clone());
+                    // Set highlights
+                    let highlights_vec: Vec<_> = highlights.values().cloned().collect();
+                    hand.set_highlights(highlights_vec);
                     Widget::Hand(hand)
                 }
                 "spellhand" => {
@@ -753,6 +763,9 @@ impl WindowManager {
                     }
                     hand.set_background_color(config.background_color.clone());
                     hand.set_text_color(config.text_color.clone());
+                    // Set highlights
+                    let highlights_vec: Vec<_> = highlights.values().cloned().collect();
+                    hand.set_highlights(highlights_vec);
                     Widget::Hand(hand)
                 }
                 "dashboard" => {
@@ -869,6 +882,10 @@ impl WindowManager {
                     } else {
                         tracing::warn!("Tabbed window '{}' has no tabs configured!", config.name);
                     }
+
+                    // Set highlights for all tabs
+                    let highlights_vec: Vec<_> = highlights.values().cloned().collect();
+                    tabbed_window.set_highlights(highlights_vec);
 
                     Widget::Tabbed(tabbed_window)
                 }
@@ -1271,6 +1288,9 @@ impl WindowManager {
                         hands.set_border_sides(config.border_sides.clone());
                         hands.set_background_color(config.background_color.clone());
                         hands.set_text_color(config.text_color.clone());
+                        // Set highlights
+                        let highlights_vec: Vec<_> = self.highlights.values().cloned().collect();
+                        hands.set_highlights(highlights_vec);
                         Widget::Hands(hands)
                     }
                     "lefthand" => {
@@ -1286,6 +1306,9 @@ impl WindowManager {
                         }
                         hand.set_background_color(config.background_color.clone());
                         hand.set_text_color(config.text_color.clone());
+                        // Set highlights
+                        let highlights_vec: Vec<_> = self.highlights.values().cloned().collect();
+                        hand.set_highlights(highlights_vec);
                         Widget::Hand(hand)
                     }
                     "righthand" => {
@@ -1301,6 +1324,9 @@ impl WindowManager {
                         }
                         hand.set_background_color(config.background_color.clone());
                         hand.set_text_color(config.text_color.clone());
+                        // Set highlights
+                        let highlights_vec: Vec<_> = self.highlights.values().cloned().collect();
+                        hand.set_highlights(highlights_vec);
                         Widget::Hand(hand)
                     }
                     "spellhand" => {
@@ -1316,6 +1342,9 @@ impl WindowManager {
                         }
                         hand.set_background_color(config.background_color.clone());
                         hand.set_text_color(config.text_color.clone());
+                        // Set highlights
+                        let highlights_vec: Vec<_> = self.highlights.values().cloned().collect();
+                        hand.set_highlights(highlights_vec);
                         Widget::Hand(hand)
                     }
                     "dashboard" => {
@@ -1433,6 +1462,10 @@ impl WindowManager {
                         } else {
                             tracing::warn!("Tabbed window '{}' has no tabs configured! (update_config)", config.name);
                         }
+
+                        // Set highlights for all tabs
+                        let highlights_vec: Vec<_> = self.highlights.values().cloned().collect();
+                        tabbed_window.set_highlights(highlights_vec);
 
                         Widget::Tabbed(tabbed_window)
                     }
@@ -1658,6 +1691,10 @@ impl WindowManager {
                                     self.stream_map.insert(tab.stream.clone(), config.name.clone());
                                 }
                             }
+
+                            // Update highlights for all tabs
+                            let highlights_vec: Vec<_> = self.highlights.values().cloned().collect();
+                            tabbed.set_highlights(highlights_vec);
                         }
                         Widget::Progress(progress) => {
                             progress.set_colors(config.bar_fill.clone(), config.bar_background.clone());
@@ -1715,6 +1752,14 @@ impl WindowManager {
                             if let Some(ref icon) = config.hand_icon {
                                 hand.set_icon(icon.clone());
                             }
+                            // Update highlights
+                            let highlights_vec: Vec<_> = self.highlights.values().cloned().collect();
+                            hand.set_highlights(highlights_vec);
+                        }
+                        Widget::Hands(hands) => {
+                            // Update highlights
+                            let highlights_vec: Vec<_> = self.highlights.values().cloned().collect();
+                            hands.set_highlights(highlights_vec);
                         }
                         _ => {
                             // Other widget types (targets, players, hands multi) don't have additional properties to update

@@ -4656,6 +4656,7 @@ impl App {
                                 self.selection_state.as_ref(),
                                 &self.config.colors.ui.selection_bg_color,
                                 idx,
+                                &self.config.colors.ui.focused_border_color,
                             );
                         }
                     }
@@ -8798,13 +8799,12 @@ impl App {
                             }
                         }
                         ParsedElement::StatusIndicator { id, active } => {
-                            // Update status indicator widgets (poisoned, diseased, bleeding, stunned)
+                            // Update status indicator widgets (poisoned, diseased, bleeding, stunned, webbed)
                             let value = if active { 1 } else { 0 };
 
                             // Update individual indicator window if it exists
                             if let Some(window) = self.window_manager.get_window(&id) {
                                 window.set_indicator(value);
-                                debug!("Updated status indicator {}: {}", id, if active { "active" } else { "clear" });
                             }
 
                             // Update any dashboard widgets that contain this indicator

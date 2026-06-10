@@ -4,6 +4,8 @@ use ratatui::{
     style::{Color, Style},
     widgets::{Block, BorderType},
 };
+use regex::Regex;
+use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
 
 /// Hands widget showing left/right/spell hand contents
 /// Layout: Icon: text (up to 24 chars)
@@ -22,6 +24,11 @@ pub struct Hands {
     text_color: Option<String>,
     background_color: Option<String>,
     transparent_background: bool,
+    // Highlight support
+    highlights: Vec<crate::config::HighlightPattern>,
+    highlight_regexes: Vec<Option<Regex>>,
+    fast_matcher: Option<AhoCorasick>,
+    fast_pattern_map: Vec<usize>,
 }
 
 impl Hands {
@@ -38,6 +45,10 @@ impl Hands {
             text_color: None,  // Will use global default
             background_color: None,
             transparent_background: true,  // Default to transparent
+            highlights: Vec::new(),
+            highlight_regexes: Vec::new(),
+            fast_matcher: None,
+            fast_pattern_map: Vec::new(),
         }
     }
 
@@ -113,6 +124,131 @@ impl Hands {
 
     pub fn set_transparent_background(&mut self, transparent: bool) {
         self.transparent_background = transparent;
+    }
+
+    pub fn set_highlights(&mut self, highlights: Vec<crate::config::HighlightPattern>) {
+        // Separate fast_parse patterns from regex patterns
+        let mut fast_patterns: Vec<String> = Vec::new();
+        let mut fast_map: Vec<usize> = Vec::new();
+
+        // Build regex list and collect fast_parse patterns
+        self.highlight_regexes = highlights.iter()
+            .enumerate()
+            .map(|(i, h)| {
+                if h.fast_parse {
+                    // Split pattern on | and add to Aho-Corasick
+                    for literal in h.pattern.split('|') {
+                        let literal = literal.trim();
+                        if !literal.is_empty() {
+                            fast_patterns.push(literal.to_string());
+                            fast_map.push(i);  // Map this pattern back to highlight index
+                        }
+                    }
+                    None  // Don't compile as regex
+                } else {
+                    // Regular regex pattern
+                    Regex::new(&h.pattern).ok()
+                }
+            })
+            .collect();
+
+        // Build Aho-Corasick matcher for fast_parse patterns
+        if !fast_patterns.is_empty() {
+            self.fast_matcher = AhoCorasickBuilder::new()
+                .match_kind(MatchKind::Standard)
+                .build(&fast_patterns)
+                .ok();
+            self.fast_pattern_map = fast_map;
+        } else {
+            self.fast_matcher = None;
+            self.fast_pattern_map.clear();
+        }
+
+        self.highlights = highlights;
+    }
+
+    fn parse_hex_color(hex: &str) -> Option<Color> {
+        if !hex.starts_with('#') || hex.len() != 7 {
+            return None;
+        }
+
+        let r = u8::from_str_radix(&hex[1..3], 16).ok()?;
+        let g = u8::from_str_radix(&hex[3..5], 16).ok()?;
+        let b = u8::from_str_radix(&hex[5..7], 16).ok()?;
+
+        Some(Color::Rgb(r, g, b))
+    }
+
+    /// Apply highlights to text and return styled segments (text, fg, bg, bold)
+    fn apply_highlights_to_text(&self, text: &str) -> Vec<(String, Option<Color>, Option<Color>, bool)> {
+        if self.highlights.is_empty() || text.is_empty() {
+            return vec![(text.to_string(), None, None, false)];
+        }
+
+        // Find all matches
+        let mut matches: Vec<(usize, usize, Option<Color>, Option<Color>, bool)> = Vec::new();
+
+        // Try Aho-Corasick fast patterns
+        if let Some(ref matcher) = self.fast_matcher {
+            for mat in matcher.find_iter(text) {
+                let start = mat.start();
+                let end = mat.end();
+
+                if let Some(&highlight_idx) = self.fast_pattern_map.get(mat.pattern().as_usize()) {
+                    if let Some(highlight) = self.highlights.get(highlight_idx) {
+                        let fg = highlight.fg.as_ref().and_then(|h| Self::parse_hex_color(h));
+                        let bg = highlight.bg.as_ref().and_then(|h| Self::parse_hex_color(h));
+                        matches.push((start, end, fg, bg, highlight.bold));
+                    }
+                }
+            }
+        }
+
+        // Try regex patterns
+        for (i, highlight) in self.highlights.iter().enumerate() {
+            if highlight.fast_parse {
+                continue;  // Already handled by Aho-Corasick
+            }
+
+            if let Some(Some(regex)) = self.highlight_regexes.get(i) {
+                if let Some(captures) = regex.captures(text) {
+                    if let Some(m) = captures.get(0) {
+                        let fg = highlight.fg.as_ref().and_then(|h| Self::parse_hex_color(h));
+                        let bg = highlight.bg.as_ref().and_then(|h| Self::parse_hex_color(h));
+                        matches.push((m.start(), m.end(), fg, bg, highlight.bold));
+                    }
+                }
+            }
+        }
+
+        if matches.is_empty() {
+            return vec![(text.to_string(), None, None, false)];
+        }
+
+        // Sort matches by start position
+        matches.sort_by_key(|(start, _, _, _, _)| *start);
+
+        // Build segments
+        let mut segments = Vec::new();
+        let mut pos = 0;
+
+        for (start, end, fg, bg, bold) in matches {
+            // Add any text before this match
+            if pos < start {
+                segments.push((text[pos..start].to_string(), None, None, false));
+            }
+
+            // Add the matched text with highlighting
+            segments.push((text[start..end].to_string(), fg, bg, bold));
+            pos = end;
+        }
+
+        // Add any remaining text
+        if pos < text.len() {
+            segments.push((text[pos..].to_string(), None, None, false));
+        }
+
+        segments
     }
 
     fn parse_color(hex: &str) -> Color {
@@ -247,19 +383,41 @@ impl Hands {
                 }
             }
 
-            // Render text starting at column 3 (after "L: ")
+            // Render text starting at column 3 (after "L: ") with highlights
             let start_col = 3;
-            for (i, ch) in text.chars().enumerate() {
-                let x = inner_area.x + start_col + i as u16;
-                if x < inner_area.x + inner_area.width {
-                    buf[(x, y)].set_char(ch);
-                    buf[(x, y)].set_fg(text_color);
-                    if !self.transparent_background {
-                        let bg_color = self.background_color
-                            .as_ref()
-                            .map(|c| Self::parse_color(c))
-                            .unwrap_or(Color::Reset);
-                        buf[(x, y)].set_bg(bg_color);
+            let segments = self.apply_highlights_to_text(text);
+            let mut col_offset = 0;
+
+            for (segment_text, seg_fg, seg_bg, seg_bold) in segments {
+                for ch in segment_text.chars() {
+                    let x = inner_area.x + start_col + col_offset;
+                    if x < inner_area.x + inner_area.width {
+                        buf[(x, y)].set_char(ch);
+
+                        // Use highlight color if available, otherwise use default text_color
+                        let fg = seg_fg.or_else(|| Some(text_color)).unwrap_or(Color::Reset);
+                        buf[(x, y)].set_fg(fg);
+
+                        // Use highlight background if available, otherwise use widget background
+                        if let Some(highlight_bg) = seg_bg {
+                            buf[(x, y)].set_bg(highlight_bg);
+                        } else if !self.transparent_background {
+                            let bg_color = self.background_color
+                                .as_ref()
+                                .map(|c| Self::parse_color(c))
+                                .unwrap_or(Color::Reset);
+                            buf[(x, y)].set_bg(bg_color);
+                        }
+
+                        // Apply bold if highlight specifies it
+                        if seg_bold {
+                            let current_style = buf[(x, y)].style();
+                            buf[(x, y)].set_style(current_style.add_modifier(ratatui::style::Modifier::BOLD));
+                        }
+
+                        col_offset += 1;
+                    } else {
+                        break;
                     }
                 }
             }
