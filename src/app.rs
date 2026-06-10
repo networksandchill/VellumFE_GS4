@@ -4540,6 +4540,9 @@ impl App {
         });
 
         // Main event loop
+        // True when the last iteration hit its message-processing budget with
+        // messages still queued; skips the event-poll sleep so draining resumes fast
+        let mut message_backlog = false;
         while self.running && running.load(Ordering::SeqCst) {
             // Update window widths based on terminal size
             let terminal_size = terminal.size()?;
@@ -4797,7 +4800,10 @@ impl App {
             self.perf_stats.record_frame();
 
             // Handle events with timeout (configurable via poll_timeout_ms setting)
-            if event::poll(std::time::Duration::from_millis(self.config.ui.poll_timeout_ms))? {
+            // When server messages are backlogged, poll without sleeping so we
+            // get back to draining the queue immediately
+            let poll_ms = if message_backlog { 0 } else { self.config.ui.poll_timeout_ms };
+            if event::poll(std::time::Duration::from_millis(poll_ms))? {
                 let event_start = std::time::Instant::now();
                 match event::read()? {
                     Event::Key(key) => {
@@ -4834,13 +4840,22 @@ impl App {
                 self.auto_scale_layout(width, height);
             }
 
-            // Handle server messages
+            // Handle server messages with a time budget: large bursts (combat spam,
+            // script output) are spread across frames instead of freezing the UI
+            // until the queue is fully drained. Leftover messages are picked up
+            // next iteration with a zero-sleep event poll (see message_backlog).
+            let msg_budget = std::time::Duration::from_millis(16);
             let msg_start = std::time::Instant::now();
             let mut msg_count = 0;
             let in_inv_before = self.inventory_buffer_state.buffering;
+            message_backlog = false;
             while let Ok(msg) = server_rx.try_recv() {
                 self.handle_server_message(msg);
                 msg_count += 1;
+                if msg_start.elapsed() >= msg_budget {
+                    message_backlog = true;
+                    break;
+                }
             }
             let msg_duration = msg_start.elapsed();
             let in_inv_after = self.inventory_buffer_state.buffering;
