@@ -68,8 +68,15 @@ async fn main() -> Result<()> {
         .append(true)
         .open(log_file)?;
 
+    // Only enable debug logging if RUST_LOG is set, otherwise use WARN level
+    let log_level = if std::env::var("RUST_LOG").is_ok() {
+        tracing::Level::DEBUG
+    } else {
+        tracing::Level::WARN
+    };
+
     tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::DEBUG)
+        .with_max_level(log_level)
         .with_writer(file)
         .with_ansi(false)
         .init();
