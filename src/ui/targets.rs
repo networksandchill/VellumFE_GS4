@@ -53,7 +53,7 @@ impl Targets {
 
             let mut status_suffix = None;
             let is_current_target = part.contains("ul='true'");
-            let mut _is_dead = false;
+            let mut is_dead = false;
 
             // Remove all XML tags for parsing
             let mut clean_text = part.to_string();
@@ -68,7 +68,7 @@ impl Targets {
                 if let Some(end_bracket) = clean_text.find(']') {
                     let status = &clean_text[1..end_bracket];
                     status_suffix = Some(format!("[{}]", status));
-                    _is_dead = status == "dead";
+                    is_dead = status == "dead";
                     clean_text[end_bracket + 1..].trim().to_string()
                 } else {
                     clean_text
@@ -88,6 +88,13 @@ impl Targets {
                     target_name
                 };
 
+                // Highlight non-dead targets with monster color
+                let color_override = if !is_dead {
+                    Some("#a29900".to_string())
+                } else {
+                    None
+                };
+
                 // Add item with value=0 to hide progress bar, just show text
                 self.container.add_or_update_item_full(
                     id,
@@ -96,7 +103,7 @@ impl Targets {
                     0,  // value
                     1,  // max
                     status_suffix,
-                    None, // no color override for targets
+                    color_override,
                 );
 
                 target_index += 1;
