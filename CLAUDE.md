@@ -28,6 +28,30 @@ cargo run -- --character Zoleta --port 8000
 # Logs written to ~/.vellum-fe/debug_Zoleta.log
 ```
 
+## XML Protocol Logging
+
+VellumFE itself has no raw XML logging — `debug.log` contains parsed events (tag handlers, key events), not the raw protocol stream. To capture the raw XML that VellumFE receives, use Lich's bundled `logxml` script:
+
+```bash
+# Option 1: In-game (typed into VellumFE's command input)
+;logxml
+
+# Option 2: At Lich launch (no in-game step needed)
+ruby lich-5/lich.rbw --login CharacterName --gemstone --without-frontend --detachable-client=8000 --start-scripts=logxml
+
+# Option 3: Persistent — log every session automatically (run once in-game)
+;autostart add --global logxml
+```
+
+- Logs written to `lich-5/logs/GSIV-<Character>/<year>/<month>/<date>-<time>.xml`
+- Files rotate every 30,000 lines (~1 MB); a new file starts when the day changes
+- Client-sent commands are included, wrapped in `<!-- CLIENT -->...<!-- ENDCLIENT -->` markers
+- **Default output omits `<pushStream>`/`<popStream>` lines** — pass the `streams` argument (`;logxml streams`) to include them. Required when debugging VellumFE's stream routing, but noisy
+- Optional flags: `--timestamp="%F %T %Z"` to timestamp lines, `--rnum` to include room numbers
+- Session start is covered: if started within 30s of login, the script backfills from Lich's `reget` buffer (marked with a comment in the file)
+- This is the primary tool for investigating unhandled XML tags before adding parser support (see "Adding a New XML Tag Handler")
+- Note: logxml captures the raw server→Lich stream, *before* Lich's downstream hooks run. If a Lich script rewrites output, what VellumFE's parser receives may differ from the log — for those cases, capture would need to happen in VellumFE itself (no such flag exists today)
+
 ## Running the Application
 
 **Prerequisites:**
@@ -518,6 +542,7 @@ title = "Local Map"
 
 ### Window Management
 - `.quit` - Exit application
+- `.fullscreen [window]` / `.fs` - Toggle fullscreen for a window (default: main); F11 by default. Hidden windows keep buffering and reappear unchanged
 - `.addwindow` / `.newwindow` - Open window editor to create new window
 - `.editwindow [name]` - Edit existing window (or select from list if no name given)
 - `.editinput` - Edit command input box
