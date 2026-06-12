@@ -175,6 +175,7 @@ pub struct App {
     running: bool,
     current_stream: String, // Track which stream we're currently writing to
     discard_current_stream: bool, // If true, discard text because no window exists for current stream
+    squelch_inv_items: bool, // Drop worn-item lines after an inv push with no inv window (the server pops the stream early, so items arrive on main)
     chunk_has_main_text: bool, // Track if current chunk (since last prompt) has main stream text
     chunk_has_silent_updates: bool, // Track if current chunk has silent updates (buffs, vitals, etc.)
     server_time_offset: i64, // Offset between server time and local time (server_time - local_time) - used for countdown calculations to avoid clock drift
@@ -478,6 +479,7 @@ impl App {
             running: true,
             current_stream: "main".to_string(),
             discard_current_stream: false,
+            squelch_inv_items: false,
             chunk_has_main_text: false,
             chunk_has_silent_updates: false,
             server_time_offset: 0, // No offset until first prompt
@@ -8448,6 +8450,26 @@ impl App {
                     }
                 }
 
+                // Squelch worn-inventory refresh spam (see StreamPush "inv" arm):
+                // drop the indented item lines that follow an inv push when no
+                // window consumes the stream. Tag-only lines (e.g. a lone
+                // popStream or dialogData) parse normally without ending the
+                // squelch; the first real non-indented text ends it. Prompts
+                // always end it (refresh blocks never span a prompt).
+                if self.squelch_inv_items {
+                    if line.starts_with("<prompt ") {
+                        self.squelch_inv_items = false;
+                    } else if (self.current_stream == "main" || self.current_stream == "inv")
+                        && line.starts_with("  ")
+                        && !line.trim().is_empty()
+                    {
+                        debug!("Squelched worn-inventory line: '{}'", &line[..line.len().min(80)]);
+                        return;
+                    } else if !Self::is_tag_only_line(&line) {
+                        self.squelch_inv_items = false;
+                    }
+                }
+
                 // Parse XML and add to window (with timing)
                 let parse_start = std::time::Instant::now();
                 let elements = self.parser.parse_line(&line);
@@ -8654,6 +8676,12 @@ impl App {
                                         // Add header line to buffer so it's included when buffer is processed
                                         // (The Text element also adds it to the window, but we clear the window before processing buffer)
                                         self.inventory_buffer_state.add_line("Your worn items are:".to_string());
+                                    } else {
+                                        // No inv window: the server pops the inv stream right
+                                        // after the header, so the worn-item lines arrive on
+                                        // main and would spam the story window. Squelch them
+                                        // until real (non-indented) text resumes.
+                                        self.squelch_inv_items = true;
                                     }
                                 }
                                 "room" => {
@@ -9128,6 +9156,21 @@ impl App {
 
     /// Process buffered inventory lines with diff optimization
     /// Only re-processes lines that changed from last update
+    /// True if the line contains no visible text outside XML tags
+    /// (e.g. a lone `<popStream/>` or `<dialogData .../>` line)
+    fn is_tag_only_line(line: &str) -> bool {
+        let mut in_tag = false;
+        for c in line.chars() {
+            match c {
+                '<' => in_tag = true,
+                '>' => in_tag = false,
+                _ if !in_tag && !c.is_whitespace() => return false,
+                _ => {}
+            }
+        }
+        true
+    }
+
     fn process_inventory_buffer(&mut self) {
         // Check if buffers are identical - if so, skip update entirely
         if self.inventory_buffer_state.buffers_identical() {
