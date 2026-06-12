@@ -55,6 +55,8 @@ f3 = "next_search_match"  # Find next
 esc = "clear_search"  # Exit search mode
 "ctrl+page_up" = "prev_search_match"  # Alternative binding
 "ctrl+page_down" = "next_search_match"  # Alternative binding
+"ctrl+n" = "next_search_match"  # Alternative binding (Mac-friendly)
+"ctrl+p" = "prev_search_match"  # Alternative binding (Mac-friendly)
 
 # Performance stats
 f12 = "toggle_performance_stats"

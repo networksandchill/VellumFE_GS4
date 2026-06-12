@@ -703,6 +703,36 @@ impl App {
         }
     }
 
+    /// Name of the window search keys should act on: the focused window if it
+    /// supports search, otherwise "main", otherwise the first searchable window
+    fn search_window_name(&self) -> Option<String> {
+        let names = self.window_manager.get_window_names();
+        let is_searchable = |name: &str| {
+            self.window_manager
+                .get_window_const(name)
+                .map_or(false, |w| matches!(w, Widget::Text(_) | Widget::Tabbed(_)))
+        };
+        if let Some(name) = names.get(self.focused_window_index) {
+            if is_searchable(name) {
+                return Some(name.clone());
+            }
+        }
+        if names.iter().any(|n| n == "main") && is_searchable("main") {
+            return Some("main".to_string());
+        }
+        names.iter().find(|n| is_searchable(n)).cloned()
+    }
+
+    fn get_search_window(&mut self) -> Option<&mut Widget> {
+        let name = self.search_window_name()?;
+        self.window_manager.get_window(&name)
+    }
+
+    fn get_search_window_const(&self) -> Option<&Widget> {
+        let name = self.search_window_name()?;
+        self.window_manager.get_window_const(&name)
+    }
+
     /// Cycle to next window
     fn cycle_focused_window(&mut self) {
         let window_count = self.window_manager.get_window_names().len();
@@ -5400,7 +5430,7 @@ impl App {
                 // Exit search mode
                 if self.input_mode == InputMode::Search {
                     self.input_mode = InputMode::Normal;
-                    if let Some(window) = self.get_focused_window() {
+                    if let Some(window) = self.get_search_window() {
                         window.clear_search();
                     }
                 }
@@ -5408,14 +5438,28 @@ impl App {
             }
             (KeyCode::PageUp, KeyModifiers::CONTROL) => {
                 // Previous search match
-                if let Some(window) = self.get_focused_window() {
+                if let Some(window) = self.get_search_window() {
                     window.prev_match();
                 }
                 return Ok(());
             }
             (KeyCode::PageDown, KeyModifiers::CONTROL) => {
                 // Next search match
-                if let Some(window) = self.get_focused_window() {
+                if let Some(window) = self.get_search_window() {
+                    window.next_match();
+                }
+                return Ok(());
+            }
+            (KeyCode::Char('p'), KeyModifiers::CONTROL) => {
+                // Previous search match
+                if let Some(window) = self.get_search_window() {
+                    window.prev_match();
+                }
+                return Ok(());
+            }
+            (KeyCode::Char('n'), KeyModifiers::CONTROL) => {
+                // Next search match
+                if let Some(window) = self.get_search_window() {
                     window.next_match();
                 }
                 return Ok(());
@@ -6691,7 +6735,7 @@ impl App {
                 // Execute search
                 if let Some(pattern) = self.search_input.get_input() {
                     if !pattern.is_empty() {
-                        if let Some(window) = self.get_focused_window() {
+                        if let Some(window) = self.get_search_window() {
                             match window.start_search(&pattern) {
                                 Ok(count) => {
                                     if count > 0 {
@@ -6717,8 +6761,8 @@ impl App {
         use ratatui::text::{Line, Span};
         use ratatui::widgets::{Block, Borders, Paragraph, Widget as RatatuiWidget};
 
-        // Get search info from focused window
-        let search_info = self.get_focused_window_const()
+        // Get search info from the window being searched
+        let search_info = self.get_search_window_const()
             .and_then(|w| w.search_info())
             .map(|(current, total)| format!(" [{}/{}]", current, total))
             .unwrap_or_default();
@@ -6747,15 +6791,6 @@ impl App {
         };
 
         paragraph.render(area, buf);
-    }
-
-    fn get_focused_window_const(&self) -> Option<&Widget> {
-        let names = self.window_manager.get_window_names();
-        if self.focused_window_index < names.len() {
-            self.window_manager.get_window_const(&names[self.focused_window_index])
-        } else {
-            None
-        }
     }
 
     fn handle_normal_input(
@@ -6969,19 +7004,19 @@ impl App {
                 self.search_input.clear();
             }
             KeyAction::NextSearchMatch => {
-                if let Some(window) = self.get_focused_window() {
+                if let Some(window) = self.get_search_window() {
                     window.next_match();
                 }
             }
             KeyAction::PrevSearchMatch => {
-                if let Some(window) = self.get_focused_window() {
+                if let Some(window) = self.get_search_window() {
                     window.prev_match();
                 }
             }
             KeyAction::ClearSearch => {
                 if self.input_mode == InputMode::Search {
                     self.input_mode = InputMode::Normal;
-                    if let Some(window) = self.get_focused_window() {
+                    if let Some(window) = self.get_search_window() {
                         window.clear_search();
                     }
                 }

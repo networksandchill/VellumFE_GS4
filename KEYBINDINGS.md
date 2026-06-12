@@ -68,12 +68,12 @@ To see what key code your terminal sends:
 
 ### Search
 - `Ctrl+F` - Start search
-- `F3` - Next search match
-- `Shift+F3` - Previous search match
+- `F3` or `Ctrl+N` - Next search match
+- `Shift+F3` or `Ctrl+P` - Previous search match
 - `Esc` - Clear search
 
 ### Debug
-- `Ctrl+P` - Toggle performance stats
+- `F12` - Toggle performance stats
 
 ## Available Actions
 
