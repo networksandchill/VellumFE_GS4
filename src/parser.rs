@@ -1189,18 +1189,15 @@ impl XmlParser {
     fn extract_attribute(tag: &str, attr: &str) -> Option<String> {
         // Extract attribute value from tag
         // Handles both single and double quotes
-        let pattern_double = format!(r#"{}="([^"]*)""#, attr);
-        let pattern_single = format!(r#"{}='([^']*)'"#, attr);
-
-        if let Ok(re) = Regex::new(&pattern_double) {
-            if let Some(caps) = re.captures(tag) {
-                return Some(caps[1].to_string());
-            }
-        }
-
-        if let Ok(re) = Regex::new(&pattern_single) {
-            if let Some(caps) = re.captures(tag) {
-                return Some(caps[1].to_string());
+        // Plain string scanning: this runs for every attribute of every tag,
+        // so it must not compile regexes per call
+        for quote in ['"', '\''] {
+            let needle = format!("{}={}", attr, quote);
+            if let Some(pos) = tag.find(&needle) {
+                let value_start = pos + needle.len();
+                if let Some(len) = tag[value_start..].find(quote) {
+                    return Some(tag[value_start..value_start + len].to_string());
+                }
             }
         }
 
@@ -1211,5 +1208,59 @@ impl XmlParser {
 impl Default for XmlParser {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_attribute_double_quotes() {
+        let tag = r#"<progressBar id="health" value="98" text="health 98/100"/>"#;
+        assert_eq!(XmlParser::extract_attribute(tag, "id"), Some("health".to_string()));
+        assert_eq!(XmlParser::extract_attribute(tag, "value"), Some("98".to_string()));
+        assert_eq!(XmlParser::extract_attribute(tag, "text"), Some("health 98/100".to_string()));
+    }
+
+    #[test]
+    fn extract_attribute_single_quotes() {
+        let tag = "<roundTime value='1781245447'/>";
+        assert_eq!(XmlParser::extract_attribute(tag, "value"), Some("1781245447".to_string()));
+    }
+
+    #[test]
+    fn extract_attribute_mixed_quotes() {
+        let tag = r#"<a exist="191969005" noun='urnon'>shard</a>"#;
+        assert_eq!(XmlParser::extract_attribute(tag, "exist"), Some("191969005".to_string()));
+        assert_eq!(XmlParser::extract_attribute(tag, "noun"), Some("urnon".to_string()));
+    }
+
+    #[test]
+    fn extract_attribute_missing() {
+        let tag = r#"<prompt time="1781245447">&gt;</prompt>"#;
+        assert_eq!(XmlParser::extract_attribute(tag, "id"), None);
+        assert_eq!(XmlParser::extract_attribute(tag, "value"), None);
+    }
+
+    #[test]
+    fn extract_attribute_empty_value() {
+        let tag = r#"<output class=""/>"#;
+        assert_eq!(XmlParser::extract_attribute(tag, "class"), Some(String::new()));
+    }
+
+    #[test]
+    fn extract_attribute_multibyte_value() {
+        let tag = r#"<label value="Fasthr’s Reward — 3h"/>"#;
+        assert_eq!(
+            XmlParser::extract_attribute(tag, "value"),
+            Some("Fasthr’s Reward — 3h".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_attribute_unclosed_quote() {
+        let tag = r#"<label value="truncated"#;
+        assert_eq!(XmlParser::extract_attribute(tag, "value"), None);
     }
 }
