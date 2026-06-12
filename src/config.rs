@@ -1045,8 +1045,9 @@ pub fn default_keybinds() -> HashMap<String, KeyBindAction> {
     // Debug/Performance
     map.insert("f12".to_string(), KeyBindAction::Action("toggle_performance_stats".to_string()));
 
-    // Window fullscreen toggle
+    // Window fullscreen toggle (alt+f as well: F11 is awkward on macOS)
     map.insert("f11".to_string(), KeyBindAction::Action("toggle_fullscreen".to_string()));
+    map.insert("alt+f".to_string(), KeyBindAction::Action("toggle_fullscreen".to_string()));
 
     // Numpad movement macros
     map.insert("num_1".to_string(), KeyBindAction::Macro(MacroAction { macro_text: "sw\r".to_string() }));

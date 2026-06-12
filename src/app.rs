@@ -736,17 +736,24 @@ impl App {
     }
 
     /// In fullscreen mode, reduce the layout map to just the fullscreened
-    /// window at the full main area. Must be applied to both per-frame layout
-    /// calculations so wrap width matches render width.
+    /// window, filling the main area but stopping above the command input
+    /// (normal layouts may overlap the input; fullscreen must not). Must be
+    /// applied to both per-frame layout calculations so wrap width matches
+    /// render width.
     fn apply_fullscreen_override(
         &self,
         window_layouts: &mut HashMap<String, ratatui::layout::Rect>,
         main_area: ratatui::layout::Rect,
+        input_area: ratatui::layout::Rect,
     ) {
         if let Some(name) = &self.fullscreen_window {
             if window_layouts.contains_key(name) {
+                let mut area = main_area;
+                if input_area.y > area.y {
+                    area.height = area.height.min(input_area.y - area.y);
+                }
                 window_layouts.retain(|k, _| k == name);
-                window_layouts.insert(name.clone(), main_area);
+                window_layouts.insert(name.clone(), area);
             }
         }
     }
@@ -4607,7 +4614,7 @@ impl App {
             // Calculate window layouts using proportional sizing
             let layout_calc_start = std::time::Instant::now();
             let mut window_layouts = self.window_manager.calculate_layout(layout.main_area);
-            self.apply_fullscreen_override(&mut window_layouts, layout.main_area);
+            self.apply_fullscreen_override(&mut window_layouts, layout.main_area, layout.input_area);
 
             // Add command_input to window_layouts for mouse operations
             window_layouts.insert(
@@ -4634,7 +4641,7 @@ impl App {
 
                 let layout = UiLayout::calculate(f.area(), cmd_row, cmd_col, cmd_height, cmd_width);
                 let mut window_layouts = self.window_manager.calculate_layout(layout.main_area);
-                self.apply_fullscreen_override(&mut window_layouts, layout.main_area);
+                self.apply_fullscreen_override(&mut window_layouts, layout.main_area, layout.input_area);
 
                 // Add command_input to window_layouts for mouse operations (with bounds checking)
                 let terminal_area = f.area();

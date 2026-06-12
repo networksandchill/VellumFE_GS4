@@ -61,6 +61,7 @@ f12 = "toggle_performance_stats"
 
 # Fullscreen toggle for the story window (also: .fs)
 f11 = "toggle_fullscreen"
+"alt+f" = "toggle_fullscreen"
 
 # Numpad movement macros
 [num_1]
