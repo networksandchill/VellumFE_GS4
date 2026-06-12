@@ -185,6 +185,8 @@ pub struct App {
     keybind_map: HashMap<(KeyCode, KeyModifiers), KeyAction>,  // Parsed keybindings
     perf_stats: PerformanceStats,  // Performance statistics
     show_perf_stats: bool,  // Whether to show performance stats window
+    fullscreen_window: Option<String>,  // When set, only this window renders, filling the main area
+    fullscreen_prev_focus: Option<usize>,  // Focused window index to restore when leaving fullscreen
     stream_buffer: String,  // Buffer for accumulating stream text (used for combat/playerlist)
     sound_player: Option<SoundPlayer>,  // Sound player (None if initialization failed)
     highlight_form: Option<crate::ui::HighlightFormWidget>,  // Highlight form (None when not shown)
@@ -485,6 +487,8 @@ impl App {
             input_mode: InputMode::Normal,  // Start in normal mode
             perf_stats: PerformanceStats::new(),  // Initialize performance stats
             show_perf_stats: false,  // Hidden by default
+            fullscreen_window: None,  // Normal multi-window view by default
+            fullscreen_prev_focus: None,
             stream_buffer: String::new(),  // Initialize empty stream buffer
             sound_player,  // Sound player (may be None if initialization failed)
             highlight_form: None,  // No form shown initially
@@ -703,6 +707,47 @@ impl App {
         if window_count > 0 {
             self.focused_window_index = (self.focused_window_index + 1) % window_count;
             debug!("Focused window index: {}", self.focused_window_index);
+        }
+    }
+
+    /// Toggle fullscreen mode for a window (default: "main").
+    /// Window defs and text buffers are untouched; hidden windows keep
+    /// receiving stream text and reappear unchanged on toggle back.
+    fn toggle_fullscreen(&mut self, target: Option<&str>) {
+        if self.fullscreen_window.take().is_some() {
+            if let Some(prev) = self.fullscreen_prev_focus.take() {
+                if prev < self.window_manager.get_window_names().len() {
+                    self.focused_window_index = prev;
+                }
+            }
+            self.add_system_message("Fullscreen off");
+        } else {
+            let name = target.unwrap_or("main");
+            let names = self.window_manager.get_window_names();
+            if let Some(idx) = names.iter().position(|n| n == name) {
+                self.fullscreen_prev_focus = Some(self.focused_window_index);
+                self.focused_window_index = idx;
+                self.fullscreen_window = Some(name.to_string());
+                self.add_system_message(&format!("Fullscreen: {} (.fs or F11 to toggle back)", name));
+            } else {
+                self.add_system_message(&format!("Window '{}' not found", name));
+            }
+        }
+    }
+
+    /// In fullscreen mode, reduce the layout map to just the fullscreened
+    /// window at the full main area. Must be applied to both per-frame layout
+    /// calculations so wrap width matches render width.
+    fn apply_fullscreen_override(
+        &self,
+        window_layouts: &mut HashMap<String, ratatui::layout::Rect>,
+        main_area: ratatui::layout::Rect,
+    ) {
+        if let Some(name) = &self.fullscreen_window {
+            if window_layouts.contains_key(name) {
+                window_layouts.retain(|k, _| k == name);
+                window_layouts.insert(name.clone(), main_area);
+            }
         }
     }
 
@@ -2208,6 +2253,9 @@ impl App {
             }
             "quit" | "q" => {
                 self.running = false;
+            }
+            "fullscreen" | "fs" => {
+                self.toggle_fullscreen(parts.get(1).copied());
             }
             "savelayout" => {
                 let name = parts.get(1).unwrap_or(&"default");
@@ -4559,6 +4607,7 @@ impl App {
             // Calculate window layouts using proportional sizing
             let layout_calc_start = std::time::Instant::now();
             let mut window_layouts = self.window_manager.calculate_layout(layout.main_area);
+            self.apply_fullscreen_override(&mut window_layouts, layout.main_area);
 
             // Add command_input to window_layouts for mouse operations
             window_layouts.insert(
@@ -4585,6 +4634,7 @@ impl App {
 
                 let layout = UiLayout::calculate(f.area(), cmd_row, cmd_col, cmd_height, cmd_width);
                 let mut window_layouts = self.window_manager.calculate_layout(layout.main_area);
+                self.apply_fullscreen_override(&mut window_layouts, layout.main_area);
 
                 // Add command_input to window_layouts for mouse operations (with bounds checking)
                 let terminal_area = f.area();
@@ -6908,6 +6958,11 @@ impl App {
             // Debug/Performance actions
             KeyAction::TogglePerformanceStats => {
                 self.show_perf_stats = !self.show_perf_stats;
+            }
+
+            // Window fullscreen toggle
+            KeyAction::ToggleFullscreen => {
+                self.toggle_fullscreen(None);
             }
 
             // Macro - send literal text

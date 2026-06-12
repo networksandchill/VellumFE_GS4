@@ -59,6 +59,9 @@ esc = "clear_search"  # Exit search mode
 # Performance stats
 f12 = "toggle_performance_stats"
 
+# Fullscreen toggle for the story window (also: .fs)
+f11 = "toggle_fullscreen"
+
 # Numpad movement macros
 [num_1]
 macro_text = "sw\r"

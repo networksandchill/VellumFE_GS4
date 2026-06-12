@@ -821,6 +821,9 @@ pub enum KeyAction {
     // Debug/Performance actions
     TogglePerformanceStats,
 
+    // Window fullscreen toggle
+    ToggleFullscreen,
+
     // Macro - send literal text
     SendMacro(String),
 }
@@ -851,6 +854,7 @@ impl KeyAction {
             "prev_search_match" => Some(Self::PrevSearchMatch),
             "clear_search" => Some(Self::ClearSearch),
             "toggle_performance_stats" => Some(Self::TogglePerformanceStats),
+            "toggle_fullscreen" => Some(Self::ToggleFullscreen),
             _ => None,
         }
     }
@@ -1040,6 +1044,9 @@ pub fn default_keybinds() -> HashMap<String, KeyBindAction> {
 
     // Debug/Performance
     map.insert("f12".to_string(), KeyBindAction::Action("toggle_performance_stats".to_string()));
+
+    // Window fullscreen toggle
+    map.insert("f11".to_string(), KeyBindAction::Action("toggle_fullscreen".to_string()));
 
     // Numpad movement macros
     map.insert("num_1".to_string(), KeyBindAction::Macro(MacroAction { macro_text: "sw\r".to_string() }));

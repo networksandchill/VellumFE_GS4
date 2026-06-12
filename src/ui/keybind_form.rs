@@ -72,6 +72,7 @@ const AVAILABLE_ACTIONS: &[&str] = &[
     "prev_search_match",
     "next_search_match",
     "toggle_performance_stats",
+    "toggle_fullscreen",
 ];
 
 impl KeybindFormWidget {
