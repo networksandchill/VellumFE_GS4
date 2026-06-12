@@ -4609,6 +4609,14 @@ impl App {
                 .map(|w| (w.row, w.col, w.rows, w.cols))
                 .expect("command_input must exist in windows array");
 
+            // Fullscreen: command bar moves to the bottom edge, full width
+            // (row=0 means bottom and width=0 means full width in UiLayout)
+            let (cmd_row, cmd_col, cmd_width) = if self.fullscreen_window.is_some() {
+                (0, 0, 0)
+            } else {
+                (cmd_row, cmd_col, cmd_width)
+            };
+
             let layout = UiLayout::calculate(terminal_rect, cmd_row, cmd_col, cmd_height, cmd_width);
 
             // Calculate window layouts using proportional sizing
@@ -4617,10 +4625,14 @@ impl App {
             self.apply_fullscreen_override(&mut window_layouts, layout.main_area, layout.input_area);
 
             // Add command_input to window_layouts for mouse operations
-            window_layouts.insert(
-                "command_input".to_string(),
+            // (input_area is the resolved rect; raw cmd_* values use 0 as a
+            // sentinel and don't describe the fullscreen bottom bar)
+            let cmd_rect = if self.fullscreen_window.is_some() {
+                layout.input_area
+            } else {
                 ratatui::layout::Rect::new(cmd_col, cmd_row, cmd_width, cmd_height)
-            );
+            };
+            window_layouts.insert("command_input".to_string(), cmd_rect);
 
             self.window_manager.update_widths(&window_layouts);
             let layout_calc_duration = layout_calc_start.elapsed();
@@ -4639,13 +4651,24 @@ impl App {
                     .map(|w| (w.row, w.col, w.rows, w.cols))
                     .expect("command_input must exist in windows array");
 
+                // Fullscreen: command bar moves to the bottom edge, full width
+                let (cmd_row, cmd_col, cmd_width) = if self.fullscreen_window.is_some() {
+                    (0, 0, 0)
+                } else {
+                    (cmd_row, cmd_col, cmd_width)
+                };
+
                 let layout = UiLayout::calculate(f.area(), cmd_row, cmd_col, cmd_height, cmd_width);
                 let mut window_layouts = self.window_manager.calculate_layout(layout.main_area);
                 self.apply_fullscreen_override(&mut window_layouts, layout.main_area, layout.input_area);
 
                 // Add command_input to window_layouts for mouse operations (with bounds checking)
                 let terminal_area = f.area();
-                let cmd_input_rect = if cmd_row < terminal_area.height && cmd_col < terminal_area.width {
+                let cmd_input_rect = if self.fullscreen_window.is_some() {
+                    // input_area is the resolved bottom bar; raw cmd_* values
+                    // use 0 as a sentinel and would clip to zero width here
+                    Some(layout.input_area)
+                } else if cmd_row < terminal_area.height && cmd_col < terminal_area.width {
                     // Clip command_input to terminal bounds
                     let clipped_height = cmd_height.min(terminal_area.height.saturating_sub(cmd_row));
                     let clipped_width = cmd_width.min(terminal_area.width.saturating_sub(cmd_col));
