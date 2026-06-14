@@ -23,7 +23,7 @@ use std::collections::{HashMap, HashSet};
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info};
 use rand::Rng;
 
@@ -224,6 +224,20 @@ pub struct App {
     room_subtitle: Option<String>,  // Room subtitle (e.g., " - Emberthorn Refuge, Bowery")
     // Inventory buffer state for diff optimization
     inventory_buffer_state: InventoryBufferState,
+    // Control socket: when true, a per-character Unix socket lets external
+    // scripts (e.g. `sendgs`) inject commands into this running client
+    control_socket: bool,
+    // In-flight capture of a control-socket command's output (Phase 2); None when idle
+    pending_capture: Option<RemoteCapture>,
+}
+
+/// In-flight capture of a control-socket command's output (Phase 2). Text routed
+/// to the main window is accumulated here from when the command is sent until the
+/// next prompt, then returned to the `sendgs` caller over the socket.
+struct RemoteCapture {
+    responder: oneshot::Sender<String>,
+    buffer: String,
+    started: std::time::Instant,
 }
 
 /// Drag and drop state
@@ -263,7 +277,7 @@ enum ResizeEdge {
 }
 
 impl App {
-    pub fn new(mut config: Config, nomusic: bool) -> Result<Self> {
+    pub fn new(mut config: Config, nomusic: bool, control_socket: bool) -> Result<Self> {
         // Override startup_music if --nomusic flag is set
         // Override startup_music if --nomusic flag is set
         if nomusic {
@@ -527,6 +541,8 @@ impl App {
             room_subtitle: None,
             // Inventory buffer state initialized
             inventory_buffer_state: InventoryBufferState::new(),
+            control_socket,
+            pending_capture: None,
         })
     }
 
@@ -624,6 +640,13 @@ impl App {
             .cloned()
             .unwrap_or_else(|| "main".to_string());
 
+        // Capture main-window text for an in-flight control-socket request (Phase 2)
+        if window_name == "main" {
+            if let Some(cap) = self.pending_capture.as_mut() {
+                cap.buffer.push_str(&text.content);
+            }
+        }
+
         // Get the window
         if let Some(widget) = self.window_manager.get_window(&window_name) {
             match widget {
@@ -665,6 +688,13 @@ impl App {
             .get(&stream)
             .cloned()
             .unwrap_or_else(|| "main".to_string());
+
+        // Mark a line break in an in-flight control-socket capture (Phase 2)
+        if window_name == "main" {
+            if let Some(cap) = self.pending_capture.as_mut() {
+                cap.buffer.push('\n');
+            }
+        }
 
         // Get the window
         if let Some(widget) = self.window_manager.get_window(&window_name) {
@@ -4626,6 +4656,24 @@ impl App {
             }
         });
 
+        // Spawn the control-socket task (testbuild): external scripts like
+        // `sendgs` connect to a per-character Unix socket and inject commands.
+        // Received lines arrive on control_rx and are replayed in the main loop
+        // (echoed as remote, then sent on the existing connection above).
+        let (control_tx, mut control_rx) = mpsc::unbounded_channel::<crate::control::ControlRequest>();
+        if self.control_socket {
+            match Config::control_socket_path(self.config.character.as_deref()) {
+                Ok(socket_path) => {
+                    tokio::spawn(async move {
+                        if let Err(e) = crate::control::run(socket_path, control_tx).await {
+                            tracing::error!("Control socket error: {}", e);
+                        }
+                    });
+                }
+                Err(e) => tracing::error!("Could not resolve control socket path: {}", e),
+            }
+        }
+
         // Main event loop
         // True when the last iteration hit its message-processing budget with
         // messages still queued; skips the event-poll sleep so draining resumes fast
@@ -4980,6 +5028,23 @@ impl App {
             } else if msg_duration.as_millis() > 20 && (in_inv_before || in_inv_after) {
                 debug!("PERF: Message processing took {}ms ({} messages, inv_stream: {} -> {})",
                     msg_duration.as_millis(), msg_count, in_inv_before, in_inv_after);
+            }
+
+            // Drain control-socket requests (testbuild): inject each like typed input
+            while let Ok(req) = control_rx.try_recv() {
+                self.handle_remote_command(req, &command_tx);
+            }
+
+            // Abandon a stuck capture so it can't bleed into later output: the
+            // caller hung up, or no prompt arrived within the timeout window.
+            if let Some(cap) = self.pending_capture.as_ref() {
+                if cap.responder.is_closed() {
+                    self.pending_capture = None;
+                } else if cap.started.elapsed() > std::time::Duration::from_secs(6) {
+                    if let Some(cap) = self.pending_capture.take() {
+                        let _ = cap.responder.send(cap.buffer);
+                    }
+                }
             }
 
             // Update memory stats periodically (count total lines buffered)
@@ -6862,6 +6927,85 @@ impl App {
         Ok(())
     }
 
+    /// Echo a command to the current stream as if it were typed locally.
+    /// `remote` marks commands injected via the control socket (Option C) so
+    /// they read differently from keyboard input.
+    fn echo_command(&mut self, command: &str, remote: bool) {
+        // Leading indicator: ">" for local input, "»" (cyan) for remote injects
+        let (indicator, indicator_color) = if remote {
+            ("\u{00bb}".to_string(), Some(Color::Cyan))
+        } else {
+            let prompt_color = self.config.colors.prompt_colors
+                .iter()
+                .find(|pc| pc.character == ">")
+                .and_then(|pc| pc.fg.as_ref().or(pc.color.as_ref()))
+                .and_then(|color_str| Self::parse_hex_color(color_str))
+                .unwrap_or(Color::DarkGray);
+            (">".to_string(), Some(prompt_color))
+        };
+
+        let echo_color = Self::parse_hex_color(&self.config.colors.ui.command_echo_color);
+
+        // Indicator, then the command text
+        self.add_text_to_current_stream(StyledText {
+            content: indicator,
+            fg: indicator_color,
+            bg: None,
+            bold: false,
+            span_type: SpanType::Normal,
+            link_data: None,
+        });
+        self.add_text_to_current_stream(StyledText {
+            content: command.to_string(),
+            fg: echo_color,
+            bg: None,
+            bold: false,
+            span_type: SpanType::Normal,
+            link_data: None,
+        });
+
+        // Finish the line so the command appears before the server response
+        if let Ok(size) = crossterm::terminal::size() {
+            let inner_width = size.0.saturating_sub(2);
+            self.finish_current_line(inner_width);
+        }
+    }
+
+    /// Handle a command injected over the control socket: echo it (marked as
+    /// remote), send it on the existing game connection, and begin capturing its
+    /// output (text up to the next prompt) to return to the caller (Phase 2).
+    /// Dot commands are not special-cased; they're forwarded to the game as-is.
+    fn handle_remote_command(
+        &mut self,
+        req: crate::control::ControlRequest,
+        command_tx: &mpsc::UnboundedSender<String>,
+    ) {
+        let command = req.command.trim().to_string();
+        if command.is_empty() {
+            let _ = req.responder.send(String::new());
+            return;
+        }
+
+        // Single capture slot: if one is still pending, flush it first so its
+        // caller gets whatever was collected rather than hanging.
+        if let Some(prev) = self.pending_capture.take() {
+            let _ = prev.responder.send(prev.buffer);
+        }
+
+        // Echo BEFORE arming the capture so the "»cmd" line isn't captured.
+        self.echo_command(&command, true);
+        // Track bytes sent (+1 for newline added by network module)
+        self.perf_stats.record_bytes_sent((command.len() + 1) as u64);
+        let _ = command_tx.send(command);
+
+        // Capture main-window output until the next prompt (see add_text_to_current_stream)
+        self.pending_capture = Some(RemoteCapture {
+            responder: req.responder,
+            buffer: String::new(),
+            started: std::time::Instant::now(),
+        });
+    }
+
     fn execute_action(
         &mut self,
         action: KeyAction,
@@ -6875,42 +7019,7 @@ impl App {
                     if command.starts_with('.') {
                         self.handle_dot_command(&command, Some(command_tx));
                     } else {
-                        // Echo ">" with prompt color, then command with command echo color
-                        let prompt_color = self.config.colors.prompt_colors
-                            .iter()
-                            .find(|pc| pc.character == ">")
-                            .and_then(|pc| pc.fg.as_ref().or(pc.color.as_ref()))
-                            .and_then(|color_str| Self::parse_hex_color(color_str))
-                            .unwrap_or(Color::DarkGray);
-
-                        let echo_color = Self::parse_hex_color(&self.config.colors.ui.command_echo_color);
-
-                        // Add ">" with prompt color
-                        self.add_text_to_current_stream(StyledText {
-                            content: ">".to_string(),
-                            fg: Some(prompt_color),
-                            bg: None,
-                            bold: false,
-                            span_type: SpanType::Normal,
-                            link_data: None,
-                        });
-
-                        // Add command with echo color
-                        self.add_text_to_current_stream(StyledText {
-                            content: command.clone(),
-                            fg: echo_color,
-                            bg: None,
-                            bold: false,
-                            span_type: SpanType::Normal,
-                            link_data: None,
-                        });
-
-                        // Finish the line so command appears before server response
-                        if let Ok(size) = crossterm::terminal::size() {
-                            let inner_width = size.0.saturating_sub(2);
-                            self.finish_current_line(inner_width);
-                        }
-
+                        self.echo_command(&command, false);
                         // Track bytes sent (+1 for newline added by network module)
                         self.perf_stats.record_bytes_sent((command.len() + 1) as u64);
                         let _ = command_tx.send(command);
@@ -7037,40 +7146,7 @@ impl App {
                 // Echo the command (strip \r for display)
                 let display_text = text.replace('\r', "");
                 if !display_text.is_empty() {
-                    // Echo ">" with prompt color
-                    let prompt_color = self.config.colors.prompt_colors
-                        .iter()
-                        .find(|pc| pc.character == ">")
-                        .and_then(|pc| pc.fg.as_ref().or(pc.color.as_ref()))
-                        .and_then(|color_str| Self::parse_hex_color(color_str))
-                        .unwrap_or(Color::DarkGray);
-
-                    let echo_color = Self::parse_hex_color(&self.config.colors.ui.command_echo_color);
-
-                    self.add_text_to_current_stream(StyledText {
-                        content: ">".to_string(),
-                        fg: Some(prompt_color),
-                        bg: None,
-                        bold: false,
-                        span_type: SpanType::Normal,
-                            link_data: None,
-                    });
-
-                    self.add_text_to_current_stream(StyledText {
-                        content: display_text,
-                        fg: echo_color,
-                        bg: None,
-                        bold: false,
-                        span_type: SpanType::Normal,
-                            link_data: None,
-                    });
-
-                    // Finish the line
-                    if let Ok(size) = crossterm::terminal::size() {
-                        let inner_width = size.0.saturating_sub(2);
-                        self.finish_current_line(inner_width);
-                    }
-
+                    self.echo_command(&display_text, false);
                 }
 
                 // Track bytes sent (+1 for newline added by network module)
@@ -8644,6 +8720,14 @@ impl App {
                             // Reset stream to main - prompts always end stream contexts
                             self.current_stream = "main".to_string();
                             self.discard_current_stream = false;
+
+                            // Phase 2: the prompt ends the command's output —
+                            // return the captured text to the sendgs caller.
+                            // (Done before the prompt chars are added so the
+                            // trailing ">" isn't included.)
+                            if let Some(cap) = self.pending_capture.take() {
+                                let _ = cap.responder.send(cap.buffer);
+                            }
 
                             // Show prompts with content (unless skipped)
                             if !text.trim().is_empty() && !should_skip {

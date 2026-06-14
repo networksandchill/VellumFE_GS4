@@ -4400,6 +4400,12 @@ impl Config {
         Ok(Self::profile_dir(character)?.join("history.txt"))
     }
 
+    /// Get path to the control socket for a character
+    /// Returns: ~/.vellum-fe/{character}/control.sock
+    pub fn control_socket_path(character: Option<&str>) -> Result<PathBuf> {
+        Ok(Self::profile_dir(character)?.join("control.sock"))
+    }
+
     /// Get path to cmdlist1.xml (single source of truth)
     /// Returns: ~/.vellum-fe/cmdlist1.xml
     pub fn cmdlist_path() -> Result<PathBuf> {

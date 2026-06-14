@@ -2,6 +2,7 @@ mod app;
 mod validator;
 mod cmdlist;
 mod config;
+mod control;
 mod map_data;
 mod network;
 mod parser;
@@ -37,6 +38,10 @@ struct Args {
     /// Disable startup music on connection
     #[arg(long, default_value = "false")]
     nomusic: bool,
+
+    /// Enable the local control socket so `sendgs` can inject commands (testbuild)
+    #[arg(long, default_value = "false")]
+    control: bool,
 
     /// Validate a layout file against multiple sizes and exit
     #[arg(long, value_name = "PATH", required = false)]
@@ -124,7 +129,7 @@ async fn main() -> Result<()> {
     }
 
     // Create and run the application
-    let mut app = App::new(config, args.nomusic)?;
+    let mut app = App::new(config, args.nomusic, args.control)?;
 
     // Auto-shrink layout if terminal is smaller than designed size
     app.check_and_auto_resize()?;
