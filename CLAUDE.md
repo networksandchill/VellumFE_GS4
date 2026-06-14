@@ -21,12 +21,28 @@ cargo build --release
 
 # Enable debug logs
 RUST_LOG=debug cargo run
-# Logs written to ~/.vellum-fe/debug.log
+# Logs written to ~/.vellum-fe/default/debug.log
 
 # Run with character-specific config
 cargo run -- --character Zoleta --port 8000
-# Logs written to ~/.vellum-fe/debug_Zoleta.log
+# Logs written to ~/.vellum-fe/Zoleta/debug.log
 ```
+
+## Deploying Changes to the Running App
+
+`cargo build` / `cargo run` only affect the repo build. The game is normally launched
+from a separate, manually-deployed copy of the binary that can lag far behind the repo
+(e.g. `~/gemstone/gs <login>` starts Lich detached and runs `~/gemstone/vellum-fe`). So
+for **code** changes to reach the running app you must rebuild release **and** copy the
+binary into place:
+
+```bash
+cargo build --release
+cp target/release/vellum-fe ~/gemstone/vellum-fe   # refresh the deployed copy
+```
+
+- Deploy the **release** build, not debug: a debug binary (~30 MB vs ~9 MB release) caused 100–750 ms UI freezes. Sanity-check the binary size after copying.
+- **Config/layout TOML changes** do NOT need a rebuild — they take effect on app restart.
 
 ## XML Protocol Logging
 
@@ -136,16 +152,18 @@ ruby ~/lich5/lich.rbw --login CharacterName --gemstone --without-frontend --deta
 - Centered text shows remaining seconds
 
 **Configuration System:**
-- Embedded defaults bundled into binary using `include_str!()`
-- Multi-character support with character-specific configs and layouts
-- Config priority: `~/.vellum-fe/configs/<character>.toml` → `~/.vellum-fe/configs/default.toml` → embedded defaults
-- Layout priority: `auto_<character>.toml` → `<character>.toml` → `default.toml`
-- Character-specific debug logs: `debug_<character>.log`
+- Embedded defaults bundled into binary using `include_str!()` / `include_dir!()`
+- Multi-character support: each profile lives in its own directory `~/.vellum-fe/<character>/` (or `~/.vellum-fe/default/` when no `--character`)
+- A profile dir holds `config.toml`, `colors.toml`, `highlights.toml`, `keybinds.toml`, `layout.toml`, `history.txt`, and `debug.log`
+- On first run, missing files are seeded from the embedded defaults; the app then loads the profile directly (there is no character→default merge at load time)
+- Config priority: `~/.vellum-fe/<character>/config.toml` → embedded `defaults/config.toml` (used only to seed a missing file, not a runtime fallback)
+- Character-specific debug log: `~/.vellum-fe/<character>/debug.log`
 
 **Layout Persistence:**
-- Window configs stored in `~/.vellum-fe/configs/` directory
-- Layouts stored in `~/.vellum-fe/layouts/<name>.toml` (just windows array)
-- Autosave layout created on exit, loaded on startup if exists
+- Each profile's `~/.vellum-fe/<character>/layout.toml` is autosaved on exit and loaded on startup (highest priority)
+- Named layouts live in the shared `~/.vellum-fe/layouts/` directory; `.savelayout <name>` writes `~/.vellum-fe/layouts/<name>.toml`
+- Layout priority: `~/.vellum-fe/<character>/layout.toml` → `~/.vellum-fe/layouts/layout.toml` → embedded `defaults/layouts/layout.toml`
+- NOTE: editing files in `~/.vellum-fe/layouts/` does NOT change a character's live layout — edit the per-profile `layout.toml` (while the app is closed, or exit-autosave will clobber it)
 
 **Mouse Operations:**
 - Mouse support is enabled by default on application start
@@ -222,9 +240,9 @@ Main application loop and state management. Contains:
 ### src/config.rs
 Configuration management and window templates. Contains:
 - `Config` struct with connection, UI, presets, highlights, keybinds, spell_colors
-- Embedded defaults using `include_str!("../defaults/config.toml")` and `include_str!("../defaults/layout.toml")`
+- Embedded defaults using `include_str!("../defaults/config.toml")` (plus colors/highlights/keybinds/cmdlist) and `include_dir!(".../defaults/layouts")` for layouts
 - `load_with_options(character, port)` - Character-specific config loading
-- Multi-character support with separate configs/layouts per character
+- Multi-character support with a separate per-profile directory per character
 - Window template definitions for all built-in window types
 - Layout save/load functionality with priority system
 - Path helpers: `config_path()`, `configs_dir()`, `layouts_dir()`, `get_log_path()`
@@ -434,19 +452,21 @@ Window editor widget for creating/editing windows. Contains:
 ## Configuration
 
 **Directory Structure:**
-- `~/.vellum-fe/configs/default.toml` - Default configuration
-- `~/.vellum-fe/configs/<character>.toml` - Character-specific configs
-- `~/.vellum-fe/layouts/default.toml` - Default window layout
-- `~/.vellum-fe/layouts/<character>.toml` - Character layouts
-- `~/.vellum-fe/layouts/auto_<character>.toml` - Autosaved layouts (highest priority)
-- `~/.vellum-fe/debug.log` - Debug log (or `debug_<character>.log` with `-c`)
-- `defaults/config.toml` - Source defaults (embedded at compile time)
-- `defaults/layout.toml` - Source layout defaults (embedded at compile time)
+- `~/.vellum-fe/<character>/` - Per-profile dir (`default/` when no `--character`), containing:
+  - `config.toml` - Main configuration for the profile
+  - `colors.toml`, `highlights.toml`, `keybinds.toml` - Per-profile colors/highlights/keybinds
+  - `layout.toml` - Window layout, autosaved on exit (highest priority)
+  - `history.txt` - Command history
+  - `debug.log` - Debug log (`RUST_LOG=debug`)
+- `~/.vellum-fe/layouts/` - Shared named layouts (`<name>.toml`); `.savelayout` writes here
+- `~/.vellum-fe/sounds/` - Shared sound files
+- `~/.vellum-fe/cmdlist1.xml` - Shared command list for clickable-link menus
+- `defaults/` - Source defaults embedded at compile time (`config.toml`, `colors.toml`, `highlights.toml`, `keybinds.toml`, `cmdlist1.xml`, `layouts/`, `sounds/`)
 
 **Keybindings System:**
 - Fully customizable keybindings defined in config file
 - Default keybinds defined in `defaults/config.toml` under `[[keybinds]]` sections
-- Users can override in their own config files (`~/.vellum-fe/configs/`)
+- Users can override in their own profile (`~/.vellum-fe/<character>/keybinds.toml`)
 - Terminal compatibility: If backspace doesn't work, users can remap it (see `KEYBINDINGS.md`)
 - Common issue: Some terminals (MobaXterm, PuTTY) send `Delete` for backspace key
 - Solution: Edit config and change `key = "backspace"` to `key = "delete"`
@@ -454,15 +474,13 @@ Window editor widget for creating/editing windows. Contains:
 - See `KEYBINDINGS.md` for complete documentation on customizing keys
 
 **Config Loading Priority:**
-1. `~/.vellum-fe/configs/<character>.toml` (if `--character` specified)
-2. `~/.vellum-fe/configs/default.toml`
-3. Embedded defaults from `defaults/config.toml`
+1. `~/.vellum-fe/<character>/config.toml` (profile = character name, or `default` when no `--character`)
+2. Embedded `defaults/config.toml` — only used to create the file on first run if missing (no runtime fallback/merge)
 
 **Layout Loading Priority:**
-1. `~/.vellum-fe/layouts/auto_<character>.toml`
-2. `~/.vellum-fe/layouts/<character>.toml`
-3. `~/.vellum-fe/layouts/default.toml`
-4. Embedded defaults from `defaults/layout.toml`
+1. `~/.vellum-fe/<character>/layout.toml` (autosaved on exit)
+2. `~/.vellum-fe/layouts/layout.toml` (shared default)
+3. Embedded `defaults/layouts/layout.toml`
 
 ### Important Config Sections
 
@@ -690,7 +708,7 @@ All popup editors (Settings, Highlights, Keybinds, Windows) follow the same patt
 
 - Use `.setprogress health 50 100` to manually test progress bars
 - Use `.setcountdown roundtime 5` to test countdown timers
-- Check `~/.vellum-fe/debug.log` for tracing output
+- Check `~/.vellum-fe/<character>/debug.log` (or `default/debug.log`) for tracing output
 - Terminal size changes require layout recalculation (handled automatically)
 - Mouse operations log to debug when RUST_LOG=debug
 - Test compass colors: Edit compass window, set `compass_active_color` and `compass_inactive_color`
