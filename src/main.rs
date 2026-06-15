@@ -39,9 +39,14 @@ struct Args {
     #[arg(long, default_value = "false")]
     nomusic: bool,
 
-    /// Enable the local control socket so `sendgs` can inject commands (testbuild)
-    #[arg(long, default_value = "false")]
+    /// Deprecated no-op: the control socket is on by default now. Kept so older
+    /// launch scripts that pass --control still parse; use --no-control to disable.
+    #[arg(long, default_value = "false", hide = true)]
     control: bool,
+
+    /// Disable the local control socket (it's on by default so `sendgs` works)
+    #[arg(long, default_value = "false")]
+    no_control: bool,
 
     /// Start with the main window fullscreened (same as .fs / F11 at startup)
     #[arg(long, default_value = "false")]
@@ -133,7 +138,11 @@ async fn main() -> Result<()> {
     }
 
     // Create and run the application
-    let mut app = App::new(config, args.nomusic, args.control, args.fullscreen)?;
+    // Control socket is on by default; --no-control opts out. --control is a
+    // back-compat no-op (older scripts/the testbuild path still pass it).
+    let _ = args.control;
+    let control_socket = !args.no_control;
+    let mut app = App::new(config, args.nomusic, control_socket, args.fullscreen)?;
 
     // Auto-shrink layout if terminal is smaller than designed size
     app.check_and_auto_resize()?;
