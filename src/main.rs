@@ -43,6 +43,10 @@ struct Args {
     #[arg(long, default_value = "false")]
     control: bool,
 
+    /// Start with the main window fullscreened (same as .fs / F11 at startup)
+    #[arg(long, default_value = "false")]
+    fullscreen: bool,
+
     /// Validate a layout file against multiple sizes and exit
     #[arg(long, value_name = "PATH", required = false)]
     validate_layout: Option<String>,
@@ -129,7 +133,7 @@ async fn main() -> Result<()> {
     }
 
     // Create and run the application
-    let mut app = App::new(config, args.nomusic, args.control)?;
+    let mut app = App::new(config, args.nomusic, args.control, args.fullscreen)?;
 
     // Auto-shrink layout if terminal is smaller than designed size
     app.check_and_auto_resize()?;

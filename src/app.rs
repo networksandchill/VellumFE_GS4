@@ -188,6 +188,7 @@ pub struct App {
     show_perf_stats: bool,  // Whether to show performance stats window
     fullscreen_window: Option<String>,  // When set, only this window renders, filling the main area
     fullscreen_prev_focus: Option<usize>,  // Focused window index to restore when leaving fullscreen
+    start_fullscreen: bool,  // --fullscreen: fullscreen the main window once at startup
     stream_buffer: String,  // Buffer for accumulating stream text (used for combat/playerlist)
     sound_player: Option<SoundPlayer>,  // Sound player (None if initialization failed)
     highlight_form: Option<crate::ui::HighlightFormWidget>,  // Highlight form (None when not shown)
@@ -277,7 +278,7 @@ enum ResizeEdge {
 }
 
 impl App {
-    pub fn new(mut config: Config, nomusic: bool, control_socket: bool) -> Result<Self> {
+    pub fn new(mut config: Config, nomusic: bool, control_socket: bool, start_fullscreen: bool) -> Result<Self> {
         // Override startup_music if --nomusic flag is set
         // Override startup_music if --nomusic flag is set
         if nomusic {
@@ -542,6 +543,7 @@ impl App {
             // Inventory buffer state initialized
             inventory_buffer_state: InventoryBufferState::new(),
             control_socket,
+            start_fullscreen,
             pending_capture: None,
         })
     }
@@ -4636,12 +4638,19 @@ impl App {
         self.baseline_snapshot = Some((size.0, size.1));
         tracing::info!("Captured baseline terminal size: {}x{}", size.0, size.1);
 
-        // Set up signal handler for Ctrl+C and terminal close
+        // Graceful shutdown on SIGINT (Ctrl+C), SIGTERM, and SIGHUP. The
+        // `ctrlc` crate's "termination" feature routes SIGTERM/SIGHUP through
+        // this same handler, so killing the process (e.g. `gs --steal`'s pkill,
+        // or a dropped SSH session) flips `running` false and exits via the
+        // normal teardown below, which restores the terminal (leaves the alt
+        // screen, disables mouse capture and raw mode). Without this, a
+        // SIGTERM'd frontend leaves mouse reporting on, flooding the terminal
+        // with escape codes.
         let running = Arc::new(AtomicBool::new(true));
         let r = running.clone();
         ctrlc::set_handler(move || {
             r.store(false, Ordering::SeqCst);
-        }).expect("Error setting Ctrl+C handler");
+        }).expect("Error setting termination signal handler");
 
         // Connect to Lich
         let (server_tx, mut server_rx) = mpsc::unbounded_channel();
@@ -4672,6 +4681,13 @@ impl App {
                 }
                 Err(e) => tracing::error!("Could not resolve control socket path: {}", e),
             }
+        }
+
+        // Apply startup fullscreen (--fullscreen): fullscreen the main window
+        // before the first draw so the session opens fullscreened (e.g. over
+        // SSH). Reuses the runtime .fs/F11 path; .fs or F11 toggles back.
+        if self.start_fullscreen {
+            self.toggle_fullscreen(Some("main"));
         }
 
         // Main event loop

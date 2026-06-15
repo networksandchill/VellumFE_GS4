@@ -43,8 +43,11 @@ chrono = "0.4"
 tracing = "0.1"
 tracing-subscriber = "0.3"
 
-# Signal handling
-ctrlc = "3.4"
+# Signal handling. "termination" routes SIGTERM/SIGHUP through the same handler
+# as SIGINT, so a killed process (e.g. `gs --steal`'s pkill, or an SSH hangup)
+# shuts down gracefully and restores the terminal instead of leaving mouse
+# reporting on.
+ctrlc = { version = "3.4", features = ["termination"] }
 
 # Random number generation
 rand = "0.8"
