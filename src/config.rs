@@ -403,12 +403,29 @@ pub struct WindowDef {
     pub scar3_color: Option<String>,  // Scar level 3 color
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TabConfig {
     pub name: String,    // Tab display name
-    pub stream: String,  // Stream to route to this tab
+    #[serde(default)]
+    pub stream: String,  // Stream(s) to route to this tab (comma-separated). Unused for split tabs.
     #[serde(default)]
     pub show_timestamps: Option<bool>,  // Show timestamps at end of lines for this tab
+    #[serde(default)]
+    pub split: Option<String>,  // "vertical" | "horizontal" — arrangement of `panes` (split tab)
+    #[serde(default)]
+    pub panes: Option<Vec<TabPaneConfig>>,  // If set, this is a split tab with multiple stream panes
+}
+
+/// One pane inside a split tab (see `TabConfig::panes`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TabPaneConfig {
+    pub stream: String,  // Stream(s) for this pane (comma-separated)
+    #[serde(default)]
+    pub title: Option<String>,  // Optional header label shown above the pane
+    #[serde(default)]
+    pub weight: Option<u16>,  // Relative size of this pane (default 1)
+    #[serde(default)]
+    pub show_timestamps: Option<bool>,  // Show timestamps for this pane
 }
 
 impl Default for WindowDef {

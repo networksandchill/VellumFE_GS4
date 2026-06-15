@@ -37,7 +37,7 @@ mod spells_window;
 #[allow(unused_imports)]
 pub use text_window::{TextWindow, StyledText, SpanType, LinkData, LineSegments, TextSegment};
 pub use popup_menu::{PopupMenu, MenuItem};
-pub use tabbed_text_window::{TabbedTextWindow, TabBarPosition};
+pub use tabbed_text_window::{TabbedTextWindow, TabBarPosition, split_streams, SplitDirection};
 pub use command_input::CommandInput;
 pub use window_manager::{WindowManager, WindowConfig, Widget};
 #[allow(unused_imports)]

@@ -2579,6 +2579,7 @@ impl App {
                         name: tab_parts[0].trim().to_string(),
                         stream: tab_parts[1].trim().to_string(),
                         show_timestamps: None,
+                        ..Default::default()
                     });
                 }
 
@@ -2681,6 +2682,7 @@ impl App {
                             name: tab_name.to_string(),
                             stream: stream_name.to_string(),
                             show_timestamps: None,
+                            ..Default::default()
                         });
                     }
 

@@ -1332,7 +1332,7 @@ impl WindowEditor {
                         }
                         None
                     },
-                    KeyCode::Char('d') | KeyCode::Char('D') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    KeyCode::Char('d') | KeyCode::Char('D') | KeyCode::Delete => {
                         if let Some(ref mut tabs) = self.current_window.tabs {
                             if self.tab_editor.selected_index < tabs.len() {
                                 tabs.remove(self.tab_editor.selected_index);
@@ -1366,11 +1366,15 @@ impl WindowEditor {
                                 if self.tab_editor.mode == TabEditMode::Editing {
                                     if let Some(idx) = self.tab_editor.editing_index {
                                         if idx < tabs.len() {
-                                            tabs[idx] = TabConfig { name, stream, show_timestamps: show_timestamps_value };
+                                            // Mutate in place so a split tab's `panes`/`split`
+                                            // config is preserved (the editor doesn't expose them yet).
+                                            tabs[idx].name = name;
+                                            tabs[idx].stream = stream;
+                                            tabs[idx].show_timestamps = show_timestamps_value;
                                         }
                                     }
                                 } else {
-                                    tabs.push(TabConfig { name, stream, show_timestamps: show_timestamps_value });
+                                    tabs.push(TabConfig { name, stream, show_timestamps: show_timestamps_value, ..Default::default() });
                                 }
                             }
 

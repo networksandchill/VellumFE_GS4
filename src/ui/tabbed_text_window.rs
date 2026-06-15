@@ -13,12 +13,101 @@ pub enum TabBarPosition {
     Bottom,
 }
 
+/// Split a tab stream spec into individual stream names.
+/// A single tab may subscribe to multiple streams via a comma-separated
+/// spec (e.g. "speech,whisper"). Whitespace around each name is trimmed
+/// and empty entries are dropped, so "speech" yields `["speech"]`.
+pub fn split_streams(spec: &str) -> Vec<String> {
+    spec.split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect()
+}
+
+/// Direction in which a split tab's panes are arranged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SplitDirection {
+    /// Panes stacked top-to-bottom (each spans the full content width).
+    Vertical,
+    /// Panes placed side-by-side (each gets a slice of the width).
+    Horizontal,
+}
+
+impl SplitDirection {
+    pub fn parse(s: &str) -> Self {
+        match s.trim().to_lowercase().as_str() {
+            "horizontal" | "h" | "cols" | "columns" | "side" => SplitDirection::Horizontal,
+            _ => SplitDirection::Vertical,
+        }
+    }
+}
+
+/// One pane inside a split tab: an independent scrollback bound to its own stream(s).
+struct TabPane {
+    streams: Vec<String>,
+    window: TextWindow,
+    title: Option<String>,
+    weight: u16,
+}
+
 struct TabInfo {
     name: String,
-    stream: String,
+    /// Streams for a normal (single-window) tab. Empty for split tabs.
+    streams: Vec<String>,
+    /// The single text window for a normal tab. Unused (dummy) for split tabs.
     window: TextWindow,
+    /// Non-empty => this is a split tab; `panes` are rendered instead of `window`.
+    panes: Vec<TabPane>,
+    split: SplitDirection,
     has_unread: bool,
     unread_count: usize,
+}
+
+impl TabInfo {
+    fn is_split(&self) -> bool {
+        !self.panes.is_empty()
+    }
+
+    /// The window used for search/selection/link detection on this tab
+    /// (the first pane for a split tab, otherwise the single window).
+    fn primary_window(&self) -> &TextWindow {
+        if self.is_split() {
+            &self.panes[0].window
+        } else {
+            &self.window
+        }
+    }
+
+    fn primary_window_mut(&mut self) -> &mut TextWindow {
+        if self.is_split() {
+            &mut self.panes[0].window
+        } else {
+            &mut self.window
+        }
+    }
+}
+
+/// Divide `total` cells across `weights`, giving the last slice any remainder
+/// so the sizes always sum back to `total`.
+fn weighted_sizes(total: u16, weights: &[u16]) -> Vec<u16> {
+    let norm: Vec<u32> = weights.iter().map(|&w| w.max(1) as u32).collect();
+    let sum: u32 = norm.iter().sum();
+    if sum == 0 {
+        return vec![0; weights.len()];
+    }
+    let mut sizes = Vec::with_capacity(weights.len());
+    let mut used: u32 = 0;
+    for (i, &w) in norm.iter().enumerate() {
+        if i + 1 == norm.len() {
+            sizes.push((total as u32).saturating_sub(used) as u16);
+        } else {
+            let s = total as u32 * w / sum;
+            used += s;
+            sizes.push(s as u16);
+        }
+    }
+    sizes
 }
 
 pub struct TabbedTextWindow {
@@ -73,8 +162,10 @@ impl TabbedTextWindow {
             .into_iter()
             .map(|(name, stream)| TabInfo {
                 name: name.clone(),
-                stream: stream.clone(),
+                streams: split_streams(&stream),
                 window: TextWindow::new(name.clone(), max_lines_per_tab),
+                panes: Vec::new(),
+                split: SplitDirection::Vertical,
                 has_unread: false,
                 unread_count: 0,
             })
@@ -193,8 +284,44 @@ impl TabbedTextWindow {
         window.set_show_timestamps(show_timestamps);
         self.tabs.push(TabInfo {
             name,
-            stream,
+            streams: split_streams(&stream),
             window,
+            panes: Vec::new(),
+            split: SplitDirection::Vertical,
+            has_unread: false,
+            unread_count: 0,
+        });
+    }
+
+    /// Add a split tab: its content area is divided into panes, each pane an
+    /// independent scrollback bound to its own comma-separated stream spec.
+    /// `panes` entries are `(stream_spec, title, weight, show_timestamps)`.
+    pub fn add_split_tab(
+        &mut self,
+        name: String,
+        direction: SplitDirection,
+        panes: Vec<(String, Option<String>, u16, bool)>,
+        max_lines: usize,
+    ) {
+        let pane_infos: Vec<TabPane> = panes
+            .into_iter()
+            .map(|(spec, title, weight, show_ts)| {
+                let mut window = TextWindow::new(name.clone(), max_lines);
+                window.set_show_timestamps(show_ts);
+                TabPane {
+                    streams: split_streams(&spec),
+                    window,
+                    title,
+                    weight: weight.max(1),
+                }
+            })
+            .collect();
+        self.tabs.push(TabInfo {
+            name: name.clone(),
+            streams: Vec::new(),
+            window: TextWindow::new(name, max_lines),
+            panes: pane_infos,
+            split: direction,
             has_unread: false,
             unread_count: 0,
         });
@@ -202,11 +329,16 @@ impl TabbedTextWindow {
 
     /// Add text to a specific stream (will route to correct tab and set unread if needed)
     pub fn add_text_to_stream(&mut self, stream: &str, styled: StyledText) {
-        if let Some((idx, tab)) = self.tabs.iter_mut().enumerate().find(|(_, t)| t.stream == stream) {
-            tab.window.add_text(styled);
-
-            // Set unread flag if this is not the active tab
-            if idx != self.active_tab_index {
+        // Locate the target tab (and pane within a split tab) before mutating,
+        // so we don't hold a borrow while touching unread state.
+        if let Some((idx, pane_idx)) = self.locate_stream(stream) {
+            let active = self.active_tab_index;
+            let tab = &mut self.tabs[idx];
+            match pane_idx {
+                Some(p) => tab.panes[p].window.add_text(styled),
+                None => tab.window.add_text(styled),
+            }
+            if idx != active {
                 tab.has_unread = true;
                 tab.unread_count += 1;
             }
@@ -215,29 +347,71 @@ impl TabbedTextWindow {
 
     /// Finish line for a specific stream
     pub fn finish_line_for_stream(&mut self, stream: &str, width: u16) {
-        if let Some(tab) = self.tabs.iter_mut().find(|t| t.stream == stream) {
-            tab.window.finish_line(width);
+        if let Some((idx, pane_idx)) = self.locate_stream(stream) {
+            let tab = &mut self.tabs[idx];
+            match pane_idx {
+                Some(p) => tab.panes[p].window.finish_line(width),
+                None => tab.window.finish_line(width),
+            }
         }
     }
 
-    /// Get the active tab's stream name
+    /// Find which tab (and, for split tabs, which pane) owns a stream.
+    /// Returns `(tab_index, Some(pane_index))` for split tabs or
+    /// `(tab_index, None)` for normal tabs.
+    fn locate_stream(&self, stream: &str) -> Option<(usize, Option<usize>)> {
+        for (idx, tab) in self.tabs.iter().enumerate() {
+            if tab.is_split() {
+                if let Some(p) = tab
+                    .panes
+                    .iter()
+                    .position(|pane| pane.streams.iter().any(|s| s == stream))
+                {
+                    return Some((idx, Some(p)));
+                }
+            } else if tab.streams.iter().any(|s| s == stream) {
+                return Some((idx, None));
+            }
+        }
+        None
+    }
+
+    /// Get the active tab's primary stream name
     pub fn get_active_stream(&self) -> Option<&str> {
-        self.tabs.get(self.active_tab_index).map(|t| t.stream.as_str())
+        self.tabs
+            .get(self.active_tab_index)
+            .and_then(|t| {
+                if t.is_split() {
+                    t.panes.first().and_then(|p| p.streams.first())
+                } else {
+                    t.streams.first()
+                }
+            })
+            .map(|s| s.as_str())
     }
 
-    /// Get the active tab's text window (for selection/link detection)
+    /// Get the active tab's text window (for selection/link detection).
+    /// For split tabs this is the first pane.
     pub fn get_active_window(&self) -> Option<&TextWindow> {
-        self.tabs.get(self.active_tab_index).map(|t| &t.window)
+        self.tabs.get(self.active_tab_index).map(|t| t.primary_window())
     }
 
-    /// Get the active tab's text window mutably (for clipboard copy)
+    /// Get the active tab's text window mutably (for clipboard copy).
+    /// For split tabs this is the first pane.
     pub fn get_active_window_mut(&mut self) -> Option<&mut TextWindow> {
-        self.tabs.get_mut(self.active_tab_index).map(|t| &mut t.window)
+        self.tabs.get_mut(self.active_tab_index).map(|t| t.primary_window_mut())
     }
 
-    /// Get all stream names for this tabbed window
+    /// Get all stream names for this tabbed window (flattened across tabs and panes)
     pub fn get_all_streams(&self) -> Vec<String> {
-        self.tabs.iter().map(|t| t.stream.clone()).collect()
+        let mut out = Vec::new();
+        for tab in &self.tabs {
+            out.extend(tab.streams.iter().cloned());
+            for pane in &tab.panes {
+                out.extend(pane.streams.iter().cloned());
+            }
+        }
+        out
     }
 
     /// Switch to a specific tab by index
@@ -315,23 +489,54 @@ impl TabbedTextWindow {
         }
     }
 
-    /// Scroll the active tab
+    /// Scroll the active tab (all panes together for a split tab)
     pub fn scroll_up(&mut self, lines: usize) {
         if let Some(tab) = self.tabs.get_mut(self.active_tab_index) {
-            tab.window.scroll_up(lines);
+            if tab.is_split() {
+                for pane in &mut tab.panes {
+                    pane.window.scroll_up(lines);
+                }
+            } else {
+                tab.window.scroll_up(lines);
+            }
         }
     }
 
     pub fn scroll_down(&mut self, lines: usize) {
         if let Some(tab) = self.tabs.get_mut(self.active_tab_index) {
-            tab.window.scroll_down(lines);
+            if tab.is_split() {
+                for pane in &mut tab.panes {
+                    pane.window.scroll_down(lines);
+                }
+            } else {
+                tab.window.scroll_down(lines);
+            }
         }
     }
 
-    /// Update inner width for all tabs
+    /// Update inner width for all tabs. Split-tab panes get their own width:
+    /// full content width when stacked vertically, or a weighted slice when
+    /// arranged horizontally (matching the render layout).
     pub fn update_inner_width(&mut self, width: u16) {
         for tab in &mut self.tabs {
-            tab.window.update_inner_width(width);
+            if !tab.is_split() {
+                tab.window.update_inner_width(width);
+                continue;
+            }
+            match tab.split {
+                SplitDirection::Vertical => {
+                    for pane in &mut tab.panes {
+                        pane.window.update_inner_width(width);
+                    }
+                }
+                SplitDirection::Horizontal => {
+                    let weights: Vec<u16> = tab.panes.iter().map(|p| p.weight).collect();
+                    let widths = weighted_sizes(width, &weights);
+                    for (pane, w) in tab.panes.iter_mut().zip(widths) {
+                        pane.window.update_inner_width(w.max(1));
+                    }
+                }
+            }
         }
     }
 
@@ -425,10 +630,13 @@ impl TabbedTextWindow {
         tabs_widget.render(area, buf);
     }
 
-    /// Update highlights for all tabs
+    /// Update highlights for all tabs (and every pane of split tabs)
     pub fn set_highlights(&mut self, highlights: Vec<crate::config::HighlightPattern>) {
         for tab in &mut self.tabs {
             tab.window.set_highlights(highlights.clone());
+            for pane in &mut tab.panes {
+                pane.window.set_highlights(highlights.clone());
+            }
         }
     }
 
@@ -548,7 +756,59 @@ impl TabbedTextWindow {
 
         // Render active tab's content
         if let Some(tab) = self.tabs.get_mut(self.active_tab_index) {
-            tab.window.render_with_focus(content_area, buf, focused, selection_state, selection_bg_color, window_index, focused_border_color);
+            if !tab.is_split() {
+                tab.window.render_with_focus(content_area, buf, focused, selection_state, selection_bg_color, window_index, focused_border_color);
+            } else {
+                let axis_total = match tab.split {
+                    SplitDirection::Vertical => content_area.height,
+                    SplitDirection::Horizontal => content_area.width,
+                };
+                let weights: Vec<u16> = tab.panes.iter().map(|p| p.weight).collect();
+                let sizes = weighted_sizes(axis_total, &weights);
+                let mut offset: u16 = 0;
+                for (pane, size) in tab.panes.iter_mut().zip(sizes) {
+                    let pane_rect = match tab.split {
+                        SplitDirection::Vertical => Rect {
+                            x: content_area.x,
+                            y: content_area.y + offset,
+                            width: content_area.width,
+                            height: size,
+                        },
+                        SplitDirection::Horizontal => Rect {
+                            x: content_area.x + offset,
+                            y: content_area.y,
+                            width: size,
+                            height: content_area.height,
+                        },
+                    };
+                    offset += size;
+
+                    if pane_rect.width == 0 || pane_rect.height == 0 {
+                        continue;
+                    }
+
+                    // Optional 1-row pane header label, leaving the rest for the window.
+                    let win_rect = if let Some(ref title) = pane.title {
+                        let label = format!(" {} ", title);
+                        let style = Style::default()
+                            .fg(Color::DarkGray)
+                            .add_modifier(Modifier::BOLD);
+                        buf.set_stringn(pane_rect.x, pane_rect.y, &label, pane_rect.width as usize, style);
+                        Rect {
+                            x: pane_rect.x,
+                            y: pane_rect.y + 1,
+                            width: pane_rect.width,
+                            height: pane_rect.height.saturating_sub(1),
+                        }
+                    } else {
+                        pane_rect
+                    };
+
+                    if win_rect.height > 0 {
+                        pane.window.render_with_focus(win_rect, buf, focused, selection_state, selection_bg_color, window_index, focused_border_color);
+                    }
+                }
+            }
         }
     }
 
@@ -622,7 +882,7 @@ impl TabbedTextWindow {
     /// Start search in the active tab's text window
     pub fn start_search(&mut self, pattern: &str) -> Result<usize, regex::Error> {
         if let Some(tab) = self.tabs.get_mut(self.active_tab_index) {
-            tab.window.start_search(pattern)
+            tab.primary_window_mut().start_search(pattern)
         } else {
             Ok(0)
         }
@@ -631,28 +891,35 @@ impl TabbedTextWindow {
     /// Clear search from the active tab's text window
     pub fn clear_search(&mut self) {
         if let Some(tab) = self.tabs.get_mut(self.active_tab_index) {
-            tab.window.clear_search();
+            tab.primary_window_mut().clear_search();
         }
     }
 
-    /// Clear all text from all tabs
+    /// Clear all text from all tabs (and panes)
     pub fn clear_all(&mut self) {
         for tab in &mut self.tabs {
             tab.window.clear();
+            for pane in &mut tab.panes {
+                pane.window.clear();
+            }
         }
     }
 
-    /// Clear text from a specific stream's tab only
+    /// Clear text from a specific stream's tab/pane only
     pub fn clear_stream(&mut self, stream: &str) {
-        if let Some(tab) = self.tabs.iter_mut().find(|t| t.stream == stream) {
-            tab.window.clear();
+        if let Some((idx, pane_idx)) = self.locate_stream(stream) {
+            let tab = &mut self.tabs[idx];
+            match pane_idx {
+                Some(p) => tab.panes[p].window.clear(),
+                None => tab.window.clear(),
+            }
         }
     }
 
     /// Go to next match in the active tab's text window
     pub fn next_match(&mut self) -> bool {
         if let Some(tab) = self.tabs.get_mut(self.active_tab_index) {
-            tab.window.next_match()
+            tab.primary_window_mut().next_match()
         } else {
             false
         }
@@ -661,7 +928,7 @@ impl TabbedTextWindow {
     /// Go to previous match in the active tab's text window
     pub fn prev_match(&mut self) -> bool {
         if let Some(tab) = self.tabs.get_mut(self.active_tab_index) {
-            tab.window.prev_match()
+            tab.primary_window_mut().prev_match()
         } else {
             false
         }
@@ -670,7 +937,7 @@ impl TabbedTextWindow {
     /// Get search info (current match, total matches) from the active tab's text window
     pub fn search_info(&self) -> Option<(usize, usize)> {
         if let Some(tab) = self.tabs.get(self.active_tab_index) {
-            tab.window.search_info()
+            tab.primary_window().search_info()
         } else {
             None
         }

@@ -871,13 +871,7 @@ impl WindowManager {
                     if let Some(ref tabs) = config.tabs {
                         tracing::debug!("Creating tabbed window '{}' with {} tabs", config.name, tabs.len());
                         for tab in tabs {
-                            tracing::debug!("  Adding tab '{}' -> stream '{}'", tab.name, tab.stream);
-                            tabbed_window.add_tab(
-                                tab.name.clone(),
-                                tab.stream.clone(),
-                                config.buffer_size,
-                                tab.show_timestamps.unwrap_or(false),
-                            );
+                            Self::add_configured_tab(&mut tabbed_window, tab, config.buffer_size);
                         }
                     } else {
                         tracing::warn!("Tabbed window '{}' has no tabs configured!", config.name);
@@ -1014,11 +1008,12 @@ impl WindowManager {
                 stream_map.insert(stream.clone(), config.name.clone());
             }
 
-            // For tabbed windows, also map all tab streams
+            // For tabbed windows, also map all tab streams (a tab may
+            // subscribe to several comma-separated streams)
             if config.widget_type == "tabbed" {
                 if let Some(ref tabs) = config.tabs {
                     for tab in tabs {
-                        stream_map.insert(tab.stream.clone(), config.name.clone());
+                        Self::register_tab_streams(&mut stream_map, tab, &config.name);
                     }
                 }
             }
@@ -1061,6 +1056,58 @@ impl WindowManager {
                 }
             }
             _ => DashboardLayout::Horizontal,
+        }
+    }
+
+    /// Add a tab to a tabbed window from its config, choosing a normal
+    /// (single-window) tab or a split tab with panes based on `tab.panes`.
+    fn add_configured_tab(tabbed: &mut TabbedTextWindow, tab: &crate::config::TabConfig, buffer_size: usize) {
+        if let Some(ref panes) = tab.panes {
+            let direction = tab
+                .split
+                .as_deref()
+                .map(super::SplitDirection::parse)
+                .unwrap_or(super::SplitDirection::Vertical);
+            let pane_specs: Vec<(String, Option<String>, u16, bool)> = panes
+                .iter()
+                .map(|p| {
+                    (
+                        p.stream.clone(),
+                        p.title.clone(),
+                        p.weight.unwrap_or(1),
+                        p.show_timestamps.unwrap_or(false),
+                    )
+                })
+                .collect();
+            tracing::debug!("  Adding split tab '{}' with {} panes", tab.name, pane_specs.len());
+            tabbed.add_split_tab(tab.name.clone(), direction, pane_specs, buffer_size);
+        } else {
+            tracing::debug!("  Adding tab '{}' -> stream '{}'", tab.name, tab.stream);
+            tabbed.add_tab(
+                tab.name.clone(),
+                tab.stream.clone(),
+                buffer_size,
+                tab.show_timestamps.unwrap_or(false),
+            );
+        }
+    }
+
+    /// Register every stream a tab routes (its own streams plus each pane's
+    /// streams for split tabs) into a stream→window map.
+    fn register_tab_streams(
+        map: &mut HashMap<String, String>,
+        tab: &crate::config::TabConfig,
+        window_name: &str,
+    ) {
+        for s in super::split_streams(&tab.stream) {
+            map.insert(s, window_name.to_string());
+        }
+        if let Some(ref panes) = tab.panes {
+            for pane in panes {
+                for s in super::split_streams(&pane.stream) {
+                    map.insert(s, window_name.to_string());
+                }
+            }
         }
     }
 
@@ -1451,13 +1498,7 @@ impl WindowManager {
                         if let Some(ref tabs) = config.tabs {
                             tracing::debug!("Creating tabbed window '{}' with {} tabs (update_config)", config.name, tabs.len());
                             for tab in tabs {
-                                tracing::debug!("  Adding tab '{}' -> stream '{}'", tab.name, tab.stream);
-                                tabbed_window.add_tab(
-                                    tab.name.clone(),
-                                    tab.stream.clone(),
-                                    config.buffer_size,
-                                    tab.show_timestamps.unwrap_or(false),
-                                );
+                                Self::add_configured_tab(&mut tabbed_window, tab, config.buffer_size);
                             }
                         } else {
                             tracing::warn!("Tabbed window '{}' has no tabs configured! (update_config)", config.name);
@@ -1594,11 +1635,12 @@ impl WindowManager {
                     self.stream_map.insert(stream.clone(), config.name.clone());
                 }
 
-                // For tabbed windows, also map all tab streams
+                // For tabbed windows, also map all tab streams (a tab may
+                // subscribe to several comma-separated streams)
                 if config.widget_type == "tabbed" {
                     if let Some(ref tabs) = config.tabs {
                         for tab in tabs {
-                            self.stream_map.insert(tab.stream.clone(), config.name.clone());
+                            Self::register_tab_streams(&mut self.stream_map, tab, &config.name);
                         }
                     }
                 }
@@ -1665,12 +1707,7 @@ impl WindowManager {
                                 for tab in tabs {
                                     if !current_tabs.contains(&tab.name) {
                                         tracing::debug!("Adding new tab '{}' to existing window '{}'", tab.name, config.name);
-                                        tabbed.add_tab(
-                                            tab.name.clone(),
-                                            tab.stream.clone(),
-                                            config.buffer_size,
-                                            tab.show_timestamps.unwrap_or(false),
-                                        );
+                                        Self::add_configured_tab(tabbed, tab, config.buffer_size);
                                     }
                                 }
 
@@ -1688,7 +1725,7 @@ impl WindowManager {
                                 // CRITICAL: Re-add ALL tab stream mappings, not just new ones
                                 // The stream_map was cleared at line 1564, so we need to restore ALL tab mappings
                                 for tab in tabs {
-                                    self.stream_map.insert(tab.stream.clone(), config.name.clone());
+                                    Self::register_tab_streams(&mut self.stream_map, tab, &config.name);
                                 }
                             }
 
