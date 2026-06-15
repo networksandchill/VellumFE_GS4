@@ -431,6 +431,33 @@ impl TabbedTextWindow {
         }
     }
 
+    /// Number of tabs in this window
+    pub fn tab_count(&self) -> usize {
+        self.tabs.len()
+    }
+
+    /// Index of the currently active tab
+    pub fn active_index(&self) -> usize {
+        self.active_tab_index
+    }
+
+    /// Activate the next tab, wrapping past the last back to the first
+    pub fn next_tab(&mut self) {
+        if !self.tabs.is_empty() {
+            let next = (self.active_tab_index + 1) % self.tabs.len();
+            self.switch_to_tab(next);
+        }
+    }
+
+    /// Activate the previous tab, wrapping past the first to the last
+    pub fn prev_tab(&mut self) {
+        if !self.tabs.is_empty() {
+            let len = self.tabs.len();
+            let prev = (self.active_tab_index + len - 1) % len;
+            self.switch_to_tab(prev);
+        }
+    }
+
     /// Remove a tab by name
     pub fn remove_tab(&mut self, name: &str) -> bool {
         if self.tabs.len() <= 1 {

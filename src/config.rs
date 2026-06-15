@@ -824,6 +824,8 @@ pub enum KeyAction {
 
     // Window actions
     SwitchCurrentWindow,
+    NextTab,
+    PrevTab,
     ScrollCurrentWindowUpOne,
     ScrollCurrentWindowDownOne,
     ScrollCurrentWindowUpPage,
@@ -862,6 +864,8 @@ impl KeyAction {
             "send_last_command" => Some(Self::SendLastCommand),
             "send_second_last_command" => Some(Self::SendSecondLastCommand),
             "switch_current_window" => Some(Self::SwitchCurrentWindow),
+            "next_tab" => Some(Self::NextTab),
+            "prev_tab" => Some(Self::PrevTab),
             "scroll_current_window_up_one" => Some(Self::ScrollCurrentWindowUpOne),
             "scroll_current_window_down_one" => Some(Self::ScrollCurrentWindowDownOne),
             "scroll_current_window_up_page" => Some(Self::ScrollCurrentWindowUpPage),

@@ -1259,21 +1259,39 @@ impl TextWindow {
         let total_lines = self.wrapped_lines.len();
 
         if total_lines == 0 {
-            // No lines to display
+            // No lines to display — draw the border using the same styling as
+            // the populated path so an empty tab/pane doesn't fall back to a
+            // hardcoded yellow border. Honors focused_border_color when focused
+            // and the window's own border_color/border_style otherwise.
             let borders = crate::config::parse_border_sides(&self.border_sides);
-            let paragraph = Paragraph::new(vec![])
-                .block(
-                    if focused {
-                        Block::default()
-                            .title(self.title.as_str())
-                            .borders(borders)
-                            .border_style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
-                    } else {
-                        Block::default()
-                            .title(self.title.as_str())
-                            .borders(borders)
-                    }
-                );
+            let mut border_style = Style::default();
+            if focused {
+                if let Some(color) = Self::parse_hex_color(focused_border_color) {
+                    border_style = border_style.fg(color).add_modifier(Modifier::BOLD);
+                } else {
+                    border_style = border_style.fg(Color::Yellow).add_modifier(Modifier::BOLD);
+                }
+            } else if let Some(ref color_hex) = self.border_color {
+                if let Some(color) = Self::parse_hex_color(color_hex) {
+                    border_style = border_style.fg(color);
+                }
+            }
+            let mut block = Block::default()
+                .title(self.title.as_str())
+                .borders(borders)
+                .border_style(border_style);
+            if let Some(ref style_name) = self.border_style {
+                let border_type = match style_name.as_str() {
+                    "double" => BorderType::Double,
+                    "rounded" => BorderType::Rounded,
+                    "thick" => BorderType::Thick,
+                    "quadrant_inside" => BorderType::QuadrantInside,
+                    "quadrant_outside" => BorderType::QuadrantOutside,
+                    _ => BorderType::Plain,
+                };
+                block = block.border_type(border_type);
+            }
+            let paragraph = Paragraph::new(vec![]).block(block);
             paragraph.render(area, buf);
             return;
         }

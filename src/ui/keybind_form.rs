@@ -60,6 +60,8 @@ const AVAILABLE_ACTIONS: &[&str] = &[
     "cursor_delete_word",
     "cursor_clear_line",
     "switch_current_window",
+    "next_tab",
+    "prev_tab",
     "scroll_current_window_up_one",
     "scroll_current_window_down_one",
     "scroll_current_window_up_page",

@@ -7100,8 +7100,29 @@ impl App {
                     // Try completion
                     self.command_input.try_complete(&available_commands, &available_names);
                 } else {
-                    // No text - cycle focused window as usual
-                    self.cycle_focused_window();
+                    // No text - if a tabbed window is focused, just cycle its tabs
+                    // (wrapping); otherwise cycle the focused window.
+                    let on_tabbed = {
+                        if let Some(Widget::Tabbed(tabbed)) = self.get_focused_window() {
+                            tabbed.next_tab();
+                            true
+                        } else {
+                            false
+                        }
+                    };
+                    if !on_tabbed {
+                        self.cycle_focused_window();
+                    }
+                }
+            }
+            KeyAction::NextTab => {
+                if let Some(Widget::Tabbed(tabbed)) = self.get_focused_window() {
+                    tabbed.next_tab();
+                }
+            }
+            KeyAction::PrevTab => {
+                if let Some(Widget::Tabbed(tabbed)) = self.get_focused_window() {
+                    tabbed.prev_tab();
                 }
             }
             KeyAction::ScrollCurrentWindowUpOne => {
