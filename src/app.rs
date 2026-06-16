@@ -5114,6 +5114,16 @@ impl App {
             tracing::debug!("No character specified, skipping auto-save");
         }
 
+        // Remove the control socket file so a logged-out character doesn't leave
+        // a stale `control.sock` behind (which `sendgs` would otherwise treat as
+        // a live session). Best-effort: crashes/SIGKILL can't run this, so the
+        // client also probes for a live listener.
+        if self.control_socket {
+            if let Ok(socket_path) = Config::control_socket_path(self.config.character.as_deref()) {
+                let _ = std::fs::remove_file(&socket_path);
+            }
+        }
+
         // Cleanup terminal
         disable_raw_mode()?;
         execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
