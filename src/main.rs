@@ -48,6 +48,11 @@ struct Args {
     #[arg(long, default_value = "false")]
     no_control: bool,
 
+    /// Disable the post-hook feed tee (~/.vellum-fe/<char>/feed.log). On by
+    /// default whenever the control socket is on, so `sendgs` reads a clean feed.
+    #[arg(long, default_value = "false")]
+    no_feed: bool,
+
     /// Start with the main window fullscreened (same as .fs / F11 at startup)
     #[arg(long, default_value = "false")]
     fullscreen: bool,
@@ -142,7 +147,10 @@ async fn main() -> Result<()> {
     // back-compat no-op (older scripts/the testbuild path still pass it).
     let _ = args.control;
     let control_socket = !args.no_control;
-    let mut app = App::new(config, args.nomusic, control_socket, args.fullscreen)?;
+    // Feed tee follows the control socket (sendgs users have control on), unless
+    // explicitly disabled with --no-feed.
+    let feed_log = control_socket && !args.no_feed;
+    let mut app = App::new(config, args.nomusic, control_socket, feed_log, args.fullscreen)?;
 
     // Auto-shrink layout if terminal is smaller than designed size
     app.check_and_auto_resize()?;

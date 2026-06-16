@@ -228,6 +228,9 @@ pub struct App {
     // Control socket: when true, a per-character Unix socket lets external
     // scripts (e.g. `sendgs`) inject commands into this running client
     control_socket: bool,
+    // Feed tee: when true, the post-hook stream is mirrored to
+    // ~/.vellum-fe/<char>/feed.log for `sendgs` to tail
+    feed_log: bool,
     // In-flight capture of a control-socket command's output (Phase 2); None when idle
     pending_capture: Option<RemoteCapture>,
 }
@@ -278,7 +281,7 @@ enum ResizeEdge {
 }
 
 impl App {
-    pub fn new(mut config: Config, nomusic: bool, control_socket: bool, start_fullscreen: bool) -> Result<Self> {
+    pub fn new(mut config: Config, nomusic: bool, control_socket: bool, feed_log: bool, start_fullscreen: bool) -> Result<Self> {
         // Override startup_music if --nomusic flag is set
         // Override startup_music if --nomusic flag is set
         if nomusic {
@@ -543,6 +546,7 @@ impl App {
             // Inventory buffer state initialized
             inventory_buffer_state: InventoryBufferState::new(),
             control_socket,
+            feed_log,
             start_fullscreen,
             pending_capture: None,
         })
@@ -4661,8 +4665,14 @@ impl App {
         // Spawn connection task
         let host = self.config.connection.host.clone();
         let port = self.config.connection.port;
+        // Tee the post-hook stream to feed.log for `sendgs` when enabled.
+        let feed_path = if self.feed_log {
+            Config::feed_log_path(self.config.character.as_deref()).ok()
+        } else {
+            None
+        };
         tokio::spawn(async move {
-            if let Err(e) = LichConnection::start(&host, port, server_tx, command_rx).await {
+            if let Err(e) = LichConnection::start(&host, port, server_tx, command_rx, feed_path).await {
                 tracing::error!("Connection error: {}", e);
             }
         });

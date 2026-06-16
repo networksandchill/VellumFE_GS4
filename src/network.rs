@@ -19,14 +19,68 @@ impl LichConnection {
         port: u16,
         server_tx: mpsc::UnboundedSender<ServerMessage>,
         mut command_rx: mpsc::UnboundedReceiver<String>,
+        feed_path: Option<std::path::PathBuf>,
     ) -> Result<()> {
         info!("Connecting to Lich at {}:{}...", host, port);
 
-        let stream = TcpStream::connect(format!("{}:{}", host, port))
-            .await
-            .context("Failed to connect to Lich")?;
+        // Retry the initial connect: on a restart, Lich needs a moment to tear
+        // down the old session and re-open its detachable listener, so a single
+        // attempt often loses the race. Retry with backoff for ~30s rather than
+        // failing immediately (which left the client sitting disconnected until
+        // a manual relaunch).
+        let addr = format!("{}:{}", host, port);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let stream = loop {
+            match TcpStream::connect(&addr).await {
+                Ok(s) => break s,
+                Err(e) => {
+                    if std::time::Instant::now() >= deadline {
+                        return Err(e).context("Failed to connect to Lich");
+                    }
+                    debug!("Connect attempt failed ({}); retrying in 500ms...", e);
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                }
+            }
+        };
 
         info!("Connected successfully");
+
+        // Optional tee of the post-hook stream to ~/.vellum-fe/<char>/feed.log,
+        // consumed by `sendgs`. A dedicated writer task owns the file so disk
+        // I/O never stalls the read loop; the file is truncated on each connect.
+        let feed_tx = feed_path.map(|path| {
+            let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+            tokio::spawn(async move {
+                let mut f = match tokio::fs::File::create(&path).await {
+                    Ok(f) => f,
+                    Err(e) => {
+                        error!("Failed to open feed log {:?}: {}", path, e);
+                        return;
+                    }
+                };
+                // Cap the file so a long session can't grow unbounded; roll over
+                // by truncating. `sendgs` notices the shrink and re-syncs from
+                // the top, and since it tails the end the reset is invisible.
+                use tokio::io::AsyncSeekExt;
+                const FEED_CAP: u64 = 3 * 1024 * 1024;
+                let mut written: u64 = 0;
+                while let Some(line) = rx.recv().await {
+                    if written > FEED_CAP {
+                        if f.set_len(0).await.is_ok() {
+                            let _ = f.seek(std::io::SeekFrom::Start(0)).await;
+                            written = 0;
+                        }
+                    }
+                    if f.write_all(line.as_bytes()).await.is_err() {
+                        break;
+                    }
+                    let _ = f.write_all(b"\n").await;
+                    let _ = f.flush().await;
+                    written += line.len() as u64 + 1;
+                }
+            });
+            tx
+        });
 
         let (reader, mut writer) = tokio::io::split(stream);
         let mut reader = BufReader::new(reader);
@@ -43,6 +97,7 @@ impl LichConnection {
         // Spawn reader task
         let server_tx_clone = server_tx.clone();
         let read_handle = tokio::spawn(async move {
+            let feed_tx = feed_tx;
             loop {
                 let mut buf = Vec::new();
                 match reader.read_until(b'\n', &mut buf).await {
@@ -64,6 +119,9 @@ impl LichConnection {
                         };
                         // Strip only the trailing newline, preserve blank lines
                         let line = line.trim_end_matches(&['\r', '\n']);
+                        if let Some(tx) = &feed_tx {
+                            let _ = tx.send(line.to_string());
+                        }
                         let _ = server_tx_clone.send(ServerMessage::Text(line.to_string()));
                     }
                     Err(e) => {

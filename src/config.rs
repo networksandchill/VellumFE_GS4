@@ -4427,6 +4427,12 @@ impl Config {
         Ok(Self::profile_dir(character)?.join("control.sock"))
     }
 
+    /// Get path to the post-hook feed tee for a character (consumed by `sendgs`).
+    /// Returns: ~/.vellum-fe/{character}/feed.log
+    pub fn feed_log_path(character: Option<&str>) -> Result<PathBuf> {
+        Ok(Self::profile_dir(character)?.join("feed.log"))
+    }
+
     /// Get path to cmdlist1.xml (single source of truth)
     /// Returns: ~/.vellum-fe/cmdlist1.xml
     pub fn cmdlist_path() -> Result<PathBuf> {
