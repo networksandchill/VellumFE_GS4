@@ -28,3 +28,9 @@ map_editor.html
 mapdb.json
 temp_map*.json
 map_coordinates_from_csv.json
+
+# Local investigation artifacts (not project docs)
+STALL.md
+RESIZE.md
+tools/stall-profiling/
+.claude/skills/debugging-gemstone-stack/
