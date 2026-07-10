@@ -171,6 +171,12 @@ impl ScrollableContainer {
         self.label = title;
     }
 
+    /// Default fill color for item bars without a per-item color
+    /// (used by the ActiveEffects window's bar_color config).
+    pub fn set_bar_color(&mut self, color: String) {
+        self.bar_color = color;
+    }
+
     pub fn set_transparent_background(&mut self, transparent: bool) {
         self.transparent_background = transparent;
     }

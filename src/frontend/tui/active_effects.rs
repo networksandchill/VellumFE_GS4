@@ -99,6 +99,10 @@ impl ActiveEffects {
         self.container.set_title(title);
     }
 
+    pub fn set_bar_color(&mut self, color: String) {
+        self.container.set_bar_color(color);
+    }
+
     pub fn set_text_color(&mut self, color: Option<String>) {
         self.container.set_text_color(color);
     }
