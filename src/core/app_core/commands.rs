@@ -239,6 +239,17 @@ impl AppCore {
                 self.show_version();
             }
 
+            // Re-dial the game connection after a disconnect (the runtime
+            // watches this flag and respawns the network task).
+            "connect" => {
+                if self.game_state.connected {
+                    self.add_system_message("Already connected.");
+                } else {
+                    self.reconnect_requested = true;
+                    self.add_system_message("Reconnecting...");
+                }
+            }
+
             // Web frontend: reload macros.toml (+ the phone-edited local
             // overlay) and push to connected phones
             "reloadmacros" => {

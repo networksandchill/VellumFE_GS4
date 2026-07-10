@@ -286,10 +286,25 @@ pub fn handle_menu_action(
                 app_core.ui_state.input_mode = InputMode::ThemeBrowser;
             }
             action if action.starts_with("action:settheme:") => {
-                // Update frontend theme cache when theme changes via .settheme command
+                // Switch the active theme BEFORE reading it back — get_theme()
+                // returns the theme for config.active_theme, so updating the
+                // cache without setting it first caches the old theme's
+                // colors under the new id (`.settheme` was a no-op).
                 let theme_id = action.strip_prefix("action:settheme:").unwrap().to_string();
-                let theme = app_core.config.get_theme();
-                frontend.update_theme_cache(theme_id, theme);
+                let presets = crate::theme::ThemePresets::all_with_custom(None);
+                if presets.contains_key(&theme_id) {
+                    app_core.config.active_theme = theme_id.clone();
+                    if let Err(e) = app_core.config.save(app_core.config.character.as_deref()) {
+                        tracing::warn!("Failed to save config after .settheme: {}", e);
+                    }
+                    let theme = app_core.config.get_theme();
+                    frontend.update_theme_cache(theme_id, theme);
+                } else {
+                    app_core.add_system_message(&format!(
+                        "Unknown theme '{}' (see .themes for the list)",
+                        theme_id
+                    ));
+                }
                 app_core.needs_render = true;
             }
             action

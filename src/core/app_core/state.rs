@@ -115,6 +115,10 @@ pub struct AppCore {
     /// Application running flag
     pub running: bool,
 
+    /// Set by `.connect` after a disconnect; the frontend runtime re-dials
+    /// the game connection and clears it.
+    pub reconnect_requested: bool,
+
     /// Dirty flag - true if state changed and needs re-render
     pub needs_render: bool,
 
@@ -241,6 +245,7 @@ impl AppCore {
             current_room_component: None,
             room_window_dirty: false,
             running: true,
+            reconnect_requested: false,
             needs_render: true,
             chunk_has_main_text: false,
             chunk_has_silent_updates: false,
@@ -767,26 +772,33 @@ impl AppCore {
             return;
         }
         let label = button.label.clone();
-        self.config.macros_local.upsert_button(
-            group.as_deref(),
-            button,
-            original
-                .as_ref()
-                .map(|(group, label)| (group.as_deref(), label.as_str())),
-        );
+        // Editing: remove the original from the overlay, or tombstone it
+        // when it comes from the hand-written base file (never rewritten).
+        if let Some((orig_group, orig_label)) = &original {
+            if !self
+                .config
+                .macros_local
+                .delete_button(orig_group.as_deref(), orig_label)
+            {
+                self.config
+                    .macros_local
+                    .hide_button(orig_group.as_deref(), orig_label);
+            }
+        }
+        self.config.macros_local.upsert_button(group.as_deref(), button, None);
         self.persist_and_push_macros(&format!("Saved macro '{}'", label));
     }
 
-    /// Delete a phone-authored macro button. Buttons from the hand-written
-    /// macros.toml are not deletable remotely.
+    /// Delete a macro button. Phone-authored buttons are removed from the
+    /// macros-local.toml overlay; buttons from the hand-written macros.toml
+    /// are tombstoned there instead (the base file is never rewritten).
     pub fn apply_macro_delete(&mut self, group: Option<String>, label: String) {
-        if self.config.macros_local.delete_button(group.as_deref(), &label) {
+        if self.config.macros_local.delete_button(group.as_deref(), &label)
+            || self.config.macros_local.hide_button(group.as_deref(), &label)
+        {
             self.persist_and_push_macros(&format!("Deleted macro '{}'", label));
         } else {
-            self.add_system_message(&format!(
-                "Macro '{}' is defined in macros.toml and can only be edited there",
-                label
-            ));
+            self.add_system_message(&format!("Macro '{}' is already deleted", label));
         }
     }
 
@@ -2020,6 +2032,7 @@ impl AppCore {
         self.add_system_message("  .quit / .q              - Exit VellumFE");
         self.add_system_message("  .help / .h / .?         - Show this help");
         self.add_system_message("  .version / .ver         - Show version info");
+        self.add_system_message("  .connect                - Reconnect to the game after a disconnect");
         self.add_system_message("  .menu                   - Open main menu");
         self.add_system_message("  .settings               - Open settings editor");
         self.add_system_message("  .reload [category]      - Reload config from disk (highlights|keybinds|settings|colors)");
@@ -3945,6 +3958,8 @@ impl AppCore {
                         self.config.sound = new_config.sound;
                         self.config.event_patterns = new_config.event_patterns;
                         self.config.layout_mappings = new_config.layout_mappings;
+                        self.config.streams = new_config.streams;
+                        self.config.target_list = new_config.target_list;
                         self.parser
                             .update_event_patterns(self.config.event_patterns.clone());
                         self.message_processor.apply_config(self.config.clone());

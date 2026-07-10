@@ -1866,6 +1866,44 @@ impl MessageProcessor {
                 tracing::debug!("Room objs now empty (previously had creatures: {})", had_objs);
             }
 
+            // GS4 sends creature condition as a <crtrStatus exist="ID"
+            // dead="1" prone="1" .../> tag preceding each bold section (the
+            // "(stunned)" text suffix parsed below is a legacy/DR format).
+            // Pre-scan the component for them: exist id -> highest-priority
+            // status word (attribute names chosen to match status_abbrev).
+            let crtr_status: std::collections::HashMap<String, String> = {
+                const STATUS_PRIORITY: &[&str] = &[
+                    "dead", "stunned", "frozen", "webbed", "immobile",
+                    "sleeping", "prone", "kneeling", "sitting",
+                ];
+                let mut map = std::collections::HashMap::new();
+                let mut rest = value;
+                while let Some(pos) = rest.find("<crtrStatus ") {
+                    let tag_body = &rest[pos..];
+                    let tag_end = tag_body.find("/>").unwrap_or(tag_body.len());
+                    let tag = &tag_body[..tag_end];
+                    let exist = tag.find("exist=").and_then(|p| {
+                        let after = &tag[p + 6..];
+                        let quote = after.chars().next()?;
+                        if quote == '\'' || quote == '"' {
+                            after[1..].find(quote).map(|e| after[1..=e].to_string())
+                        } else {
+                            None
+                        }
+                    });
+                    if let Some(exist) = exist {
+                        if let Some(status) = STATUS_PRIORITY
+                            .iter()
+                            .find(|s| tag.contains(&format!("{}=", s)))
+                        {
+                            map.insert(exist, status.to_string());
+                        }
+                    }
+                    rest = &rest[pos + tag_end.max(12)..];
+                }
+                map
+            };
+
             let mut remaining = value;
             while let Some(bold_start) = remaining.find("<b>") {
                 // Find the matching </b>
@@ -1938,6 +1976,13 @@ impl MessageProcessor {
                                                     continue;
                                                 }
                                             }
+
+                                            // Prefer the crtrStatus attribute (GS4's real
+                                            // format); the "(...)" suffix is the fallback.
+                                            let status = crtr_status
+                                                .get(exist_id)
+                                                .cloned()
+                                                .or(status);
 
                                             let creature = crate::core::state::Creature {
                                                 id: format!("#{}", exist_id),
@@ -2254,6 +2299,58 @@ impl MessageProcessor {
     /// Flush current text to appropriate window
     pub fn flush_current_stream(&mut self, ui_state: &mut UiState) {
         self.flush_current_stream_with_tts(ui_state, None);
+    }
+
+    /// Deliver a finalized line to a window regardless of its content kind.
+    /// The fallback/redirect-copy paths resolve a window by *name* (usually
+    /// "main"), so they can land on a TabbedText window: the line goes to the
+    /// tab subscribed to `stream`, else the tab subscribed to "main", else the
+    /// active tab, with the same unread flagging as the subscriber loop.
+    /// Returns false when the window kind can't display text lines.
+    fn deliver_line_to_window_content(
+        content: &mut WindowContent,
+        line: StyledLine,
+        stream: &str,
+    ) -> bool {
+        match content {
+            WindowContent::Text(c) => {
+                c.add_line(line);
+                true
+            }
+            WindowContent::Inventory(c) => {
+                c.add_line(line);
+                true
+            }
+            WindowContent::Spells(c) => {
+                c.add_line(line);
+                true
+            }
+            WindowContent::TabbedText(tc) => {
+                if tc.tabs.is_empty() {
+                    return false;
+                }
+                let active = tc.active_tab_index.min(tc.tabs.len() - 1);
+                let subscribed = |tab: &crate::data::TabState, wanted: &str| {
+                    tab.definition
+                        .streams
+                        .iter()
+                        .any(|s| s.trim().eq_ignore_ascii_case(wanted))
+                };
+                let idx = tc
+                    .tabs
+                    .iter()
+                    .position(|t| subscribed(t, stream))
+                    .or_else(|| tc.tabs.iter().position(|t| subscribed(t, "main")))
+                    .unwrap_or(active);
+                let tab = &mut tc.tabs[idx];
+                tab.content.add_line(line);
+                if idx != active && !tab.definition.ignore_activity {
+                    tab.has_unread = true;
+                }
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Flush current stream with optional TTS enqueuing
@@ -2747,8 +2844,41 @@ impl MessageProcessor {
                         self.current_stream,
                         fallback_window
                     );
+                    let mut delivered = false;
                     if let Some(fallback) = ui_state.get_window_mut(&fallback_window) {
-                        if let WindowContent::Text(ref mut content) = fallback.content {
+                        // Apply window-specific replacements if any
+                        let final_line = if deferred_replacements.is_empty() {
+                            line.clone()
+                        } else {
+                            StyledLine {
+                                segments: super::highlight_engine::apply_deferred_for_window(
+                                    &line.segments,
+                                    &deferred_replacements,
+                                    &fallback_window,
+                                ),
+                                stream: line.stream.clone(),
+                                timestamp: line.timestamp,
+                            }
+                        };
+                        delivered = Self::deliver_line_to_window_content(
+                            &mut fallback.content,
+                            final_line,
+                            &self.current_stream,
+                        );
+                        if delivered {
+                            if let Some(tts_mgr) = tts_manager.as_deref_mut() {
+                                self.enqueue_tts(tts_mgr, &fallback_window, line);
+                            }
+                        }
+                    }
+                    if !delivered && fallback_window != "main" {
+                        // Fallback window missing or can't display text - try
+                        // main as last resort
+                        tracing::trace!(
+                            "Fallback window '{}' not found, routing to main",
+                            fallback_window
+                        );
+                        if let Some(main_window) = ui_state.get_window_mut("main") {
                             // Apply window-specific replacements if any
                             let final_line = if deferred_replacements.is_empty() {
                                 line.clone()
@@ -2757,42 +2887,19 @@ impl MessageProcessor {
                                     segments: super::highlight_engine::apply_deferred_for_window(
                                         &line.segments,
                                         &deferred_replacements,
-                                        &fallback_window,
+                                        "main",
                                     ),
                                     stream: line.stream.clone(),
                                     timestamp: line.timestamp,
                                 }
                             };
-                            content.add_line(final_line);
-                            if let Some(tts_mgr) = tts_manager.as_deref_mut() {
-                                self.enqueue_tts(tts_mgr, &fallback_window, &line);
-                            }
-                        }
-                    } else if fallback_window != "main" {
-                        // Fallback window doesn't exist, try main as last resort
-                        tracing::trace!(
-                            "Fallback window '{}' not found, routing to main",
-                            fallback_window
-                        );
-                        if let Some(main_window) = ui_state.get_window_mut("main") {
-                            if let WindowContent::Text(ref mut content) = main_window.content {
-                                // Apply window-specific replacements if any
-                                let final_line = if deferred_replacements.is_empty() {
-                                    line.clone()
-                                } else {
-                                    StyledLine {
-                                        segments: super::highlight_engine::apply_deferred_for_window(
-                                            &line.segments,
-                                            &deferred_replacements,
-                                            "main",
-                                        ),
-                                        stream: line.stream.clone(),
-                                        timestamp: line.timestamp,
-                                    }
-                                };
-                                content.add_line(final_line);
+                            if Self::deliver_line_to_window_content(
+                                &mut main_window.content,
+                                final_line,
+                                &self.current_stream,
+                            ) {
                                 if let Some(tts_mgr) = tts_manager.as_deref_mut() {
-                                    self.enqueue_tts(tts_mgr, "main", &line);
+                                    self.enqueue_tts(tts_mgr, "main", line);
                                 }
                             }
                         }
@@ -2815,53 +2922,50 @@ impl MessageProcessor {
             );
 
             // Route to original window
+            let mut delivered = false;
             if let Some(window) = ui_state.get_window_mut(&original_window_name) {
-                match window.content {
-                    WindowContent::Text(ref mut content) => {
-                        // Apply window-specific replacements if any
-                        let final_line = if deferred_replacements.is_empty() {
-                            line.clone()
-                        } else {
-                            StyledLine {
-                                segments: super::highlight_engine::apply_deferred_for_window(
-                                    &line.segments,
-                                    &deferred_replacements,
-                                    &original_window_name,
-                                ),
-                                stream: line.stream.clone(),
-                                timestamp: line.timestamp,
-                            }
-                        };
-                        content.add_line(final_line);
+                // Apply window-specific replacements if any
+                let final_line = if deferred_replacements.is_empty() {
+                    line.clone()
+                } else {
+                    StyledLine {
+                        segments: super::highlight_engine::apply_deferred_for_window(
+                            &line.segments,
+                            &deferred_replacements,
+                            &original_window_name,
+                        ),
+                        stream: line.stream.clone(),
+                        timestamp: line.timestamp,
                     }
-                    WindowContent::Inventory(ref mut content) => {
-                        content.add_line(line.clone());
-                    }
-                    WindowContent::Spells(ref mut content) => {
-                        content.add_line(line.clone());
-                    }
-                    _ => {}
-                }
-            } else if original_window_name != "main" {
+                };
+                delivered = Self::deliver_line_to_window_content(
+                    &mut window.content,
+                    final_line,
+                    &self.current_stream,
+                );
+            }
+            if !delivered && original_window_name != "main" {
                 // Fallback to main for original stream too
                 if let Some(main_window) = ui_state.get_window_mut("main") {
-                    if let WindowContent::Text(ref mut content) = main_window.content {
-                        // Apply window-specific replacements if any
-                        let final_line = if deferred_replacements.is_empty() {
-                            line.clone()
-                        } else {
-                            StyledLine {
-                                segments: super::highlight_engine::apply_deferred_for_window(
-                                    &line.segments,
-                                    &deferred_replacements,
-                                    "main",
-                                ),
-                                stream: line.stream.clone(),
-                                timestamp: line.timestamp,
-                            }
-                        };
-                        content.add_line(final_line);
-                    }
+                    // Apply window-specific replacements if any
+                    let final_line = if deferred_replacements.is_empty() {
+                        line.clone()
+                    } else {
+                        StyledLine {
+                            segments: super::highlight_engine::apply_deferred_for_window(
+                                &line.segments,
+                                &deferred_replacements,
+                                "main",
+                            ),
+                            stream: line.stream.clone(),
+                            timestamp: line.timestamp,
+                        }
+                    };
+                    Self::deliver_line_to_window_content(
+                        &mut main_window.content,
+                        final_line,
+                        &self.current_stream,
+                    );
                 }
             }
         } else {

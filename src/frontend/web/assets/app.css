@@ -57,9 +57,10 @@ html, body {
      follow the visual viewport's offset so the app can't be pushed off
      the top of the screen (0 where the viewport resizes instead). */
   transform: translateY(var(--vvt, 0px));
-  /* Keep chrome clear of notches / home indicators when installed as PWA */
+  /* Keep chrome clear of notches when installed as PWA; the bottom
+     inset lives inside #bottombar so its background fills the screen
+     down past the rounded corners. */
   padding-top: env(safe-area-inset-top);
-  padding-bottom: env(safe-area-inset-bottom);
 }
 
 #topbar {
@@ -263,6 +264,7 @@ html, body {
 #bottombar {
   position: relative;
   background: var(--bg-panel);
+  /* Runs to the physical bottom edge of the screen. */
   padding: 0 10px 8px;
 }
 
@@ -282,20 +284,6 @@ html, body {
   background: var(--rt);
   transition: width 100ms linear;
 }
-
-#rt-label {
-  position: absolute;
-  top: 9px;
-  right: 10px;
-  font-size: 10px;
-  color: var(--fg-dim);
-  background: var(--bg-panel);
-  padding: 0 4px;
-  border-radius: 4px;
-  z-index: 1;
-}
-
-#rt-label:empty { display: none; }
 
 /* Macro rail */
 #macro-rail {
@@ -344,16 +332,6 @@ html, body {
 
 .macro-btn:active {
   background: var(--fg-dim);
-}
-
-#macro-add {
-  flex-shrink: 0;
-  padding: 7px 10px;
-  background: none;
-  border: 1px dashed var(--fg-dim);
-  border-radius: 6px;
-  color: var(--fg-dim);
-  font-size: 13px;
 }
 
 #macro-collapse {
@@ -511,7 +489,10 @@ html, body {
 
 #hands {
   display: flex;
-  gap: 12px;
+  flex-wrap: wrap;
+  gap: 2px 12px;
+  flex: 1 1 auto;
+  min-width: 0;
   overflow: hidden;
 }
 
@@ -546,23 +527,21 @@ html, body {
   flex-shrink: 0;
 }
 
-/* Effects pills: ✦ spells+buffs (count + soonest expiry), ⚠ debuffs+
-   cooldowns (only exists when something is wrong). */
+/* Effects pill: green with Sword Hymn's countdown while the buff is up,
+   blue "Buffs" otherwise. Tapping it opens the effects sheet. */
 .fx-pill {
   padding: 2px 8px;
   background: none;
-  border: 1px solid var(--border);
+  border: 1px solid #4da3ff;
   border-radius: 10px;
-  color: var(--fg);
+  color: #4da3ff;
   font: inherit;
   font-size: 11px;
   white-space: nowrap;
 }
 
 .fx-pill[hidden] { display: none; }
-.fx-pill.fx-warn { border-color: var(--st); color: var(--st); }
-.fx-pill.fx-crit { border-color: var(--hp); color: var(--hp); }
-.fx-pill.fx-bad { border-color: var(--hp); color: var(--hp); }
+.fx-pill.fx-on { border-color: #3ddc84; color: #3ddc84; }
 
 /* Effects list rows (bottom sheet + tablet sidebar) */
 .effect-row {
@@ -830,9 +809,9 @@ html, body {
 /* Hands + status indicators (bottom, above vitals) */
 #status-row {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   justify-content: space-between;
-  gap: 8px;
+  gap: 4px 8px;
   margin-bottom: 6px;
   font-size: 12px;
   min-height: 16px;
@@ -1350,8 +1329,7 @@ html, body {
    some of these elements manage their own hidden attribute from JS. */
 body.hide-vitals #vitals { display: none !important; }
 body.hide-hands #hands { display: none !important; }
-body.hide-rt #rt-label { display: none !important; }
-body.hide-fx #fx-buffs, body.hide-fx #fx-debuffs { display: none !important; }
+body.hide-fx #fx-buffs { display: none !important; }
 body.hide-chips #chips { display: none !important; }
 
 .theme-row {

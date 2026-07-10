@@ -401,20 +401,20 @@ async fn macros_flow_definitions_out_taps_in() {
     client.send_resume(0).await;
     assert_eq!(read_json_timeout(&mut client).await["t"], "snapshot");
 
-    // Definitions arrive after the snapshot: ids and labels, no commands.
+    // Definitions arrive after the snapshot. Commands are echoed so the
+    // phone editor can prefill (all buttons are remotely editable; base
+    // originals get tombstoned into macros-local.toml, never rewritten).
     let macros = read_json_timeout(&mut client).await;
     assert_eq!(macros["t"], "macros");
     let d = &macros["d"];
     assert_eq!(d["groups"][0]["name"], "Town");
     assert_eq!(d["groups"][0]["buttons"][0]["id"], "g:0:b:0");
     assert_eq!(d["groups"][0]["buttons"][1]["options"][0]["id"], "g:0:b:1:o:0");
+    assert_eq!(d["groups"][0]["buttons"][1]["options"][0]["command"], ";go2 bank");
     assert_eq!(d["floating"][0]["id"], "f:0");
-    assert!(
-        !macros.to_string().contains(";go2 bank"),
-        "commands must never reach the client"
-    );
-    // Type-in buttons are the exception: the client needs their text to
-    // put it in the input box, so it ships with the definition.
+    assert_eq!(d["groups"][0]["buttons"][0]["editable"], true);
+    // Type-in buttons ship their text so the client can put it in the
+    // input box; insert taps never round-trip through the server.
     assert_eq!(d["groups"][0]["buttons"][2]["insert"], true);
     assert_eq!(d["groups"][0]["buttons"][2]["command"], "go");
     assert_eq!(d["groups"][0]["buttons"][0]["insert"], false);

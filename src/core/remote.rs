@@ -83,12 +83,13 @@ pub struct RemoteMacroButton {
     pub x: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub y: Option<f32>,
-    /// Phone-authored (macros-local.toml): may be edited/deleted remotely.
+    /// May be edited/deleted remotely. Always true now: phone-authored
+    /// buttons live in macros-local.toml; base-file (macros.toml) buttons
+    /// are edited by tombstoning the original there and saving the new
+    /// version to the overlay — the hand-written file is never rewritten.
     pub editable: bool,
-    /// The command behind an editable action button, echoed back so the
-    /// phone editor can prefill its form. Hand-file commands stay private
-    /// unless the button is type-in (`insert`) — that text is the client's
-    /// to display by definition.
+    /// The command behind an action button, echoed back so the phone
+    /// editor can prefill its form.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
 }
@@ -100,8 +101,7 @@ pub struct RemoteMacroOption {
     pub confirm: bool,
     /// Type-in option (see `RemoteMacroButton::insert`).
     pub insert: bool,
-    /// Echoed for phone-authored buttons and type-in options, so the
-    /// editor can prefill and insert taps stay client-side.
+    /// Echoed so the editor can prefill and insert taps stay client-side.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
 }
@@ -119,11 +119,7 @@ impl RemoteMacros {
                         label: option.label.clone(),
                         confirm: option.confirm,
                         insert: option.insert,
-                        command: if button.editable || option.insert {
-                            Some(option.command.clone())
-                        } else {
-                            None
-                        },
+                        command: Some(option.command.clone()),
                     })
                     .collect(),
                 id,
@@ -133,12 +129,8 @@ impl RemoteMacros {
                 insert: button.insert,
                 x: button.x,
                 y: button.y,
-                editable: button.editable,
-                command: if button.editable || button.insert {
-                    button.command.clone()
-                } else {
-                    None
-                },
+                editable: true,
+                command: button.command.clone(),
             }
         }
         Self {

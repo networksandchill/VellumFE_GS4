@@ -98,12 +98,16 @@ impl Dashboard {
             value: 0, // Default to off
         };
 
-        self.indicator_map.insert(id.clone(), self.indicators.len());
+        // Key the lookup map case-insensitively: indicator events arrive with
+        // the game's casing (e.g. "BLEEDING" from IconBLEEDING) while config
+        // ids are usually lowercase — an exact-match map never lit those.
+        self.indicator_map
+            .insert(id.to_ascii_lowercase(), self.indicators.len());
         self.indicators.push(indicator);
     }
 
     pub fn set_indicator_value(&mut self, id: &str, value: u8) {
-        if let Some(&idx) = self.indicator_map.get(id) {
+        if let Some(&idx) = self.indicator_map.get(&id.to_ascii_lowercase()) {
             if let Some(indicator) = self.indicators.get_mut(idx) {
                 indicator.value = value;
             }

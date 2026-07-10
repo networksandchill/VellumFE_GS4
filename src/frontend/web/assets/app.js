@@ -27,7 +27,6 @@ const chipsBar = document.getElementById("chips");
 const topbarTitle = document.getElementById("topbar-title");
 const connEl = document.getElementById("conn");
 const rtFill = document.getElementById("rt-fill");
-const rtLabel = document.getElementById("rt-label");
 const handsEl = document.getElementById("hands");
 const handLeftEl = document.getElementById("hand-left");
 const handRightEl = document.getElementById("hand-right");
@@ -480,8 +479,7 @@ function setIndicators(d) {
 // Tap either for the full sheet; wide viewports show a persistent
 // sidebar instead (CSS hides the pills there).
 
-const fxBuffsPill = document.getElementById("fx-buffs");
-const fxDebuffsPill = document.getElementById("fx-debuffs");
+const fxPill = document.getElementById("fx-buffs");
 const effectsPanel = document.getElementById("effects-panel");
 
 const CATEGORY_LABELS = {
@@ -523,34 +521,24 @@ function fmtRemaining(ms) {
     : `${m}:${String(sec).padStart(2, "0")}`;
 }
 
-function soonestExpiry(categories) {
-  let soonest = null;
-  for (const cat of categories) {
+// Single effects pill: green with Sword Hymn's remaining time while the
+// buff is up, blue "Buffs" otherwise.
+function renderPill(pill) {
+  let hymn = null;
+  for (const cat of effectCategories) {
     for (const e of cat.effects) {
-      if (e.expiresAt !== null && (soonest === null || e.expiresAt < soonest)) {
-        soonest = e.expiresAt;
-      }
+      if (/sword hymn/i.test(e.text)) hymn = e;
     }
   }
-  return soonest;
-}
-
-function renderPill(pill, categories, icon) {
-  const count = categories.reduce((n, c) => n + c.effects.length, 0);
-  if (!count) {
-    pill.hidden = true;
-    return;
+  const active = hymn !== null;
+  pill.classList.toggle("fx-on", active);
+  if (active && hymn.expiresAt !== null) {
+    pill.textContent = fmtRemaining(hymn.expiresAt - Date.now());
+  } else if (active) {
+    pill.textContent = "✦";
+  } else {
+    pill.textContent = "Buffs";
   }
-  const soonest = soonestExpiry(categories);
-  const remaining = soonest === null ? null : soonest - Date.now();
-  pill.hidden = false;
-  pill.textContent =
-    remaining === null ? `${icon}${count}` : `${icon}${count} ${fmtRemaining(remaining)}`;
-  pill.classList.toggle("fx-crit", remaining !== null && remaining < 30_000);
-  pill.classList.toggle(
-    "fx-warn",
-    remaining !== null && remaining >= 30_000 && remaining < 120_000
-  );
 }
 
 function buildEffectRows(target) {
@@ -593,14 +581,7 @@ function buildEffectRows(target) {
 let effectsSheetOpen = false;
 
 function renderEffects() {
-  const good = effectCategories.filter(
-    c => c.category === "ActiveSpells" || c.category === "Buffs"
-  );
-  const bad = effectCategories.filter(
-    c => c.category === "Debuffs" || c.category === "Cooldowns"
-  );
-  renderPill(fxBuffsPill, good, "✦");
-  renderPill(fxDebuffsPill, bad, "⚠");
+  renderPill(fxPill);
   buildEffectRows(effectsPanel);
   if (effectsSheetOpen && !sheet.hidden) buildEffectRows(sheetItems);
 }
@@ -611,8 +592,7 @@ function openEffectsSheet() {
   buildEffectRows(sheetItems);
 }
 
-fxBuffsPill.addEventListener("click", openEffectsSheet);
-fxDebuffsPill.addEventListener("click", openEffectsSheet);
+fxPill.addEventListener("click", openEffectsSheet);
 
 // Tick displayed times locally between server refreshes.
 setInterval(() => {
@@ -645,16 +625,14 @@ function tickRt() {
   const remaining = end - serverNowInt();
   const isCast = (state.ctEnd ?? 0) >= (state.rtEnd ?? 0) && (state.ctEnd ?? 0) > 0;
   // The bar itself is the panel divider and always visible; only the
-  // fill and the little numeric chip come and go.
+  // fill comes and goes.
   if (remaining > 0) {
     const smooth = Math.max(0, end - serverNowFrac());
     const frac = state.rtTotal > 0 ? Math.min(1, smooth / state.rtTotal) : 0;
     rtFill.style.width = `${frac * 100}%`;
     rtFill.style.background = isCast ? "var(--ct)" : "var(--rt)";
-    rtLabel.textContent = `${isCast ? "CT" : "RT"} ${remaining}`;
   } else {
     rtFill.style.width = "0";
-    rtLabel.textContent = "";
   }
 }
 
@@ -1126,7 +1104,6 @@ const CHROME_TOGGLES = [
   ["compass", "Compass"],
   ["vitals", "Vitals bars"],
   ["hands", "Hands"],
-  ["rt", "RT label"],
   ["fx", "Effect pills"],
   ["chips", "Stream chips"],
 ];
@@ -1678,9 +1655,10 @@ document.addEventListener("click", (ev) => {
   if (sheet.hidden) return;
   if (ev.target.closest("#sheet")) return;
   // A picked sheet item may already be detached (the pick re-rendered the
-  // sheet, e.g. option -> confirm step); closest("#sheet") can't see that,
-  // but the class on the detached node itself still matches.
-  if (ev.target.closest(".sheet-item, .sheet-empty")) return;
+  // sheet, e.g. option -> confirm step, or the editor's Delete opening its
+  // confirm); closest("#sheet") can't see that, but the class on the
+  // detached node (or its detached ancestors) still matches.
+  if (ev.target.closest(".sheet-item, .sheet-empty, .sheet-form")) return;
   if (ev.target.closest("span.link")) return;
   if (ev.target.closest("#repeat-btn")) return; // long-press opens history
   if (ev.target.closest("#macro-rail")) return; // rail taps retarget the sheet
@@ -1882,11 +1860,11 @@ function renderMacros() {
       document.getElementById("drawer-left").classList.contains("open")) {
     renderTray();
   }
-  // Rail shows once definitions arrive, even empty: the + button is how
-  // the first macro gets created from the phone.
   macroRail.hidden = macros === null;
   const group = currentGroup();
-  macroGroupBtn.hidden = !group;
+  // The group chip only earns its space when there's something to switch
+  // to; macros are managed from the left drawer, not the rail.
+  macroGroupBtn.hidden = !group || macros.groups.length <= 1;
   macroButtonsEl.replaceChildren();
   if (!group) return;
   macroGroupBtn.textContent =
@@ -2041,7 +2019,9 @@ function editableButtons() {
   return list;
 }
 
-document.getElementById("macro-add").addEventListener("click", () => {
+// Add/edit macros sheet, opened from the left drawer tray (the bottom
+// rail deliberately has no + button).
+function openMacroManage() {
   const editable = editableButtons();
   if (!editable.length) {
     openMacroEditor(null);
@@ -2059,7 +2039,7 @@ document.getElementById("macro-add").addEventListener("click", () => {
       () => openMacroEditor(entry)
     );
   }
-});
+}
 
 // The editor never exposes the \r storage convention: tap behavior is a
 // three-way picker, and the trailing \r ("type, then send") is appended
@@ -2737,7 +2717,7 @@ function renderTray() {
   add.type = "button";
   add.className = "tray-add";
   add.textContent = "＋ Add or edit macros";
-  add.addEventListener("click", () => document.getElementById("macro-add").click());
+  add.addEventListener("click", openMacroManage);
   tray.appendChild(add);
 }
 

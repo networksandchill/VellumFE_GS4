@@ -521,6 +521,7 @@ impl Default for Config {
                 account: None,
                 password: None,
                 game: None,
+                relaunch_command: None,
             },
             ui: UiConfig {
                 buffer_size: default_buffer_size(),

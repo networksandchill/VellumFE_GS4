@@ -1565,10 +1565,20 @@ impl TuiFrontend {
                                 *y,
                                 window_rect,
                             ) {
-                                // Find window index from the stable (sorted) ordering
-                                let window_index = window_names
-                                    .binary_search(&&window_name)
-                                    .unwrap_or(0);
+                                // Use the RENDER index (z-order cache): the
+                                // renderer checks selection cells against this
+                                // index, and it diverges from plain sorted
+                                // order (command_input/ephemeral windows are
+                                // pinned to the end) — a mismatch makes the
+                                // highlight invisible while copy still works.
+                                let window_index = self
+                                    .window_order_cache
+                                    .render_index
+                                    .get(&window_name)
+                                    .copied()
+                                    .unwrap_or_else(|| {
+                                        window_names.binary_search(&&window_name).unwrap_or(0)
+                                    });
                                 app_core.ui_state.selection_state =
                                     Some(crate::selection::SelectionState::new(
                                         window_index,
@@ -1710,8 +1720,15 @@ impl TuiFrontend {
                                 if let Some((line, col)) = self
                                     .mouse_to_text_coords(name, *x, *y, window_rect)
                                 {
-                                    let window_index =
-                                        window_names.binary_search(&name).unwrap_or(0);
+                                    // Must match the render index (see selection start)
+                                    let window_index = self
+                                        .window_order_cache
+                                        .render_index
+                                        .get(name.as_str())
+                                        .copied()
+                                        .unwrap_or_else(|| {
+                                            window_names.binary_search(&name).unwrap_or(0)
+                                        });
                                     selection.update_end(window_index, line, col);
                                     app_core.needs_render = true;
                                 }

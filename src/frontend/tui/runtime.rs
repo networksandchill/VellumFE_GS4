@@ -173,7 +173,7 @@ async fn async_run(
         mpsc::channel::<ServerMessage>(crate::network::SERVER_CHANNEL_CAPACITY);
     // Command channel stays unbounded: sends happen in the synchronous UI
     // event loop (can't await) and volume is user-typed commands only.
-    let (command_tx, command_rx) = mpsc::unbounded_channel::<String>();
+    let (mut command_tx, command_rx) = mpsc::unbounded_channel::<String>();
 
     // Store connection info
     let host = config.connection.host.clone();
@@ -310,32 +310,102 @@ async fn async_run(
         }
     }
 
-    // Spawn network connection task
-    let network_handle = match direct {
-        Some(cfg) => tokio::spawn(async move {
-            if let Err(e) = DirectConnection::start(cfg, server_tx, command_rx, raw_logger).await {
-                tracing::error!(error = ?e, "Network connection error");
-            }
-        }),
-        None => {
-            let host_clone = host.clone();
-            let login_key_clone = login_key.clone();
-            tokio::spawn(async move {
+    // Spawn network connection task. `direct`/`host`/`login_key` are kept
+    // around so `.connect` can re-dial after a disconnect. On a `.connect`
+    // (reconnect=true, Lich mode) with nothing listening — Lich exits with
+    // the game — the configured relaunch_command restarts it and we wait
+    // for the port before attaching.
+    let spawn_network = |direct: Option<crate::network::DirectConnectConfig>,
+                         host: String,
+                         login_key: Option<String>,
+                         server_tx: mpsc::Sender<ServerMessage>,
+                         command_rx: mpsc::UnboundedReceiver<String>,
+                         raw_logger,
+                         relaunch: Option<String>,
+                         reconnect: bool| {
+        // Feedback lines flow through the normal parser path so they show
+        // in the main window (tracing alone is invisible mid-session).
+        async fn say(tx: &mpsc::Sender<ServerMessage>, msg: &str) {
+            let _ = tx.send(ServerMessage::Text(format!("{msg}\n"))).await;
+        }
+        match direct {
+            Some(cfg) => tokio::spawn(async move {
+                if let Err(e) =
+                    DirectConnection::start(cfg, server_tx.clone(), command_rx, raw_logger).await
+                {
+                    tracing::error!(error = ?e, "Network connection error");
+                    say(&server_tx, &format!("Connection error: {e:#}")).await;
+                    let _ = server_tx.send(ServerMessage::Disconnected).await;
+                }
+            }),
+            None => tokio::spawn(async move {
+                let addr = format!("{host}:{port}");
+                if reconnect && tokio::net::TcpStream::connect(&addr).await.is_err() {
+                    // Nothing listening: Lich is gone. Restart it if we know how.
+                    let Some(cmd) = relaunch else {
+                        say(
+                            &server_tx,
+                            "Lich is not running and no [connection] relaunch_command is configured in config.toml.",
+                        )
+                        .await;
+                        let _ = server_tx.send(ServerMessage::Disconnected).await;
+                        return;
+                    };
+                    say(&server_tx, &format!("Lich is not running; launching: {cmd}")).await;
+                    match tokio::process::Command::new("sh").arg("-c").arg(&cmd).spawn() {
+                        Ok(_) => {
+                            let mut up = false;
+                            for _ in 0..120 {
+                                tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+                                if tokio::net::TcpStream::connect(&addr).await.is_ok() {
+                                    up = true;
+                                    break;
+                                }
+                            }
+                            if !up {
+                                say(&server_tx, "Lich did not come up within 2 minutes; giving up. Try .connect again.").await;
+                                let _ = server_tx.send(ServerMessage::Disconnected).await;
+                                return;
+                            }
+                            // The port probe briefly occupied Lich's single
+                            // frontend slot; give it a moment to free it.
+                            tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+                            say(&server_tx, "Lich is up; attaching...").await;
+                        }
+                        Err(e) => {
+                            say(&server_tx, &format!("Failed to run relaunch command: {e}")).await;
+                            let _ = server_tx.send(ServerMessage::Disconnected).await;
+                            return;
+                        }
+                    }
+                }
                 if let Err(e) = LichConnection::start(
-                    &host_clone,
+                    &host,
                     port,
-                    login_key_clone,
-                    server_tx,
+                    login_key,
+                    server_tx.clone(),
                     command_rx,
                     raw_logger,
                 )
                 .await
                 {
                     tracing::error!(error = ?e, "Network connection error");
+                    say(&server_tx, &format!("Connection error: {e:#}")).await;
+                    let _ = server_tx.send(ServerMessage::Disconnected).await;
                 }
-            })
+            }),
         }
     };
+    let mut network_handle = spawn_network(
+        direct.clone(),
+        host.clone(),
+        login_key.clone(),
+        server_tx.clone(),
+        command_rx,
+        raw_logger,
+        None,
+        false,
+    );
 
     // Track time for periodic countdown updates
     let mut last_countdown_update = std::time::Instant::now();
@@ -346,6 +416,31 @@ async fn async_run(
 
     // Main event loop
     while app_core.running {
+        // `.connect`: re-dial the game with fresh channels. The old network
+        // task has normally already exited with the dropped connection.
+        if app_core.reconnect_requested {
+            app_core.reconnect_requested = false;
+            network_handle.abort();
+            let (new_tx, new_rx) = mpsc::unbounded_channel::<String>();
+            command_tx = new_tx;
+            let raw_logger = match crate::network::RawLogger::new(&app_core.config) {
+                Ok(logger) => logger,
+                Err(e) => {
+                    tracing::error!("Failed to initialize raw logger: {}", e);
+                    None
+                }
+            };
+            network_handle = spawn_network(
+                direct.clone(),
+                host.clone(),
+                login_key.clone(),
+                server_tx.clone(),
+                new_rx,
+                raw_logger,
+                app_core.config.connection.relaunch_command.clone(),
+                true,
+            );
+        }
         // Fire delayed startup music once its deadline passes
         if startup_music_at.is_some_and(|t| Instant::now() >= t) {
             startup_music_at = None;

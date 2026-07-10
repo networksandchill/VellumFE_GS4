@@ -967,9 +967,16 @@ async fn handle_client(mut socket: WebSocket, state: Arc<WebState>) {
             incoming = socket.recv() => match incoming {
                 None | Some(Err(_)) | Some(Ok(Message::Close(_))) => break,
                 Some(Ok(Message::Text(text))) => {
-                    if let Some(msg) = protocol::parse_client_message(&text) {
-                        if !handle_client_message(&mut socket, &state, client_id, msg).await {
-                            break;
+                    let preview: String = text.chars().take(200).collect();
+                    match protocol::parse_client_message(&text) {
+                        Some(msg) => {
+                            tracing::debug!("web rx [{client_id}]: {preview}");
+                            if !handle_client_message(&mut socket, &state, client_id, msg).await {
+                                break;
+                            }
+                        }
+                        None => {
+                            tracing::warn!("web rx [{client_id}]: unparseable message: {preview}");
                         }
                     }
                 }

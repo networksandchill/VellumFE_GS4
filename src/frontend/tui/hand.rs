@@ -30,6 +30,8 @@ pub struct Hand {
     background_color: Option<Color>,
     transparent_background: bool,
     link_data: Option<crate::data::LinkData>,
+    /// User highlight patterns; the first match colors the item text
+    highlight_engine: crate::core::CoreHighlightEngine,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -62,7 +64,12 @@ impl Hand {
             background_color: None,
             transparent_background: false, // Default to transparent
             link_data: None,
+            highlight_engine: crate::core::CoreHighlightEngine::empty(),
         }
+    }
+
+    pub fn set_highlights(&mut self, highlights: Vec<crate::config::HighlightPattern>) {
+        self.highlight_engine.update_if_changed(highlights);
     }
 
     pub fn set_border_config(
@@ -229,7 +236,14 @@ impl Hand {
         // Trust that text_color is always set by window manager from config resolution
         let base_text_color = self.text_color.unwrap_or(Color::Reset);
         let icon_color = self.icon_color.unwrap_or(base_text_color);
-        let content_color = self.content_highlight_color.unwrap_or(base_text_color);
+        // User highlights win over the configured text/link color
+        let highlight_color = self
+            .highlight_engine
+            .get_first_match_color(&self.content)
+            .and_then(|c| Self::parse_color(&c));
+        let content_color = highlight_color
+            .or(self.content_highlight_color)
+            .unwrap_or(base_text_color);
 
         let y = inner_area.y;
 

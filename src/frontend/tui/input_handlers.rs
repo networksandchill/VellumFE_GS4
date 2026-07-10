@@ -39,6 +39,24 @@ impl super::TuiFrontend {
                     app_core.needs_render = true;
                     return Ok(None);
                 }
+                // ctrl+n / ctrl+p cycle matches too — friendlier on
+                // keyboards without easy PageUp/PageDown (e.g. Mac laptops)
+                KeyCode::Char('n') => {
+                    let focused_name = app_core.get_focused_window_name();
+                    if self.next_search_match(&focused_name) {
+                        tracing::debug!("Jumped to next search match in '{}'", focused_name);
+                    }
+                    app_core.needs_render = true;
+                    return Ok(None);
+                }
+                KeyCode::Char('p') => {
+                    let focused_name = app_core.get_focused_window_name();
+                    if self.prev_search_match(&focused_name) {
+                        tracing::debug!("Jumped to previous search match in '{}'", focused_name);
+                    }
+                    app_core.needs_render = true;
+                    return Ok(None);
+                }
                 _ => {}
             }
         }

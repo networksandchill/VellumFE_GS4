@@ -39,15 +39,20 @@ fn is_body_part(creature: &crate::core::state::Creature) -> bool {
 /// Check if a creature should be filtered from the targets list
 /// Based on Lich's filtering logic for dead/gone, animated, and body parts
 /// Returns (should_filter, is_body_part) tuple
-fn should_filter_creature(creature: &crate::core::state::Creature) -> (bool, bool) {
+fn should_filter_creature(
+    creature: &crate::core::state::Creature,
+    show_dead: bool,
+) -> (bool, bool) {
     // Check if it's a body part first
     let body_part = is_body_part(creature);
 
-    // Filter dead or gone creatures
-    if let Some(ref status) = creature.status {
-        let status_lower = status.to_lowercase();
-        if status_lower.contains("dead") || status_lower.contains("gone") {
-            return (true, body_part);
+    // Filter dead or gone creatures (unless configured to keep them)
+    if !show_dead {
+        if let Some(ref status) = creature.status {
+            let status_lower = status.to_lowercase();
+            if status_lower.contains("dead") || status_lower.contains("gone") {
+                return (true, body_part);
+            }
         }
     }
 
@@ -172,7 +177,7 @@ impl Targets {
             }
 
             // Apply Lich-style filtering (dead/gone, animated, body parts)
-            let (should_filter, is_body_part) = should_filter_creature(creature);
+            let (should_filter, is_body_part) = should_filter_creature(creature, config.show_dead);
             if is_body_part {
                 self.body_part_count += 1;
             }
@@ -223,7 +228,21 @@ impl Targets {
             let status_len = status_text.as_ref().map(|s| s.len()).unwrap_or(0);
 
             // Choose name based on truncation mode and available width
-            let base_name = if config.truncation_mode == "noun" && creature.status.is_some() {
+            let base_name = if config.truncation_mode == "noun_always" {
+                // Always show just the noun, status or not
+                creature
+                    .noun
+                    .as_ref()
+                    .map(|n| n.clone())
+                    .or_else(|| {
+                        creature
+                            .name
+                            .split_whitespace()
+                            .last()
+                            .map(|s| s.to_string())
+                    })
+                    .unwrap_or_else(|| creature.name.clone())
+            } else if config.truncation_mode == "noun" && creature.status.is_some() {
                 // When truncation_mode is "noun" and there's a status, check if full name + status fits
                 let full_len = creature.name.len() + status_len + 1; // +1 for space
                 if full_len > available_width {

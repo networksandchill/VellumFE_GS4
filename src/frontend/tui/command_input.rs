@@ -22,6 +22,9 @@ use std::path::PathBuf;
 
 pub struct CommandInput {
     model: CommandInputModel,
+    /// Cells drawn by the previous transparent-overlay render (y, x_start,
+    /// x_end): reset before each frame so backspaced glyphs don't linger.
+    overlay_prev: std::cell::Cell<Option<(u16, u16, u16)>>,
     show_border: bool,
     border_style: Option<String>,
     border_color: Option<String>,
@@ -41,6 +44,7 @@ impl CommandInput {
     pub fn new(max_history: usize) -> Self {
         Self {
             model: CommandInputModel::new(max_history),
+            overlay_prev: std::cell::Cell::new(None),
             show_border: true,
             border_style: None,
             border_color: None,
@@ -402,12 +406,58 @@ impl CommandInput {
                 }
                 spans.push(Span::styled(ch.to_string(), style));
             }
+            // While typing, the cursor sits one past the last character —
+            // no char cell gets the cursor style above, so draw a block
+            // there or the cursor vanishes whenever it's at the end.
+            if visible_cursor_pos >= visible_chars.len() {
+                spans.push(Span::styled(
+                    " ",
+                    Style::default().bg(cursor_bg).fg(cursor_fg),
+                ));
+            }
         }
 
         let line = Line::from(spans);
 
-        let paragraph = Paragraph::new(line);
-        paragraph.render(text_area, buf);
+        if self.background_color.is_none() {
+            // Transparent input: draw only the glyph cells (leaving every
+            // other cell untouched) so a widget layered UNDER the input on
+            // the same row — e.g. the roundtime bar — stays visible around
+            // the typed text. Cells from the previous frame are reset first
+            // so backspaced characters don't linger where nothing repaints.
+            if let Some((py, px0, px1)) = self.overlay_prev.take() {
+                for x in px0..px1 {
+                    if x < buf.area().width && py < buf.area().height {
+                        buf[(x, py)].reset();
+                    }
+                }
+            }
+            let y = text_area.y;
+            let mut x = text_area.x;
+            let x_end = text_area.x + text_area.width;
+            'spans: for span in &line.spans {
+                for ch in span.content.chars() {
+                    if x >= x_end || x >= buf.area().width || y >= buf.area().height {
+                        break 'spans;
+                    }
+                    let cell = &mut buf[(x, y)];
+                    cell.set_char(ch);
+                    if let Some(fg) = span.style.fg {
+                        cell.set_fg(fg);
+                    }
+                    if let Some(bg) = span.style.bg {
+                        cell.set_bg(bg); // cursor block keeps its background
+                    }
+                    x += 1;
+                }
+            }
+            if x > text_area.x {
+                self.overlay_prev.set(Some((y, text_area.x, x)));
+            }
+        } else {
+            let paragraph = Paragraph::new(line);
+            paragraph.render(text_area, buf);
+        }
     }
 
     /// Render the command input area in search mode, inheriting all visual settings

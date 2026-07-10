@@ -58,8 +58,12 @@ pub struct TabbedTextWindow {
     tab_unread_color: Option<String>,
     tab_unread_prefix: String,
     show_tab_separator: bool,
+    tab_bar_outside: bool,
     title_position: TitlePosition,
 }
+
+/// Left inset for the tab labels when the tab bar sits outside the border
+const OUTSIDE_TAB_BAR_INSET: u16 = 1;
 
 impl TabbedTextWindow {
     pub fn new(title: &str, tab_bar_position: TabBarPosition) -> Self {
@@ -80,6 +84,7 @@ impl TabbedTextWindow {
             tab_unread_color: Some("#FFFFFF".to_string()), // White
             tab_unread_prefix: "* ".to_string(),
             show_tab_separator: false,
+            tab_bar_outside: false,
             title_position: TitlePosition::TopLeft,
         }
     }
@@ -176,6 +181,12 @@ impl TabbedTextWindow {
     /// Check if tab separator is shown (needed for click detection)
     pub fn has_tab_separator(&self) -> bool {
         self.show_tab_separator
+    }
+
+    /// Draw the tab bar outside the window border (tabs above/below the
+    /// bordered content box instead of inside it)
+    pub fn set_tab_bar_outside(&mut self, outside: bool) {
+        self.tab_bar_outside = outside;
     }
 
     pub fn set_content_align(&mut self, align: Option<String>) {
@@ -372,7 +383,8 @@ impl TabbedTextWindow {
         let tab_bar_height = 1;
         let separator_offset: u16 = if self.show_tab_separator { 1 } else { 0 };
 
-        // Calculate inner rect for the text window
+        // Calculate inner rect for the text window. In outside mode the tab
+        // bar sits before the border, so the border offset applies after it.
         let inner_rect = match self.tab_bar_position {
             TabBarPosition::Top => Rect {
                 x: window_rect.x + border_offset,
@@ -681,6 +693,26 @@ impl TabbedTextWindow {
 
     /// Compute the tab bar and content areas for a given outer window rect
     fn tab_bar_rect(&self, outer: Rect) -> Rect {
+        // Outside mode: the tab bar occupies the outermost row, before any
+        // border, inset to match render()
+        if self.tab_bar_outside {
+            let inset = OUTSIDE_TAB_BAR_INSET.min(outer.width.saturating_sub(1));
+            return match self.tab_bar_position {
+                TabBarPosition::Top => Rect {
+                    x: outer.x + inset,
+                    y: outer.y,
+                    width: outer.width - inset,
+                    height: 1,
+                },
+                TabBarPosition::Bottom => Rect {
+                    x: outer.x + inset,
+                    y: outer.y + outer.height.saturating_sub(1),
+                    width: outer.width - inset,
+                    height: 1,
+                },
+            };
+        }
+
         // Match render() logic for border handling
         let inner_area = if self.show_border {
             let mut block = Block::default();
@@ -782,8 +814,38 @@ impl TabbedTextWindow {
             border_style = border_style.bg(bg);
         }
 
+        // Tab bar outside the border: reserve a row for the tabs before
+        // drawing the block, so the border boxes only the content. The labels
+        // are inset a few cells so they don't butt against the corner curve.
+        let mut block_area = area;
+        let mut outside_tab_bar: Option<Rect> = None;
+        if self.tab_bar_outside && block_area.height > 1 {
+            let inset = OUTSIDE_TAB_BAR_INSET.min(block_area.width.saturating_sub(1));
+            match self.tab_bar_position {
+                TabBarPosition::Top => {
+                    outside_tab_bar = Some(Rect {
+                        x: block_area.x + inset,
+                        y: block_area.y,
+                        width: block_area.width - inset,
+                        height: 1,
+                    });
+                    block_area.y += 1;
+                    block_area.height -= 1;
+                }
+                TabBarPosition::Bottom => {
+                    outside_tab_bar = Some(Rect {
+                        x: block_area.x + inset,
+                        y: block_area.y + block_area.height - 1,
+                        width: block_area.width - inset,
+                        height: 1,
+                    });
+                    block_area.height -= 1;
+                }
+            }
+        }
+
         let inner_area = title_position::render_block_with_title(
-            area,
+            block_area,
             buf,
             self.show_border,
             borders,
@@ -794,37 +856,42 @@ impl TabbedTextWindow {
             self.title_position,
         );
 
-        // Split inner area for tab bar and content
-        let (tab_bar_area, mut content_area) = match self.tab_bar_position {
-            TabBarPosition::Top => {
-                let tab_bar = Rect {
-                    x: inner_area.x,
-                    y: inner_area.y,
-                    width: inner_area.width,
-                    height: 1,
-                };
-                let content = Rect {
-                    x: inner_area.x,
-                    y: inner_area.y + 1,
-                    width: inner_area.width,
-                    height: inner_area.height.saturating_sub(1),
-                };
-                (tab_bar, content)
-            }
-            TabBarPosition::Bottom => {
-                let content = Rect {
-                    x: inner_area.x,
-                    y: inner_area.y,
-                    width: inner_area.width,
-                    height: inner_area.height.saturating_sub(1),
-                };
-                let tab_bar = Rect {
-                    x: inner_area.x,
-                    y: inner_area.y + content.height,
-                    width: inner_area.width,
-                    height: 1,
-                };
-                (tab_bar, content)
+        // Split inner area for tab bar and content (unless the tab bar was
+        // already placed outside the block, in which case all of it is content)
+        let (tab_bar_area, mut content_area) = if let Some(bar) = outside_tab_bar {
+            (bar, inner_area)
+        } else {
+            match self.tab_bar_position {
+                TabBarPosition::Top => {
+                    let tab_bar = Rect {
+                        x: inner_area.x,
+                        y: inner_area.y,
+                        width: inner_area.width,
+                        height: 1,
+                    };
+                    let content = Rect {
+                        x: inner_area.x,
+                        y: inner_area.y + 1,
+                        width: inner_area.width,
+                        height: inner_area.height.saturating_sub(1),
+                    };
+                    (tab_bar, content)
+                }
+                TabBarPosition::Bottom => {
+                    let content = Rect {
+                        x: inner_area.x,
+                        y: inner_area.y,
+                        width: inner_area.width,
+                        height: inner_area.height.saturating_sub(1),
+                    };
+                    let tab_bar = Rect {
+                        x: inner_area.x,
+                        y: inner_area.y + content.height,
+                        width: inner_area.width,
+                        height: 1,
+                    };
+                    (tab_bar, content)
+                }
             }
         };
 

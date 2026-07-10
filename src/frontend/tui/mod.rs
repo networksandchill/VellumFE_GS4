@@ -193,6 +193,14 @@ impl WindowOrderCache {
         let mut order: Vec<String> = ui_state.windows.keys().cloned().collect();
         order.sort();
 
+        // The command input always renders above regular windows (typed text
+        // must not be overwritten by overlapping widgets, e.g. a roundtime
+        // bar sharing its row); ephemeral windows/popups still go above it.
+        if let Some(pos) = order.iter().position(|n| n == "command_input") {
+            let input = order.remove(pos);
+            order.push(input);
+        }
+
         let ephemeral: Vec<String> = order
             .iter()
             .filter(|n| ui_state.ephemeral_windows.contains(*n))

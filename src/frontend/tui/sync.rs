@@ -233,13 +233,21 @@ impl TuiFrontend {
                         room_window.set_component_visible("room exits", data.show_exits);
                     }
 
-                    // Apply roomName preset colors to the title/room name if available
-                    // Resolve palette names to hex values
-                    if let Some(preset) = app_core.config.colors.presets.get("roomName") {
-                        let resolved_fg = preset.fg.as_ref().map(|c| app_core.config.resolve_palette_color(c));
-                        let resolved_bg = preset.bg.as_ref().map(|c| app_core.config.resolve_palette_color(c));
-                        room_window.set_title_colors(resolved_fg, resolved_bg);
-                    }
+                    // Title text matches the window's border color so the
+                    // header reads as part of the frame (falls back to the
+                    // roomName preset's text color). The preset's background
+                    // is intentionally not applied here: it highlights the
+                    // room name inline in story text, but as a window-header
+                    // backdrop it just looks like a painted-over title bar.
+                    let title_fg = window_def
+                        .and_then(|def| def.base().border_color.clone())
+                        .map(|c| app_core.config.resolve_palette_color(&c))
+                        .or_else(|| {
+                            app_core.config.colors.presets.get("roomName").and_then(|p| {
+                                p.fg.as_ref().map(|c| app_core.config.resolve_palette_color(c))
+                            })
+                        });
+                    room_window.set_title_colors(title_fg, None);
 
                     self.widget_manager.room_windows.insert(name.clone(), room_window);
                     tracing::debug!("Created RoomWindow widget for '{}' during sync", name);
@@ -837,6 +845,11 @@ impl TuiFrontend {
                         widget.set_transparent_background(def.base().transparent_background);
                         widget.set_background_color(colors.background.clone());
                         widget.set_text_color(colors.text.clone());
+                        if let crate::config::WindowDef::ActiveEffects { data, .. } = def {
+                            if let Some(ref bar) = data.bar_color {
+                                widget.set_bar_color(bar.clone());
+                            }
+                        }
                     }
                 }
             }
@@ -1435,6 +1448,27 @@ impl TuiFrontend {
                     for (id, value) in indicators {
                         widget.set_indicator_value(id, *value);
                     }
+
+                    // Overlay from persistent game state: window content is
+                    // rebuilt empty on layout reload and only refilled on the
+                    // next indicator event, so without this a reload blanks
+                    // every status until it next changes.
+                    let status = &app_core.game_state.status;
+                    for (id, active) in [
+                        ("standing", status.standing),
+                        ("kneeling", status.kneeling),
+                        ("sitting", status.sitting),
+                        ("prone", status.prone),
+                        ("stunned", status.stunned),
+                        ("bleeding", status.bleeding),
+                        ("hidden", status.hidden),
+                        ("invisible", status.invisible),
+                        ("webbed", status.webbed),
+                        ("joined", status.joined),
+                        ("dead", status.dead),
+                    ] {
+                        widget.set_indicator_value(id, active as u8);
+                    }
                 }
             }
         }
@@ -1520,6 +1554,7 @@ impl TuiFrontend {
                                 );
                                 widget.set_tab_bar_position(tab_position);
                                 widget.set_tab_separator(data.tab_separator);
+                                widget.set_tab_bar_outside(data.tab_bar_outside);
                                 widget.set_tab_colors(
                                     data.tab_active_color.clone(),
                                     data.tab_inactive_color.clone(),
@@ -1708,6 +1743,12 @@ impl TuiFrontend {
                     for (body_part, level) in &injury_data.injuries {
                         widget.set_injury(body_part.clone(), *level);
                     }
+                    // Overlay from persistent game state so a layout reload
+                    // (which rebuilds window content empty) doesn't blank the
+                    // doll until the next injury event.
+                    for (body_part, level) in &app_core.game_state.injuries {
+                        widget.set_injury(body_part.clone(), *level);
+                    }
 
                     // Apply configuration
                     if let Some(window_def) =
@@ -1874,6 +1915,12 @@ impl TuiFrontend {
                     // Set content (or empty if None)
                     let content = item.clone().unwrap_or_default();
                     hand_widget.set_content(content);
+
+                    // User highlights color the held item (update_if_changed
+                    // makes the per-frame call cheap)
+                    let highlights: Vec<_> =
+                        app_core.config.highlights.values().cloned().collect();
+                    hand_widget.set_highlights(highlights);
 
                     // Apply window configuration from layout
                     if let Some(window_def) =

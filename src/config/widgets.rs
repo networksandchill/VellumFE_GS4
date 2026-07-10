@@ -342,6 +342,10 @@ pub struct TabbedTextWidgetData {
     pub tab_bar_position: String,
     #[serde(default)]
     pub tab_separator: bool,
+    /// Draw the tab bar outside the window border (fork-style: tabs above
+    /// the bordered content box instead of inside it)
+    #[serde(default)]
+    pub tab_bar_outside: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tab_active_color: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -524,6 +528,10 @@ pub struct HandWidgetData {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ActiveEffectsWidgetData {
     pub category: String, // "Buffs", "Debuffs", "Cooldowns", "ActiveSpells"
+    /// Default bar fill for effects with no spell-specific color
+    /// (falls back to the widget's built-in gray when unset)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bar_color: Option<String>,
 }
 
 /// Performance widget specific data

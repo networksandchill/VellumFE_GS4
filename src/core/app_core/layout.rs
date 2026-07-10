@@ -16,8 +16,9 @@ impl AppCore {
             return None;
         }
 
-        let theme_presets =
-            crate::theme::ThemePresets::all_with_custom(self.config.character.as_deref());
+        // all_with_custom takes a config base dir, not a character name (see
+        // colors.rs get_theme) — None resolves to ~/.vellum-fe/themes/.
+        let theme_presets = crate::theme::ThemePresets::all_with_custom(None);
 
         if let Some(theme) = theme_presets.get(theme_id) {
             self.config.active_theme = theme_id.to_string();

@@ -469,7 +469,10 @@ impl Config {
     /// Get the currently active theme
     /// Returns the theme specified by active_theme, or the default dark theme if not found
     pub fn get_theme(&self) -> crate::theme::AppTheme {
-        crate::theme::ThemePresets::all_with_custom(self.character.as_deref())
+        // NOTE: all_with_custom takes a config BASE DIR, not a character name.
+        // Passing the character made it look for "<Char>/themes" relative to
+        // the CWD, so custom themes in ~/.vellum-fe/themes/ never loaded.
+        crate::theme::ThemePresets::all_with_custom(None)
             .get(&self.active_theme)
             .cloned()
             .unwrap_or_else(crate::theme::ThemePresets::dark)

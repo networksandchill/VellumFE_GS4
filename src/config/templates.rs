@@ -746,6 +746,7 @@ impl Config {
                     ..base_defaults.clone()
                 },
                 data: ActiveEffectsWidgetData {
+                    bar_color: None,
                     category: "Buffs".to_string(),
                 },
             }),
@@ -760,6 +761,7 @@ impl Config {
                     ..base_defaults.clone()
                 },
                 data: ActiveEffectsWidgetData {
+                    bar_color: None,
                     category: "Debuffs".to_string(),
                 },
             }),
@@ -774,6 +776,7 @@ impl Config {
                     ..base_defaults.clone()
                 },
                 data: ActiveEffectsWidgetData {
+                    bar_color: None,
                     category: "Cooldowns".to_string(),
                 },
             }),
@@ -788,6 +791,7 @@ impl Config {
                     ..base_defaults.clone()
                 },
                 data: ActiveEffectsWidgetData {
+                    bar_color: None,
                     category: "ActiveSpells".to_string(),
                 },
             }),
@@ -802,6 +806,7 @@ impl Config {
                     ..base_defaults.clone()
                 },
                 data: ActiveEffectsWidgetData {
+                    bar_color: None,
                     category: String::new(),
                 },
             }),
@@ -1143,6 +1148,7 @@ impl Config {
                     buffer_size: 5000,
                     tab_bar_position: "top".to_string(),
                     tab_separator: true,
+                    tab_bar_outside: false,
                     tab_active_color: None,
                     tab_inactive_color: None,
                     tab_unread_color: None,
@@ -1170,6 +1176,7 @@ impl Config {
                     buffer_size: 5000,
                     tab_bar_position: "top".to_string(),
                     tab_separator: true,
+                    tab_bar_outside: false,
                     tab_active_color: None,
                     tab_inactive_color: None,
                     tab_unread_color: None,

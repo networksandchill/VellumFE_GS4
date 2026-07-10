@@ -62,6 +62,12 @@ pub struct ConnectionConfig {
     /// Game instance: GS4: "prime", "platinum", "shattered", "test"; DR: "dr", "drplatinum", "drfallen", "drtest"
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub game: Option<String>,
+
+    /// Shell command `.connect` runs to restart Lich when nothing is
+    /// listening on host:port (Lich exits with the game). `.connect` waits
+    /// for the port to start accepting, then attaches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relaunch_command: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -328,9 +334,14 @@ pub struct TargetListConfig {
     /// Status display position: "start" or "end"
     #[serde(default = "default_target_status_position")]
     pub status_position: String,
-    /// Truncation mode: "full" or "noun"
+    /// Truncation mode: "full", "noun" (noun when name+status won't fit),
+    /// or "noun_always" (always show just the noun)
     #[serde(default = "default_target_truncation_mode")]
     pub truncation_mode: String,
+    /// Keep dead/gone creatures in the list (shown with their status
+    /// abbreviation, e.g. "[dea]") instead of filtering them out
+    #[serde(default)]
+    pub show_dead: bool,
     /// Map of full status names to 3-character abbreviations
     #[serde(default = "default_status_abbrev")]
     pub status_abbrev: HashMap<String, String>,
@@ -375,6 +386,7 @@ impl Default for TargetListConfig {
     fn default() -> Self {
         Self {
             status_position: default_target_status_position(),
+            show_dead: false,
             truncation_mode: default_target_truncation_mode(),
             status_abbrev: default_status_abbrev(),
             excluded_nouns: default_excluded_nouns(),

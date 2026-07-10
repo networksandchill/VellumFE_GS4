@@ -77,12 +77,26 @@ pub struct MacroGroup {
     pub buttons: Vec<MacroButton>,
 }
 
+/// Tombstone for a base-file button deleted from the phone: merge drops
+/// the matching button instead of rewriting the hand-written macros.toml.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct HiddenButton {
+    /// Rail group name, or None for a floating button.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+    pub label: String,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct MacrosConfig {
     #[serde(default, rename = "group")]
     pub groups: Vec<MacroGroup>,
     #[serde(default, rename = "floating")]
     pub floating: Vec<MacroButton>,
+    /// Base-file buttons hidden by phone deletes (only meaningful in the
+    /// local overlay). Un-hide by removing the entry from macros-local.toml.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hidden: Vec<HiddenButton>,
 }
 
 impl MacrosConfig {
@@ -139,6 +153,19 @@ impl MacrosConfig {
     /// buttons append. Everything from `local` is marked editable.
     pub fn merge(base: Self, mut local: Self) -> Self {
         let mut merged = base;
+        // Apply tombstones to the base set before local buttons come in,
+        // so a re-created button with a hidden label still shows.
+        for hidden in &local.hidden {
+            match &hidden.group {
+                Some(name) => {
+                    if let Some(group) = merged.groups.iter_mut().find(|g| g.name == *name) {
+                        group.buttons.retain(|b| b.label != hidden.label);
+                    }
+                }
+                None => merged.floating.retain(|b| b.label != hidden.label),
+            }
+        }
+        merged.groups.retain(|g| !g.buttons.is_empty());
         for group in &mut local.groups {
             for button in &mut group.buttons {
                 button.editable = true;
@@ -208,6 +235,20 @@ impl MacrosConfig {
         };
         self.groups.retain(|g| !g.buttons.is_empty());
         removed
+    }
+
+    /// Tombstone a base-file button so merge hides it (see [`HiddenButton`]).
+    /// Returns false if it was already hidden.
+    pub fn hide_button(&mut self, group: Option<&str>, label: &str) -> bool {
+        let entry = HiddenButton {
+            group: group.map(str::to_string),
+            label: label.to_string(),
+        };
+        if self.hidden.contains(&entry) {
+            return false;
+        }
+        self.hidden.push(entry);
+        true
     }
 
     /// Look up the command behind a client-supplied macro id and whether it
@@ -338,6 +379,34 @@ mod tests {
         // Floating appends and is editable.
         assert_eq!(merged.floating.len(), 2);
         assert!(merged.floating[1].editable);
+    }
+
+    #[test]
+    fn hidden_tombstones_drop_base_buttons_in_merge() {
+        let base = sample();
+        let mut local = MacrosConfig::default();
+        assert!(local.hide_button(Some("Town"), "Look"));
+        assert!(!local.hide_button(Some("Town"), "Look"), "already hidden");
+        assert!(local.hide_button(None, "Atk"));
+        // A phone-created button with a hidden label still shows.
+        local.upsert_button(
+            Some("Town"),
+            MacroButton {
+                label: "Look".to_string(),
+                command: Some("glance".to_string()),
+                ..Default::default()
+            },
+            None,
+        );
+        let merged = MacrosConfig::merge(base, local.clone());
+        let town = &merged.groups[0];
+        assert_eq!(town.buttons.len(), 2, "base Look hidden, local Look kept");
+        assert!(town.buttons.iter().any(|b| b.editable && b.label == "Look"));
+        assert!(merged.floating.is_empty());
+        // Tombstones survive a save/load round-trip.
+        let text = toml::to_string_pretty(&local).unwrap();
+        let reloaded: MacrosConfig = toml::from_str(&text).unwrap();
+        assert_eq!(reloaded.hidden, local.hidden);
     }
 
     #[test]
