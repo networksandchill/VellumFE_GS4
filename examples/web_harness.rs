@@ -9,7 +9,7 @@
 //! AppCore::apply_macro_save. Cmd/Macro events are logged to stdout.
 
 use vellum_fe::config::{MacroButton, MacrosConfig};
-use vellum_fe::core::remote::{RemoteEvent, RemoteSink};
+use vellum_fe::core::remote::{RemoteEvent, RemoteSessionInfo, RemoteSink, SessionState};
 use vellum_fe::data::widget::{StyledLine, TextSegment};
 use vellum_fe::frontend::web::server;
 
@@ -21,7 +21,11 @@ async fn main() {
 
     // --login: act like the headless (mobile) runtime with no session, so
     // the login overlay (and its Remote tab shell plumbing) can be driven.
-    if std::env::args().any(|a| a == "--login") {
+    // SessionConnect walks the scripted state machine (authenticating →
+    // connecting → connected); typing "drop" simulates a mid-session drop
+    // (reconnecting → connected); SessionDisconnect returns to idle.
+    let login_mode = std::env::args().any(|a| a == "--login");
+    if login_mode {
         sink.set_session_control(true);
     }
 
@@ -76,6 +80,77 @@ async fn main() {
         }),
     );
 
+    // Scripted map scene: a small fake town so the map overlay can be
+    // driven with no game and no mapdb — a street, a side lane, a labeled
+    // connector, a stub pair, an entrance dot, and a ghost sketch.
+    {
+        use vellum_fe::core::remote::{
+            RemoteGhostEdge, RemoteGhostNode, RemoteMapEdge, RemoteMapLabel, RemoteMapRoom,
+            RemoteMapScene, RemoteMapSceneRef, RemoteMapState, RemoteStateSnapshot,
+        };
+        let mut rooms = Vec::new();
+        let mut edges = Vec::new();
+        let edge = |x1, y1, x2, y2, k, l: Option<&str>, ar, br| RemoteMapEdge {
+            x1,
+            y1,
+            x2,
+            y2,
+            k,
+            l: l.map(str::to_owned),
+            ar,
+            br,
+        };
+        for i in 0..5i32 {
+            rooms.push(RemoteMapRoom {
+                i: 100 + i as u32,
+                x: i,
+                y: 0,
+                e: i == 2,
+            });
+            if i > 0 {
+                edges.push(edge(i - 1, 0, i, 0, 0, None, None, None));
+            }
+        }
+        for i in 0..3i32 {
+            rooms.push(RemoteMapRoom {
+                i: 200 + i as u32,
+                x: 2,
+                y: i + 1,
+                e: false,
+            });
+            edges.push(edge(2, i, 2, i + 1, 0, None, None, None));
+        }
+        rooms.push(RemoteMapRoom { i: 300, x: 7, y: 0, e: false });
+        edges.push(edge(4, 0, 7, 0, 1, Some("go gate"), None, None));
+        rooms.push(RemoteMapRoom { i: 400, x: 0, y: 6, e: false });
+        edges.push(edge(0, 0, 0, 6, 2, None, Some(100), Some(400)));
+        let scene = std::sync::Arc::new(RemoteMapScene {
+            location: "Harness Town".into(),
+            sheet: "outdoor".into(),
+            rooms,
+            edges,
+            labels: vec![RemoteMapLabel { x: 2, y: 1, t: "The Grid".into() }],
+        });
+        let mut snap = RemoteStateSnapshot::default();
+        snap.map_scene = RemoteMapSceneRef(Some(scene));
+        snap.map_state = RemoteMapState {
+            available: true,
+            location: Some("Harness Town".into()),
+            room: Some(102),
+            cell: Some([2, 0]),
+            in_ghost: false,
+            ghosts: vec![RemoteGhostNode { x: 3, y: -1, cur: false }],
+            ghost_edges: vec![RemoteGhostEdge {
+                x1: 3,
+                y1: 0,
+                x2: 3,
+                y2: -1,
+                l: Some("go shop".into()),
+            }],
+        };
+        sink.flush_state(snap);
+    }
+
     let listener = tokio::net::TcpListener::bind("127.0.0.1:8399")
         .await
         .expect("bind 8399");
@@ -84,8 +159,34 @@ async fn main() {
         let _ = server::serve_listener_with_token(listener, handles, TOKEN.to_string()).await;
     });
 
+    let session = |state, character: &Option<String>| RemoteSessionInfo {
+        state,
+        character: character.clone(),
+        ..Default::default()
+    };
+
     while let Some(event) = event_rx.recv().await {
         match event {
+            RemoteEvent::Command(text) if login_mode && text == "drop" => {
+                println!("EVENT cmd: {text:?} (scripted drop → reconnect)");
+                let character = Some("Harness".to_string());
+                sink.set_session_state(session(SessionState::Reconnecting, &character));
+                tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+                sink.set_session_state(session(SessionState::Connected, &character));
+            }
+            RemoteEvent::SessionConnect { character, .. } if login_mode => {
+                println!("EVENT session_connect: character={character:?}");
+                let character = character.or_else(|| Some("Harness".to_string()));
+                for state in [SessionState::Authenticating, SessionState::Connecting] {
+                    sink.set_session_state(session(state, &character));
+                    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+                }
+                sink.set_session_state(session(SessionState::Connected, &character));
+            }
+            RemoteEvent::SessionDisconnect if login_mode => {
+                println!("EVENT session_disconnect → idle");
+                sink.set_session_state(RemoteSessionInfo::default());
+            }
             RemoteEvent::Command(text) => println!("EVENT cmd: {text:?}"),
             RemoteEvent::Macro { id } => println!("EVENT macro tap: {id:?}"),
             RemoteEvent::MacroSave {

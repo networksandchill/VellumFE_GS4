@@ -12,6 +12,10 @@ impl AppCore {
             return self.handle_dot_command(&command);
         }
 
+        // If the next room turns out to be unmapped, this command is the
+        // edge label on its ghost-room sketch ("go shop").
+        self.map.note_command(&command);
+
         // Intercept game "quit" command - save settings before disconnecting
         // This handles the case where users close terminal after game disconnect
         if command.trim().eq_ignore_ascii_case("quit") {
@@ -239,6 +243,252 @@ impl AppCore {
     }
 
     /// Handle dot commands (local client commands)
+    /// `.room`: how the stream's room identifiers resolved against the
+    /// mapdb — the ground truth for debugging pathing and the mini map.
+    fn show_room_debug(&mut self) {
+        use crate::core::map_service::DbState;
+        let nav = self.nav_room_id.clone().unwrap_or_else(|| "-".into());
+        let lich = self.lich_room_id.clone().unwrap_or_else(|| "-".into());
+        self.add_system_message(&format!("Stream ids: nav uid={nav}, lich id={lich}"));
+        match self.map.db_state() {
+            DbState::Loaded => {}
+            state => {
+                self.add_system_message(&format!("Mapdb not available ({state:?})"));
+                return;
+            }
+        }
+        let Some(room_id) = self.map.current_room_id else {
+            self.add_system_message("No mapdb room resolved yet.");
+            return;
+        };
+        let location = self.map.current_location.clone().unwrap_or_else(|| "?".into());
+        let mut summary = format!("Resolved: room {room_id} in {location}");
+        if let Some(db) = self.map.mapdb() {
+            if let Some(room) = db.room(room_id) {
+                if let Some(title) = room.title.first() {
+                    summary.push_str(&format!(" — {title}"));
+                }
+                let routable = room
+                    .wayto
+                    .iter()
+                    .filter(|(dest, cmd)| {
+                        !crate::core::mapdb::is_proc_command(cmd)
+                            && matches!(
+                                room.timeto.get(dest),
+                                Some(crate::core::mapdb::TimeTo::Seconds(s)) if *s >= 0.0
+                            )
+                    })
+                    .count();
+                summary.push_str(&format!(
+                    " · {} wayto edges ({} routable)",
+                    room.wayto.len(),
+                    routable
+                ));
+                if !room.tags.is_empty() {
+                    summary.push_str(&format!(" · tags: {}", room.tags.join(", ")));
+                }
+            }
+        }
+        self.add_system_message(&summary);
+    }
+
+    /// `.mapdb` — map data management from any frontend. Subcommands:
+    /// `status` (default), `download`, `remove`, `repo <owner/repo>`.
+    fn handle_mapdb(&mut self, args: &[String]) {
+        use crate::core::mapdb_update::UpdateStatus;
+        match args.first().map(String::as_str).unwrap_or("status") {
+            "status" => {
+                let db = match self.map.db_state() {
+                    crate::core::map_service::DbState::Loaded => self
+                        .map
+                        .mapdb()
+                        .map(|db| format!("loaded ({} rooms)", db.room_count()))
+                        .unwrap_or_else(|| "loaded".to_string()),
+                    state => format!("{state:?}"),
+                };
+                self.add_system_message(&format!("[map] database: {db}"));
+                let installed = self
+                    .map_updater
+                    .installed
+                    .clone()
+                    .unwrap_or_else(|| "none".to_string());
+                self.add_system_message(&format!(
+                    "[map] downloaded release: {installed} (repo: {})",
+                    self.config.map.mapdb_repo
+                ));
+                if let UpdateStatus::Downloading {
+                    tag,
+                    received,
+                    total,
+                } = &self.map_updater.status
+                {
+                    let progress = match total {
+                        Some(total) => format!(
+                            "{:.1} / {:.1} MB",
+                            *received as f64 / 1e6,
+                            *total as f64 / 1e6
+                        ),
+                        None => format!("{:.1} MB", *received as f64 / 1e6),
+                    };
+                    self.add_system_message(&format!("[map] downloading {tag}: {progress}"));
+                }
+            }
+            "download" | "update" => {
+                if self.map_updater.in_flight() {
+                    self.add_system_message("[map] a download is already running (.mapdb status)");
+                    return;
+                }
+                let repo = self.config.map.mapdb_repo.trim().to_owned();
+                if repo.is_empty() {
+                    self.add_system_message("[map] no repo configured (.mapdb repo <owner/repo>)");
+                    return;
+                }
+                self.add_system_message(&format!("[map] checking {repo} for the latest release..."));
+                self.start_mapdb_download(&repo);
+            }
+            "remove" => {
+                if self.map_updater.in_flight() {
+                    self.add_system_message("[map] can't remove while a download is running");
+                    return;
+                }
+                self.remove_downloaded_mapdb();
+                self.add_system_message(
+                    "[map] downloaded map data removed (Lich folder is the source again, if set)",
+                );
+            }
+            "repo" => {
+                let Some(repo) = args.get(1).map(|s| s.trim()).filter(|s| !s.is_empty()) else {
+                    self.add_system_message("usage: .mapdb repo <owner/repo>");
+                    return;
+                };
+                self.config.map.mapdb_repo = repo.to_string();
+                match self.save_config() {
+                    Ok(()) => self.add_system_message(&format!(
+                        "[map] release repo set to {repo} (.mapdb download to fetch)"
+                    )),
+                    Err(e) => self.add_system_message(&format!("[map] save failed: {e}")),
+                }
+            }
+            other => {
+                self.add_system_message(&format!(
+                    "[map] unknown subcommand '{other}' — usage: .mapdb [status|download|remove|repo <owner/repo>]"
+                ));
+            }
+        }
+    }
+
+    /// `.go2 <target>` — native map travel. Subcommands: `stop`, `status`,
+    /// `save <name> [id]`, `targets`, `back`.
+    fn handle_go2(&mut self, args: &[String]) {
+        use crate::core::travel::target::Resolved;
+        let first = args.first().map(String::as_str).unwrap_or("");
+        match first {
+            "" => {
+                self.add_system_message(
+                    "usage: .go2 <room id | uid | tag | saved name | text> — also: .go2 stop / status / save <name> [id] / targets / back",
+                );
+            }
+            "stop" => self.stop_travel(),
+            "status" => {
+                let status = match (self.travel.task(), self.map.mapdb(), self.map.current_room_id)
+                {
+                    (Some(task), Some(db), Some(current)) => {
+                        let done = task.rooms_total() - task.rooms_remaining();
+                        format!(
+                            "[go2] → room {}: {}/{} rooms, ETA {}",
+                            task.destination,
+                            done,
+                            task.rooms_total(),
+                            crate::core::travel::format_eta(task.eta_seconds(db, current))
+                        )
+                    }
+                    (Some(task), _, _) => format!("[go2] → room {} (resolving...)", task.destination),
+                    _ => "[go2] not traveling.".to_string(),
+                };
+                self.add_system_message(&status);
+            }
+            "save" => {
+                let Some(name) = args.get(1).map(|s| s.trim()).filter(|s| !s.is_empty()) else {
+                    self.add_system_message("usage: .go2 save <name> [room id] (defaults to the current room)");
+                    return;
+                };
+                if name.parse::<u32>().is_ok() || name.eq_ignore_ascii_case("back") {
+                    self.add_system_message("[go2] that name would shadow a room id or keyword — pick another");
+                    return;
+                }
+                let id = match args.get(2) {
+                    Some(arg) => match arg.parse::<u32>() {
+                        Ok(id) => Some(id),
+                        Err(_) => {
+                            self.add_system_message(&format!("[go2] '{arg}' is not a room id"));
+                            return;
+                        }
+                    },
+                    None => self.map.current_room_id,
+                };
+                let Some(id) = id else {
+                    self.add_system_message(
+                        "[go2] current room unknown — give an explicit id: .go2 save <name> <id>",
+                    );
+                    return;
+                };
+                self.config.go2.saved.insert(name.to_lowercase(), id);
+                match self.save_config() {
+                    Ok(()) => self.add_system_message(&format!(
+                        "[go2] saved '{}' → room {id} (travel there with .go2 {})",
+                        name.to_lowercase(),
+                        name.to_lowercase()
+                    )),
+                    Err(e) => self.add_system_message(&format!("[go2] save failed: {e}")),
+                }
+            }
+            "targets" => {
+                if self.config.go2.saved.is_empty() {
+                    self.add_system_message("[go2] no saved targets (.go2 save <name>)");
+                } else {
+                    let list: Vec<String> = self
+                        .config
+                        .go2
+                        .saved
+                        .iter()
+                        .map(|(name, id)| format!("{name} → {id}"))
+                        .collect();
+                    self.add_system_message(&format!("[go2] saved targets: {}", list.join(", ")));
+                }
+            }
+            _ => {
+                let Some(db) = self.map.mapdb().cloned() else {
+                    self.add_system_message(
+                        "[go2] map database not loaded — configure it in Settings > Map",
+                    );
+                    return;
+                };
+                let input = args.join(" ");
+                let resolved = crate::core::travel::target::resolve(
+                    &db,
+                    self.map.current_room_id,
+                    &self.config.go2.saved,
+                    self.travel.last_start_room,
+                    &input,
+                );
+                match resolved {
+                    Resolved::Room(id) => self.start_travel(id),
+                    Resolved::Ambiguous(matches) => {
+                        self.add_system_message(&format!(
+                            "[go2] several rooms match '{input}' — pick one with .go2 <id>:"
+                        ));
+                        for (id, title) in matches {
+                            self.add_system_message(&format!("  {id}  {title}"));
+                        }
+                    }
+                    Resolved::NotFound(reason) => {
+                        self.add_system_message(&format!("[go2] {reason}"));
+                    }
+                }
+            }
+        }
+    }
+
     fn handle_dot_command(&mut self, command: &str) -> Result<String> {
         let parts: Vec<&str> = command[1..].split_whitespace().collect();
         let cmd = parts.first().map(|s| s.to_lowercase()).unwrap_or_default();
@@ -265,6 +515,25 @@ impl AppCore {
                     self.reconnect_requested = true;
                     self.add_system_message("Reconnecting...");
                 }
+            }
+
+            // Map debug: how the stream's room identifiers resolved against
+            // the mapdb (go2 plan phase 2).
+            "room" => {
+                self.show_room_debug();
+            }
+
+            // Native map travel (no Lich needed).
+            "go2" => {
+                let args: Vec<String> = parts[1..].iter().map(|s| s.to_string()).collect();
+                self.handle_go2(&args);
+            }
+
+            // Map data management from any frontend — on phones this is THE
+            // way to get map data (no Settings > Map panel there).
+            "mapdb" => {
+                let args: Vec<String> = parts[1..].iter().map(|s| s.to_string()).collect();
+                self.handle_mapdb(&args);
             }
 
             // Web frontend: reload macros.toml (+ the phone-edited local
@@ -454,6 +723,10 @@ impl AppCore {
             "keybinds" | "kb" => {
                 return Ok("action:keybinds".to_string());
             }
+            // Hotbars (hotkey bar definitions)
+            "hotbars" | "hotbar" => {
+                return Ok("action:hotbars".to_string());
+            }
             "addkeybind" | "addkey" => {
                 return Ok("action:addkeybind".to_string());
             }
@@ -615,6 +888,7 @@ impl AppCore {
                     match parts[1] {
                         "highlights" | "hl" => self.reload_highlights(),
                         "keybinds" | "kb" => self.reload_keybinds(),
+                        "hotbars" => self.reload_hotbars(),
                         "settings" => self.reload_settings(),
                         "colors" => self.reload_colors(),
                         "layout" => self.reload_layout(),
@@ -624,7 +898,7 @@ impl AppCore {
                                 parts[1]
                             ));
                             self.add_system_message(
-                                "Usage: .reload [highlights|keybinds|settings|colors|layout]",
+                                "Usage: .reload [highlights|keybinds|hotbars|settings|colors|layout]",
                             );
                             self.add_system_message("       .reload (reload everything)");
                         }
@@ -988,6 +1262,7 @@ mod tests {
                 }
             }
             "keybinds" | "kb" => Some("action:keybinds".to_string()),
+            "hotbars" | "hotbar" => Some("action:hotbars".to_string()),
             "addkeybind" | "addkey" => Some("action:addkeybind".to_string()),
             "colors" | "colorpalette" => Some("action:colors".to_string()),
             "addcolor" | "createcolor" => Some("action:addcolor".to_string()),

@@ -56,6 +56,7 @@ fn text_content_of(content: &WindowContent) -> Option<&crate::data::TextContent>
     match content {
         WindowContent::Text(text)
         | WindowContent::Inventory(text)
+        | WindowContent::Reserve(text)
         | WindowContent::Spells(text) => Some(text),
         _ => None,
     }
@@ -65,6 +66,7 @@ fn text_content_mut(content: &mut WindowContent) -> Option<&mut crate::data::Tex
     match content {
         WindowContent::Text(text)
         | WindowContent::Inventory(text)
+        | WindowContent::Reserve(text)
         | WindowContent::Spells(text) => Some(text),
         _ => None,
     }
@@ -440,7 +442,8 @@ impl VellumGuiApp {
 }
 
 /// Append a stream id to a comma-separated field if not already present.
-fn append_stream_id(field: &mut String, id: &str) {
+/// Shared with the Window Editor's seen-streams picker.
+pub(super) fn append_stream_id(field: &mut String, id: &str) {
     let already = field
         .split(',')
         .any(|s| s.trim().eq_ignore_ascii_case(id));

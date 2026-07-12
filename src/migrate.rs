@@ -151,6 +151,7 @@ fn process_file(path: &Path, out_dir: &Path, dry_run: bool, verbose: bool) -> Re
         terminal_height: layout.terminal_height,
         base_layout: None,
         theme: None,
+        unknown_windows: Vec::new(),
     };
 
     let mut windows_skipped = 0;
@@ -750,10 +751,12 @@ impl BaseMut for WindowDef {
             WindowDef::TabbedText { base, .. } => Some(base),
             WindowDef::Room { base, .. } => Some(base),
             WindowDef::Inventory { base, .. } => Some(base),
+            WindowDef::Reserve { base, .. } => Some(base),
             WindowDef::CommandInput { base, .. } => Some(base),
             WindowDef::Progress { base, .. } => Some(base),
             WindowDef::Countdown { base, .. } => Some(base),
             WindowDef::Compass { base, .. } => Some(base),
+            WindowDef::Map { base, .. } => Some(base),
             WindowDef::Indicator { base, .. } => Some(base),
             WindowDef::Dashboard { base, .. } => Some(base),
             WindowDef::InjuryDoll { base, .. } => Some(base),
@@ -766,6 +769,7 @@ impl BaseMut for WindowDef {
             WindowDef::Container { base, .. } => Some(base),
             WindowDef::Spacer { base, .. } => Some(base),
             WindowDef::Quickbar { base, .. } => Some(base),
+            WindowDef::Hotkeybar { base, .. } => Some(base),
             WindowDef::Spells { base, .. } => Some(base),
             WindowDef::Perception { base, .. } => Some(base),
             WindowDef::Experience { base, .. } => Some(base),

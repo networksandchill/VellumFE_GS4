@@ -182,6 +182,23 @@ impl Config {
                 },
             }),
 
+            "reserve" => Some(WindowDef::Reserve {
+                base: WindowBase {
+                    name: "reserve".to_string(),
+                    title: Some("Reserve".to_string()),
+                    rows: 20,
+                    cols: 40,
+                    min_rows: Some(4),
+                    ..base_defaults.clone()
+                },
+                data: InventoryWidgetData {
+                    streams: vec!["reserve".to_string()],
+                    buffer_size: 0, // No scrollback (content replaced each snapshot)
+                    wordwrap: true,
+                    show_timestamps: false,
+                },
+            }),
+
             "command_input" => Some(WindowDef::CommandInput {
                 base: WindowBase {
                     name: "command_input".to_string(),
@@ -209,6 +226,24 @@ impl Config {
                     ..base_defaults.clone()
                 },
                 data: QuickbarWidgetData {},
+            }),
+
+            "hotkeybar" => Some(WindowDef::Hotkeybar {
+                base: WindowBase {
+                    name: "hotkeybar".to_string(),
+                    title: Some("Actions".to_string()),
+                    rows: 3,
+                    cols: 60,
+                    min_rows: Some(3),
+                    max_rows: Some(3),
+                    show_border: true,
+                    show_title: false,
+                    ..base_defaults.clone()
+                },
+                data: HotkeybarWidgetData {
+                    bar: "default".to_string(),
+                    orientation: "horizontal".to_string(),
+                },
             }),
 
             "health" => Some(WindowDef::Progress {
@@ -689,6 +724,22 @@ impl Config {
                     color: None,
                     background_color: None,
                 },
+            }),
+
+            "map" => Some(WindowDef::Map {
+                base: WindowBase {
+                    name: "map".to_string(),
+                    title: Some("Map".to_string()),
+                    row: 0,
+                    col: 0,
+                    rows: 12,
+                    cols: 30,
+                    show_border: true,
+                    min_rows: Some(5),
+                    min_cols: Some(10),
+                    ..base_defaults.clone()
+                },
+                data: MapWidgetData::default(),
             }),
 
             "compass" => Some(WindowDef::Compass {
@@ -1437,11 +1488,14 @@ impl Config {
             "active_effects_custom".to_string(),
             // Other
             "inventory".to_string(),
+            "reserve".to_string(),
             "room".to_string(),
             "spells".to_string(),
             "compass".to_string(),
+            "map".to_string(),
             "injuries".to_string(),
             "quickbar".to_string(),
+            "hotkeybar".to_string(),
             "spacer".to_string(),
             // "performance" removed - now overlay-only via F12
             "perception".to_string(),
@@ -1488,7 +1542,7 @@ impl Config {
             // DR-specific templates
             "experience" | "concentration" | "perception" => Some(GameType::DR),
             // GS4-specific templates
-            "gs4_experience" | "betrayer" | "minivitals" => Some(GameType::GS4),
+            "gs4_experience" | "betrayer" | "minivitals" | "reserve" => Some(GameType::GS4),
             // All others (including encum) available for both games
             _ => None,
         }
@@ -1747,7 +1801,19 @@ impl Config {
         layout: &crate::config::Layout,
         exclude_essential: bool,
     ) -> HashMap<WidgetCategory, Vec<String>> {
+        Self::get_layout_templates_by_category(layout, exclude_essential, false)
+    }
+
+    /// Like `get_visible_templates_by_category`, but with `include_hidden`
+    /// the filter is presence-in-layout rather than visibility — used by the
+    /// edit-window picker so hidden windows stay reachable.
+    pub fn get_layout_templates_by_category(
+        layout: &crate::config::Layout,
+        exclude_essential: bool,
+        include_hidden: bool,
+    ) -> HashMap<WidgetCategory, Vec<String>> {
         let all_by_category = Self::get_templates_by_category();
+        let included = |w: &crate::config::WindowDef| include_hidden || w.base().visible;
 
         let mut visible_by_category: HashMap<WidgetCategory, Vec<String>> = all_by_category
             .into_iter()
@@ -1759,11 +1825,12 @@ impl Config {
                         if exclude_essential && (*name == "main" || *name == "command_input") {
                             return false;
                         }
-                        // Include only visible windows
+                        // Include only windows present (and, unless
+                        // include_hidden, visible) in the layout
                         layout
                             .windows
                             .iter()
-                            .any(|w| w.name() == *name && w.base().visible)
+                            .any(|w| w.name() == *name && included(w))
                     })
                     .collect();
                 (category, visible)
@@ -1779,7 +1846,7 @@ impl Config {
             if let Some(cmd) = layout
                 .windows
                 .iter()
-                .find(|w| w.widget_type() == "command_input" && w.base().visible)
+                .find(|w| w.widget_type() == "command_input" && included(w))
             {
                 visible_by_category
                     .entry(WidgetCategory::Other)
@@ -1792,7 +1859,7 @@ impl Config {
         for spacer in layout
             .windows
             .iter()
-            .filter(|w| w.widget_type() == "spacer" && w.base().visible)
+            .filter(|w| w.widget_type() == "spacer" && included(w))
         {
             visible_by_category
                 .entry(WidgetCategory::Other)
@@ -1804,7 +1871,7 @@ impl Config {
         // These have names like "custom-text-1", "custom-tabbedtext-2", etc.
         let all_templates: std::collections::HashSet<String> =
             Self::list_window_templates().into_iter().collect();
-        for window in layout.windows.iter().filter(|w| w.base().visible) {
+        for window in layout.windows.iter().filter(|w| included(w)) {
             let name = window.name().to_string();
             // Skip if already in templates or is essential window we're excluding
             if all_templates.contains(&name) {

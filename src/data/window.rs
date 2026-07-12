@@ -29,6 +29,7 @@ pub enum WidgetType {
     Indicator,
     Room,
     Inventory,
+    Reserve,
     CommandInput,
     Dashboard,
     InjuryDoll,
@@ -46,10 +47,13 @@ pub enum WidgetType {
     GS4Experience,
     Encumbrance,
     Quickbar,
+    Hotkeybar,
     MiniVitals,
     Betrayer,
     /// Lich WebUI page rendered natively from its JSON component tree
     WebUi,
+    /// Auto-generated location map (mini map)
+    Map,
 }
 
 impl WidgetType {
@@ -74,6 +78,7 @@ impl WidgetType {
             "indicator" => Some(WidgetType::Indicator),
             "room" => Some(WidgetType::Room),
             "inventory" => Some(WidgetType::Inventory),
+            "reserve" => Some(WidgetType::Reserve),
             "command_input" | "commandinput" => Some(WidgetType::CommandInput),
             "dashboard" => Some(WidgetType::Dashboard),
             "hand" => Some(WidgetType::Hand),
@@ -90,9 +95,11 @@ impl WidgetType {
             "gs4_experience" => Some(WidgetType::GS4Experience),
             "encum" => Some(WidgetType::Encumbrance),
             "quickbar" => Some(WidgetType::Quickbar),
+            "hotkeybar" => Some(WidgetType::Hotkeybar),
             "minivitals" => Some(WidgetType::MiniVitals),
             "betrayer" => Some(WidgetType::Betrayer),
             "webui" | "lichui" => Some(WidgetType::WebUi),
+            "map" => Some(WidgetType::Map),
             _ => None,
         }
     }
@@ -108,6 +115,7 @@ impl WidgetType {
         "indicator",
         "room",
         "inventory",
+        "reserve",
         "command_input",
         "dashboard",
         "hand",
@@ -123,9 +131,11 @@ impl WidgetType {
         "gs4_experience",
         "encum",
         "quickbar",
+        "hotkeybar",
         "minivitals",
         "betrayer",
         "webui",
+        "map",
     ];
 }
 
@@ -133,6 +143,7 @@ impl WidgetType {
 #[derive(Clone, Debug)]
 pub enum WindowContent {
     Text(TextContent),
+    Map(MapData),
     TabbedText(TabbedTextContent),
     Progress(ProgressData),
     Countdown(CountdownData),
@@ -141,6 +152,9 @@ pub enum WindowContent {
     Indicator(IndicatorData),
     Room(RoomContent),
     Inventory(TextContent),
+    /// Reserved-items window - same snapshot semantics as Inventory but fed
+    /// by the `reserve` stream
+    Reserve(TextContent),
     CommandInput {
         text: String,
         cursor: usize,
@@ -181,6 +195,11 @@ pub enum WindowContent {
     /// Reads from GameState.encumbrance (no data stored here)
     Encumbrance,
     Quickbar,
+    /// Hotkey bar - buttons resolved each frame from config.hotbars +
+    /// GameState by core::hotbar::resolve_bar; carries only its bar binding
+    Hotkeybar {
+        bar: String, // Name of the bar in hotbars.toml
+    },
     /// MiniVitals window - displays health, mana, stamina, spirit as horizontal bars
     /// Reads from GameState.vitals (no data stored here)
     MiniVitals,

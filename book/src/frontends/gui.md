@@ -44,6 +44,15 @@ center, and right sidebar. Toggle zones from the top toolbar.
 - Windows can be **detached** into separate OS windows (restored across
   sessions), or locked together into tab groups that move as a unit.
 
+## The Map
+
+The GUI renders a live [map](../widgets/map.md) of your surroundings: a
+mini map widget that follows your character (click a room to walk there),
+and a **Map Explorer** native window for browsing any mapped location,
+with a drag-to-tidy override editor. Map data comes from your Lich install
+or a one-click download in **Settings → Map** — see the
+[Map page](../widgets/map.md) for setup.
+
 ## The Window Editor
 
 Right-click a window → **Edit Window…** (or `.editwindow`) to configure
@@ -118,7 +127,10 @@ nine-slice borders, icon sprites, a sprite compass and paperdoll. See
 
 ## Differences from the TUI
 
-- Copying is plain text: select with the mouse, `Ctrl+C`.
+- Copying is plain text: select with the mouse, `Ctrl+C`. Selections are
+  anchored to the text itself, so they survive scrolling — drag past the
+  window edge to auto-scroll, and copy picks up everything selected, even
+  lines currently scrolled out of view.
 - `Ctrl+F` opens in-window search with match highlighting.
 - Up/Down in the input bar browse command history; whatever you were
   typing is stashed and restored when you come back down.

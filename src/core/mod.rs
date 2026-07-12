@@ -6,11 +6,19 @@
 
 pub mod app_core;
 pub mod bounty_parser;
+pub mod ghost_rooms;
 pub mod highlight_engine;
+pub mod hotbar;
 pub mod input_router;
+pub mod layout_engine;
+pub mod map_service;
+pub mod mapdb;
+pub mod mapdb_update;
 pub mod menu_actions;
 pub mod messages;
+pub mod pathing;
 pub mod remote;
+pub mod travel;
 pub mod state;
 
 pub use app_core::AppCore;

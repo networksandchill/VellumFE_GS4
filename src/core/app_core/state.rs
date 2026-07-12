@@ -93,6 +93,23 @@ pub struct AppCore {
 
     // === Navigation State ===
     /// Navigation room ID from <nav rm='...'/>
+    /// Live map state: mapdb, generated layouts, current-room tracking.
+    pub map: crate::core::map_service::MapService,
+    /// Downloads released mapdbs from GitHub (Settings > Map).
+    pub map_updater: crate::core::mapdb_update::MapDbUpdater,
+    /// Native go2: the walk executor and its outbound command queue.
+    pub travel: crate::core::travel::TravelService,
+    /// Cache for the wire-format map scene sent to web clients, keyed by
+    /// (scene Arc pointer, sheet, building cluster) so a rebuild only
+    /// happens when the drawn view actually changes.
+    remote_map_cache: Option<(
+        (usize, crate::core::layout_engine::Sheet, Option<usize>),
+        std::sync::Arc<crate::core::remote::RemoteMapScene>,
+    )>,
+    /// Map revision as of the last remote flush; lets poll_map push a
+    /// freshly generated layout to phones without waiting for game text.
+    last_remote_map_revision: u64,
+
     pub nav_room_id: Option<String>,
 
     /// Lich room ID extracted from room display
@@ -139,8 +156,13 @@ pub struct AppCore {
 
     // === Keybind Runtime Cache ===
     /// Runtime keybind map for fast O(1) lookups (KeyEvent -> KeyBindAction)
-    /// Built from config.keybinds at startup and on config reload
+    /// Built from config.keybinds at startup and on config reload,
+    /// then merged with hotbar button hotkeys (as Macro entries)
     pub keybind_map: HashMap<crate::data::input::KeyEvent, crate::config::KeyBindAction>,
+
+    /// Hotbar hotkeys that lost a conflict with an existing binding
+    /// (keybinds.toml or an earlier hotbar button). Editors surface these.
+    pub hotbar_key_conflicts: Vec<crate::core::app_core::keybinds::HotbarKeyConflict>,
 
     // === Dialog Position Persistence ===
     /// Saved dialog positions loaded from widget_state.toml
@@ -213,12 +235,25 @@ impl AppCore {
             tracing::info!("TTS enabled - accessibility features active");
         }
 
-        // Build the runtime keybind map from config
-        let keybind_map = Self::build_keybind_map(&config);
+        // Build the runtime keybind map from config, then merge hotbar
+        // button hotkeys (existing bindings win; conflicts surfaced below)
+        let mut keybind_map = Self::build_keybind_map(&config);
+        let hotbar_key_conflicts = Self::merge_hotbar_hotkeys(&mut keybind_map, &config.hotbars);
 
         let layout_theme = layout.theme.clone();
+        let map_base = Config::base_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        let map_cache_dir = map_base.join("cache").join("layouts");
+        let map_overrides_path = map_base.join("map_overrides.json");
+
         let mut app = Self {
             config,
+            map: crate::core::map_service::MapService::new(map_cache_dir, map_overrides_path),
+            map_updater: crate::core::mapdb_update::MapDbUpdater::new(
+                crate::core::mapdb_update::download_dir(&map_base),
+            ),
+            travel: Default::default(),
+            remote_map_cache: None,
+            last_remote_map_revision: 0,
             layout: layout.clone(),
             baseline_layout: Some(layout),
             game_state: GameState::new(),
@@ -253,8 +288,28 @@ impl AppCore {
             save_reminder_shown: false,
             base_layout_name: None,
             keybind_map,
+            hotbar_key_conflicts,
             saved_dialog_positions,
         };
+
+        for conflict in &app.hotbar_key_conflicts.clone() {
+            app.add_system_message(&format!(
+                "Hotbar key '{}' ({}:{}) not registered - already bound by {}",
+                conflict.key, conflict.bar, conflict.button, conflict.conflicts_with
+            ));
+        }
+
+        for entry in app.layout.unknown_windows.clone() {
+            let name = entry.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+            let widget_type = entry
+                .get("widget_type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
+            app.add_system_message(&format!(
+                "Layout window '{}' skipped: widget type '{}' not supported by this build (kept in layout.toml)",
+                name, widget_type
+            ));
+        }
 
         app.apply_session_cache();
         app.apply_custom_quickbars();
@@ -265,7 +320,213 @@ impl AppCore {
             // The frontend will refresh during initialization from config.
         }
 
+        app.refresh_map_source();
+
         Ok(app)
+    }
+
+    /// Resolve the mapdb source from config and (re)start the load when it
+    /// changes. Called at startup, after the settings editor saves, and when
+    /// the updater installs a fresh download.
+    pub fn refresh_map_source(&mut self) {
+        let base = Config::base_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        let source = crate::core::map_service::resolve_source(
+            self.config.map.mapdb_path.as_deref(),
+            self.config.map.lich_dir.as_deref(),
+            self.config.connection.game.as_deref(),
+            &crate::core::mapdb_update::download_dir(&base),
+        );
+        self.map.ensure_db(source);
+    }
+
+    /// Drain the map worker and the mapdb updater; a freshly installed
+    /// download is picked up immediately. Frontends call this once per frame.
+    pub fn poll_map(&mut self) {
+        self.map.poll();
+        if self.map_updater.poll() {
+            self.refresh_map_source();
+        }
+        // Announce download completion everywhere — on phones there is no
+        // settings panel to watch, only the game text.
+        if let Some(status) = self.map_updater.take_finished() {
+            use crate::core::mapdb_update::UpdateStatus;
+            let text = match status {
+                UpdateStatus::Updated { tag } => format!("map data {tag} installed"),
+                UpdateStatus::UpToDate { tag } => format!("map data already up to date ({tag})"),
+                UpdateStatus::Failed(e) => format!("map download failed: {e}"),
+                _ => "map update finished".to_string(),
+            };
+            self.add_system_message(&format!("[map] {text}"));
+        }
+        self.tick_travel();
+        // A layout that finished generating between game lines still needs
+        // to reach phones; the flush is diff-based so this is cheap.
+        if self.message_processor.remote.is_some()
+            && self.map.revision != self.last_remote_map_revision
+        {
+            self.last_remote_map_revision = self.map.revision;
+            self.flush_remote_state();
+        }
+    }
+
+    /// Advance the walk executor against the latest world state. Called
+    /// after every processed network line and once per frontend frame (the
+    /// frame tick covers time-based waits like roundtime when the game is
+    /// quiet).
+    pub fn tick_travel(&mut self) {
+        if !self.travel.is_traveling() {
+            return;
+        }
+        let Some(db) = self.map.mapdb().cloned() else {
+            return;
+        };
+        // Active spell numbers for scripted-edge checkspell branches.
+        let active_spells: Vec<u16> = self
+            .game_state
+            .effects
+            .get("ActiveSpells")
+            .map(|content| {
+                content
+                    .effects
+                    .iter()
+                    .filter_map(|e| e.id.trim().parse::<u16>().ok())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let ctx = crate::core::travel::TravelContext {
+            db: &db,
+            current_room: self.map.current_room_id,
+            dead: self.game_state.status.dead,
+            muckled: self.game_state.status.stunned || self.game_state.status.webbed,
+            standing: self.game_state.status.standing,
+            sitting: self.game_state.status.sitting,
+            kneeling: self.game_state.status.kneeling,
+            active_spells: &active_spells,
+            rt_remaining: self.game_state.roundtime_remaining() as f64,
+            now_ms: self.travel.now_ms(),
+        };
+        let events = self.travel.tick(ctx);
+        for event in events {
+            match event {
+                crate::core::travel::TravelEvent::Status(text) => {
+                    self.add_system_message(&format!("[go2] {text}"));
+                }
+                crate::core::travel::TravelEvent::Arrived {
+                    destination,
+                    seconds,
+                } => {
+                    self.add_system_message(&format!(
+                        "[go2] arrived at room {destination} — travel time {}",
+                        crate::core::travel::format_eta(seconds)
+                    ));
+                }
+                crate::core::travel::TravelEvent::Failed(reason) => {
+                    self.add_system_message(&format!("[go2] {reason}"));
+                }
+                crate::core::travel::TravelEvent::Send(_) => unreachable!("queued by the service"),
+            }
+        }
+    }
+
+    /// Commands automation wants sent to the game; frontends drain this
+    /// through the same path as typed commands.
+    pub fn take_outbound(&mut self) -> Vec<String> {
+        self.travel.take_outbound()
+    }
+
+    /// Plan and begin a trip to a mapdb room id.
+    pub fn start_travel(&mut self, destination: u32) {
+        let Some(db) = self.map.mapdb().cloned() else {
+            self.add_system_message(
+                "[go2] map database not loaded — configure it in Settings > Map",
+            );
+            return;
+        };
+        let Some(current) = self.map.current_room_id else {
+            self.add_system_message(
+                "[go2] your current room hasn't resolved against the mapdb yet (see .room)",
+            );
+            return;
+        };
+        if current == destination {
+            self.add_system_message("[go2] you're already here...");
+            return;
+        }
+        if db.room(destination).is_none() {
+            self.add_system_message(&format!("[go2] room {destination} is not in the mapdb"));
+            return;
+        }
+        match crate::core::travel::TravelTask::start(
+            &db,
+            current,
+            destination,
+            self.travel.now_ms(),
+        ) {
+            Ok(task) => {
+                let eta = task.eta_seconds(&db, current);
+                let title = db
+                    .room(destination)
+                    .and_then(|r| r.title.first().cloned())
+                    .unwrap_or_default();
+                self.add_system_message(&format!(
+                    "[go2] → {title} ({destination}): {} rooms, ETA {}",
+                    task.rooms_total(),
+                    crate::core::travel::format_eta(eta)
+                ));
+                self.travel.last_start_room = Some(current);
+                self.travel.set_task(task);
+                // Fire the first move now instead of on the next frame.
+                self.tick_travel();
+            }
+            Err(reason) => {
+                self.add_system_message(&format!("[go2] {reason}"));
+            }
+        }
+    }
+
+    /// Cancel the active trip (`.go2 stop`, Esc).
+    pub fn stop_travel(&mut self) {
+        if self.travel.stop() {
+            self.add_system_message("[go2] travel stopped.");
+        } else {
+            self.add_system_message("[go2] not traveling.");
+        }
+    }
+
+    /// Check the given GitHub repo for a mapdb release and download it if
+    /// it's new. Progress lands in `map_updater.status`.
+    pub fn start_mapdb_download(&mut self, repo: &str) {
+        let repo = repo.trim();
+        if repo.is_empty() {
+            return;
+        }
+        self.map_updater.start(repo.to_owned());
+    }
+
+    /// Delete all downloaded mapdb versions and fall back to the Lich folder.
+    pub fn remove_downloaded_mapdb(&mut self) {
+        self.map_updater.remove_downloaded();
+        self.refresh_map_source();
+    }
+
+    /// Push the latest stream-reported room identifiers into the map service.
+    /// `nav_room_id` carries the game uid; `lich_room_id` the Lich room id.
+    /// Title and obvious exits ride along — unmapped rooms are sketched as
+    /// ghosts from exactly this data.
+    fn sync_map_room(&mut self) {
+        let uid = self
+            .nav_room_id
+            .as_deref()
+            .and_then(|s| s.trim().parse::<i64>().ok());
+        let lich_id = self
+            .lich_room_id
+            .as_deref()
+            .and_then(|s| s.trim().parse::<u32>().ok());
+        let snapshot = crate::core::ghost_rooms::RoomSnapshot {
+            title: self.game_state.room_name.clone(),
+            exits: self.game_state.exits.clone(),
+        };
+        self.map.note_room(uid, lich_id, snapshot);
     }
 
     fn apply_custom_quickbars(&mut self) {
@@ -687,9 +948,11 @@ impl AppCore {
             crate::data::WidgetType::Progress => "progress",
             crate::data::WidgetType::Countdown => "countdown",
             crate::data::WidgetType::Compass => "compass",
+            crate::data::WidgetType::Map => "map",
             crate::data::WidgetType::Indicator => "indicator",
             crate::data::WidgetType::Room => "room",
             crate::data::WidgetType::Inventory => "inventory",
+            crate::data::WidgetType::Reserve => "reserve",
             crate::data::WidgetType::CommandInput => "command_input",
             crate::data::WidgetType::Dashboard => "dashboard",
             crate::data::WidgetType::InjuryDoll => "injury_doll",
@@ -706,6 +969,7 @@ impl AppCore {
             crate::data::WidgetType::GS4Experience => "gs4_experience",
             crate::data::WidgetType::Encumbrance => "encum",
             crate::data::WidgetType::Quickbar => "quickbar",
+            crate::data::WidgetType::Hotkeybar => "hotkeybar",
             crate::data::WidgetType::MiniVitals => "minivitals",
             crate::data::WidgetType::Betrayer => "betrayer",
             crate::data::WidgetType::Items => "items",
@@ -864,9 +1128,153 @@ impl AppCore {
                 .clone()
                 .or_else(|| self.config.character.clone());
         }
+        // The map lives on AppCore, not GameState: overlay the drawable
+        // scene + position for the phone's map view.
+        let (map_scene, map_state) = self.build_remote_map();
+        snap.map_scene = map_scene;
+        snap.map_state = map_state;
         if let Some(remote) = self.message_processor.remote.as_mut() {
             remote.flush_state(snap);
         }
+    }
+
+    /// The phone map's wire data: the same sheet + building filter the
+    /// desktop mini map draws, cached until the drawn view changes, plus
+    /// the small per-step position/ghost state.
+    fn build_remote_map(
+        &mut self,
+    ) -> (
+        crate::core::remote::RemoteMapSceneRef,
+        crate::core::remote::RemoteMapState,
+    ) {
+        use crate::core::layout_engine::{Sheet, SceneEdgeKind};
+        use crate::core::remote::{
+            RemoteGhostEdge, RemoteGhostNode, RemoteMapEdge, RemoteMapLabel, RemoteMapRoom,
+            RemoteMapScene, RemoteMapSceneRef, RemoteMapState,
+        };
+
+        let map = &self.map;
+        let mut state = RemoteMapState::default();
+        let Some(scene) = map.current_scene() else {
+            self.remote_map_cache = None;
+            return (RemoteMapSceneRef::default(), state);
+        };
+
+        let current = map.current_room_id;
+        let (sheet, center, filter) = match current.and_then(|id| scene.room(id)) {
+            Some((sheet, room)) => (
+                sheet,
+                Some(room.cell),
+                (sheet == Sheet::Interiors).then(|| scene.cluster_groups(room.group)),
+            ),
+            None => (Sheet::Outdoor, None, None),
+        };
+
+        // Ghost sketch overlay (session-only unmapped interiors).
+        let overlay = (!map.ghosts().is_empty()).then(|| {
+            crate::core::ghost_rooms::build_overlay(map.ghosts(), scene, sheet, filter.as_ref())
+        });
+        let ghost_cell = map
+            .current_ghost
+            .and_then(|uid| overlay.as_ref()?.cell_of(uid));
+
+        state.available = true;
+        state.location = map.current_location.clone();
+        state.room = current;
+        state.cell = ghost_cell.or(center).map(|c| [c.x, c.y]);
+        state.in_ghost = ghost_cell.is_some();
+        if let Some(overlay) = &overlay {
+            let current_ghost = map.current_ghost;
+            state.ghosts = overlay
+                .nodes
+                .iter()
+                .map(|n| RemoteGhostNode {
+                    x: n.cell.x,
+                    y: n.cell.y,
+                    cur: current_ghost == Some(n.uid),
+                })
+                .collect();
+            state.ghost_edges = overlay
+                .edges
+                .iter()
+                .map(|e| RemoteGhostEdge {
+                    x1: e.a.x,
+                    y1: e.a.y,
+                    x2: e.b.x,
+                    y2: e.b.y,
+                    l: e.label.clone(),
+                })
+                .collect();
+        }
+
+        // Scene: rebuild only when the drawn view changes (location/sheet/
+        // building or a layout regeneration — the Arc pointer covers all).
+        let cluster_key = filter
+            .as_ref()
+            .map(|set| set.iter().min().copied().unwrap_or(0));
+        let key = (std::sync::Arc::as_ptr(scene) as usize, sheet, cluster_key);
+        if let Some((cached_key, cached)) = &self.remote_map_cache {
+            if *cached_key == key {
+                return (RemoteMapSceneRef(Some(cached.clone())), state);
+            }
+        }
+
+        let pass =
+            |group: usize| filter.as_ref().map_or(true, |set| set.contains(&group));
+        let sheet_scene = scene.sheet(sheet);
+        let wire = RemoteMapScene {
+            location: scene.location.clone(),
+            sheet: match sheet {
+                Sheet::Outdoor => "outdoor".to_string(),
+                Sheet::Interiors => "interiors".to_string(),
+            },
+            rooms: sheet_scene
+                .rooms
+                .iter()
+                .filter(|r| pass(r.group))
+                .map(|r| RemoteMapRoom {
+                    i: r.id,
+                    x: r.cell.x,
+                    y: r.cell.y,
+                    e: r.entrance,
+                })
+                .collect(),
+            edges: sheet_scene
+                .edges
+                .iter()
+                .filter(|e| pass(e.group))
+                .map(|e| {
+                    let stub = e.kind == SceneEdgeKind::Stub;
+                    RemoteMapEdge {
+                        x1: e.a.x,
+                        y1: e.a.y,
+                        x2: e.b.x,
+                        y2: e.b.y,
+                        k: match e.kind {
+                            SceneEdgeKind::Directional => 0,
+                            SceneEdgeKind::Connector => 1,
+                            SceneEdgeKind::Stub => 2,
+                        },
+                        l: e.label.clone(),
+                        ar: stub.then_some(e.a_room),
+                        br: stub.then_some(e.b_room),
+                    }
+                })
+                .collect(),
+            labels: sheet_scene
+                .labels
+                .iter()
+                .filter(|l| pass(l.group))
+                .map(|l| RemoteMapLabel {
+                    x: l.cell.x,
+                    y: l.cell.y,
+                    t: l.text.clone(),
+                })
+                .collect(),
+        };
+        let wire = std::sync::Arc::new(wire);
+        self.remote_map_cache = Some((key, wire.clone()));
+        (RemoteMapSceneRef(Some(wire)), state)
     }
 
     /// Poll TTS events from callback channel and handle them
@@ -1094,7 +1502,8 @@ impl AppCore {
                         color,
                     })
                 }
-                WidgetType::Compass => WindowContent::Compass(CompassData {
+                WidgetType::Map => WindowContent::Map(crate::data::MapData::default()),
+            WidgetType::Compass => WindowContent::Compass(CompassData {
                     directions: Vec::new(),
                 }),
                 WidgetType::InjuryDoll => WindowContent::InjuryDoll(InjuryDollData::new()),
@@ -1137,6 +1546,11 @@ impl AppCore {
                     let mut content = TextContent::new(title, 10000);
                     content.streams = vec!["inv".to_string()];
                     WindowContent::Inventory(content)
+                }
+                WidgetType::Reserve => {
+                    let mut content = TextContent::new(title, 10000);
+                    content.streams = vec!["reserve".to_string()];
+                    WindowContent::Reserve(content)
                 }
                 WidgetType::Spells => {
                     let mut content = TextContent::new(title, 10000);
@@ -1182,6 +1596,14 @@ impl AppCore {
                 WidgetType::GS4Experience => WindowContent::GS4Experience,
                 WidgetType::Encumbrance => WindowContent::Encumbrance,
                 WidgetType::Quickbar => WindowContent::Quickbar,
+                WidgetType::Hotkeybar => {
+                    let bar = if let crate::config::WindowDef::Hotkeybar { data, .. } = window_def {
+                        data.bar.clone()
+                    } else {
+                        String::new()
+                    };
+                    WindowContent::Hotkeybar { bar }
+                }
                 WidgetType::MiniVitals => WindowContent::MiniVitals,
                 WidgetType::Betrayer => WindowContent::Betrayer,
                 WidgetType::WebUi => {
@@ -1426,6 +1848,7 @@ impl AppCore {
                     color,
                 })
             }
+            WidgetType::Map => WindowContent::Map(crate::data::MapData::default()),
             WidgetType::Compass => WindowContent::Compass(CompassData {
                 directions: Vec::new(),
             }),
@@ -1475,6 +1898,11 @@ impl AppCore {
                 content.streams = vec!["inv".to_string()];
                 WindowContent::Inventory(content)
             }
+            WidgetType::Reserve => {
+                let mut content = TextContent::new(title, 0);
+                content.streams = vec!["reserve".to_string()];
+                WindowContent::Reserve(content)
+            }
             WidgetType::Spells => {
                 let mut content = TextContent::new(title, 0);
                 content.streams = vec!["Spells".to_string()];
@@ -1513,6 +1941,14 @@ impl AppCore {
             WidgetType::GS4Experience => WindowContent::GS4Experience,
             WidgetType::Encumbrance => WindowContent::Encumbrance,
             WidgetType::Quickbar => WindowContent::Quickbar,
+            WidgetType::Hotkeybar => {
+                let bar = if let crate::config::WindowDef::Hotkeybar { data, .. } = window_def {
+                    data.bar.clone()
+                } else {
+                    String::new()
+                };
+                WindowContent::Hotkeybar { bar }
+            }
             WidgetType::MiniVitals => WindowContent::MiniVitals,
             WidgetType::Betrayer => WindowContent::Betrayer,
             WidgetType::WebUi => {
@@ -1544,6 +1980,11 @@ impl AppCore {
         // Clear inventory cache if this is an inventory window to force initial render
         if window_def.widget_type() == "inventory" {
             self.message_processor.clear_inventory_cache();
+        }
+
+        // Same for reserve windows - force the next reserve update to render
+        if window_def.widget_type() == "reserve" {
+            self.message_processor.clear_reserve_cache();
         }
 
         // Populate spells window from buffer if this is a spells window
@@ -1728,6 +2169,11 @@ impl AppCore {
                 self.game_state.society.update(society_lines);
             }
         }
+
+        self.sync_map_room();
+        // Walk executor reacts to whatever this line changed (room, RT,
+        // status); the per-frame tick covers pure time-based waits.
+        self.tick_travel();
 
         Ok(())
     }
@@ -2035,7 +2481,12 @@ impl AppCore {
         self.add_system_message("  .connect                - Reconnect to the game after a disconnect");
         self.add_system_message("  .menu                   - Open main menu");
         self.add_system_message("  .settings               - Open settings editor");
-        self.add_system_message("  .reload [category]      - Reload config from disk (highlights|keybinds|settings|colors)");
+        self.add_system_message("  .reload [category]      - Reload config from disk (highlights|keybinds|hotbars|settings|colors)");
+        self.add_system_message("  .room                   - Show how the current room resolved against the mapdb");
+        self.add_system_message("  .mapdb [download|remove|repo <r>] - Manage downloaded map data (status by default)");
+        self.add_system_message("  .go2 <target>           - Travel there (room id, uid, tag, saved name, or text search)");
+        self.add_system_message("  .go2 stop|status        - Cancel / show the active trip");
+        self.add_system_message("  .go2 save <name> [id]   - Save a target (.go2 targets lists, .go2 back returns)");
         self.add_system_message("");
 
         // Layout commands
@@ -2085,6 +2536,12 @@ impl AppCore {
         self.add_system_message("  .savekeybinds [name]    - Save keybinds as profile (default: 'default')");
         self.add_system_message("  .loadkeybinds <name>    - Load keybinds from profile");
         self.add_system_message("  .keybindprofiles        - List saved keybind profiles");
+        self.add_system_message("");
+
+        // Hotbars
+        self.add_system_message("HOTBARS:");
+        self.add_system_message("  .hotbars / .hotbar      - Open hotbar editor (bars of command buttons)");
+        self.add_system_message("    Add a bar to a layout with a 'hotkeybar' window (.addwindow)");
         self.add_system_message("");
 
         // Colors
@@ -2620,6 +3077,7 @@ impl AppCore {
                 countdown_id: name.to_string(),
                 color: None,
             }),
+            WidgetType::Map => WindowContent::Map(crate::data::MapData::default()),
             WidgetType::Compass => WindowContent::Compass(CompassData {
                 directions: Vec::new(),
             }),
@@ -2657,6 +3115,11 @@ impl AppCore {
                 content.streams = vec!["inv".to_string()];
                 WindowContent::Inventory(content)
             }
+            WidgetType::Reserve => {
+                let mut content = TextContent::new(name, 0);
+                content.streams = vec!["reserve".to_string()];
+                WindowContent::Reserve(content)
+            }
             WidgetType::Spells => {
                 let mut content = TextContent::new(name, 0);
                 content.streams = vec!["Spells".to_string()];
@@ -2681,6 +3144,11 @@ impl AppCore {
             WidgetType::Encumbrance => WindowContent::Encumbrance,
             WidgetType::MiniVitals => WindowContent::MiniVitals,
             WidgetType::Betrayer => WindowContent::Betrayer,
+            // A dot-command-created hotkeybar binds to the bar with the
+            // same name as the window
+            WidgetType::Hotkeybar => WindowContent::Hotkeybar {
+                bar: name.to_string(),
+            },
             WidgetType::WebUi => WindowContent::WebUi(
                 crate::data::webui::WebUiPanelContent::new(name, name),
             ),
@@ -3868,6 +4336,7 @@ impl AppCore {
         self.add_system_message("Reloading all configuration...");
         self.reload_highlights();
         self.reload_keybinds();
+        self.reload_hotbars();
         self.reload_settings();
         self.reload_colors();
         self.reload_layout();
@@ -3928,12 +4397,33 @@ impl AppCore {
         match crate::config::Config::load_keybinds(self.config.character.as_deref()) {
             Ok(keybinds) => {
                 self.config.keybinds = keybinds;
-                // Rebuild keybind map for O(1) lookups
-                self.keybind_map = Self::build_keybind_map(&self.config);
+                // Rebuild keybind map for O(1) lookups (re-merges hotbar keys)
+                self.rebuild_keybind_map();
                 self.add_system_message("Keybinds reloaded");
             }
             Err(e) => {
                 self.add_system_message(&format!("Failed to reload keybinds: {}", e));
+            }
+        }
+    }
+
+    /// Reload hotbars from disk and re-register their hotkeys
+    pub fn reload_hotbars(&mut self) {
+        match crate::config::Config::load_hotbars(self.config.character.as_deref()) {
+            Ok(hotbars) => {
+                self.config.hotbars = hotbars;
+                self.rebuild_keybind_map();
+                for conflict in &self.hotbar_key_conflicts.clone() {
+                    self.add_system_message(&format!(
+                        "Hotbar key '{}' ({}:{}) not registered - already bound by {}",
+                        conflict.key, conflict.bar, conflict.button, conflict.conflicts_with
+                    ));
+                }
+                self.add_system_message("Hotbars reloaded");
+                self.needs_render = true;
+            }
+            Err(e) => {
+                self.add_system_message(&format!("Failed to reload hotbars: {}", e));
             }
         }
     }
@@ -4454,7 +4944,9 @@ impl AppCore {
 
     /// Build "Edit Window" menu showing widget categories (only categories with visible windows)
     pub fn build_edit_window_menu(&self) -> Vec<crate::data::ui_state::PopupMenuItem> {
-        let categories_map = crate::config::Config::get_visible_templates_by_category(&self.layout, false);
+        // include_hidden: hidden windows stay editable from the picker.
+        let categories_map =
+            crate::config::Config::get_layout_templates_by_category(&self.layout, false, true);
 
         // Sort categories for consistent display
         let mut categories: Vec<_> = categories_map.into_iter().collect();
@@ -4477,7 +4969,9 @@ impl AppCore {
         &self,
         category: &crate::config::WidgetCategory,
     ) -> Vec<crate::data::ui_state::PopupMenuItem> {
-        let categories_map = crate::config::Config::get_visible_templates_by_category(&self.layout, false);
+        // include_hidden: hidden windows stay editable from the picker.
+        let categories_map =
+            crate::config::Config::get_layout_templates_by_category(&self.layout, false, true);
 
         if let Some(templates) = categories_map.get(category) {
             // Special handling for Status: Dashboard + Indicators submenu
@@ -4490,7 +4984,7 @@ impl AppCore {
                 let mut items: Vec<crate::data::ui_state::PopupMenuItem> = Vec::new();
                 for name in dashboards {
                     items.push(crate::data::ui_state::PopupMenuItem {
-                        text: self.get_window_display_name(&name),
+                        text: self.edit_menu_entry_text(&name),
                         command: format!("__EDIT__{}", name),
                         disabled: false,
                     });
@@ -4506,13 +5000,28 @@ impl AppCore {
             templates
                 .iter()
                 .map(|name| crate::data::ui_state::PopupMenuItem {
-                    text: self.get_window_display_name(name),
+                    text: self.edit_menu_entry_text(name),
                     command: format!("__EDIT__{}", name),
                     disabled: false,
                 })
                 .collect()
         } else {
             vec![]
+        }
+    }
+
+    /// Display text for an edit-menu entry; hidden windows are tagged so the
+    /// picker makes their state obvious.
+    fn edit_menu_entry_text(&self, name: &str) -> String {
+        let display = self.get_window_display_name(name);
+        let hidden = self
+            .layout
+            .get_window(name)
+            .is_some_and(|w| !w.base().visible);
+        if hidden {
+            format!("{} (hidden)", display)
+        } else {
+            display
         }
     }
 
@@ -4559,6 +5068,37 @@ mod tests {
     }
 
     #[test]
+    fn test_edit_picker_reaches_hidden_windows() {
+        // A hidden spacer must appear in the edit picker's template map when
+        // include_hidden is set, and stay out of the visible-only map.
+        let mut base = test_window_base("spacer_1");
+        base.visible = false;
+        let layout = Layout {
+            windows: vec![WindowDef::Spacer {
+                base,
+                data: SpacerWidgetData {},
+            }],
+            terminal_width: None,
+            terminal_height: None,
+            base_layout: None,
+            theme: None,
+            unknown_windows: Vec::new(),
+        };
+
+        let with_hidden =
+            crate::config::Config::get_layout_templates_by_category(&layout, false, true);
+        assert!(with_hidden
+            .get(&crate::config::WidgetCategory::Other)
+            .is_some_and(|names| names.iter().any(|n| n == "spacer_1")));
+
+        let visible_only =
+            crate::config::Config::get_visible_templates_by_category(&layout, false);
+        assert!(!visible_only
+            .get(&crate::config::WidgetCategory::Other)
+            .is_some_and(|names| names.iter().any(|n| n == "spacer_1")));
+    }
+
+    #[test]
     fn test_generate_spacer_name_empty_layout() {
         // RED: With no spacers, should return spacer_1
         let layout = Layout {
@@ -4567,6 +5107,7 @@ mod tests {
             terminal_height: None,
             base_layout: None,
             theme: None,
+            unknown_windows: Vec::new(),
         };
 
         let name = AppCore::generate_spacer_name(&layout);
@@ -4586,6 +5127,7 @@ mod tests {
             terminal_height: None,
             base_layout: None,
             theme: None,
+            unknown_windows: Vec::new(),
         };
 
         let name = AppCore::generate_spacer_name(&layout);
@@ -4613,6 +5155,7 @@ mod tests {
             terminal_height: None,
             base_layout: None,
             theme: None,
+            unknown_windows: Vec::new(),
         };
 
         let name = AppCore::generate_spacer_name(&layout);
@@ -4636,6 +5179,7 @@ mod tests {
             terminal_height: None,
             base_layout: None,
             theme: None,
+            unknown_windows: Vec::new(),
         };
 
         let name = AppCore::generate_spacer_name(&layout);
@@ -4681,6 +5225,7 @@ mod tests {
             terminal_height: None,
             base_layout: None,
             theme: None,
+            unknown_windows: Vec::new(),
         };
 
         let name = AppCore::generate_spacer_name(&layout);
@@ -4710,6 +5255,7 @@ mod tests {
             terminal_height: None,
             base_layout: None,
             theme: None,
+            unknown_windows: Vec::new(),
         };
 
         let name = AppCore::generate_spacer_name(&layout);
@@ -4733,6 +5279,7 @@ mod tests {
             terminal_height: None,
             base_layout: None,
             theme: None,
+            unknown_windows: Vec::new(),
         };
 
         let name = AppCore::generate_spacer_name(&layout);
@@ -4752,6 +5299,7 @@ mod tests {
             terminal_height: None,
             base_layout: None,
             theme: None,
+            unknown_windows: Vec::new(),
         };
 
         let name = AppCore::generate_spacer_name(&layout);

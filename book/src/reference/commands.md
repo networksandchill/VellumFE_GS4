@@ -16,7 +16,12 @@ command `quit` also saves your settings on the way out.)
 | `.quit` | `.q` | Exit VellumFE (saves settings) |
 | `.menu` | | Open the main menu |
 | `.settings` | | Open the settings editor |
-| `.reload [what]` | | Reload config from disk: `highlights`, `keybinds`, `settings`, `colors`, `layout`, or everything |
+| `.reload [what]` | | Reload config from disk: `highlights`, `keybinds`, `hotbars`, `settings`, `colors`, `layout`, or everything |
+| `.room` | | Show how the current room resolved against the map database (stream ids, mapdb room/location, routable exits, tags) — for debugging the map and pathing |
+| `.mapdb [download\|remove\|repo <r>]` | | Manage downloaded map data from any frontend (no args = status). On phones this is *the* way to fetch the map — there's no Settings > Map panel there |
+| `.go2 <target>` | | Native map travel: room id, uid (`u7150105`), tag (`bank`), saved name, or text search — see the [Travel chapter](../widgets/travel.md) |
+| `.go2 stop` / `.go2 status` | | Cancel / show the active trip |
+| `.go2 save <name> [id]` | | Save a travel target (`.go2 targets` lists them, `.go2 back` returns to the trip start) |
 
 ## Windows & Layout
 
@@ -53,11 +58,17 @@ command `quit` also saves your settings on the way out.)
 
 | Command | Aliases | Description |
 |---------|---------|-------------|
-| `.keybinds` | `.kb` | Browse keybinds |
+| `.keybinds` | `.kb` | Browse keybinds (press `f` to cycle the scope filter: all / global / character) |
 | `.addkeybind` | `.addkey` | Create a keybind |
 | `.savekeybinds [name]` | `.savekb` | Save keybinds as a named profile |
 | `.loadkeybinds <name>` | `.loadkb` | Load a keybind profile |
 | `.keybindprofiles` | `.kbprofiles` | List keybind profiles |
+
+## Hotbars
+
+| Command | Aliases | Description |
+|---------|---------|-------------|
+| `.hotbars` | `.hotbar` | Open the hotbar editor (bars of command buttons; see [Hotbars](../widgets/hotkeybar.md)) |
 
 ## Colors & Themes
 

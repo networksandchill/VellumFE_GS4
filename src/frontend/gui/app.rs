@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 mod detached;
+mod map_explorer;
 mod dialogs;
 mod dock;
 mod editors;
@@ -62,6 +63,8 @@ struct GuiTab {
 pub(super) struct WidgetRenderSettings {
     /// Effective text size for this window (per-tab override or global).
     text_size: f32,
+    /// Mini map zoom override (px per cell).
+    map_zoom: Option<f32>,
     /// Effective font family for this window's proportional text.
     font_family: egui::FontFamily,
     /// Height of one active-effect bar row.
@@ -163,6 +166,8 @@ pub struct VellumGuiApp {
     history_draft: String,
     close_requested: bool,
     detached_tabs: HashMap<TabKey, DetachedWindowState>,
+    /// Map Explorer native window (separate OS viewport).
+    map_explorer: map_explorer::MapExplorerState,
     detached_context_menu: Option<DetachedMenuState>,
     /// Which detached tab's viewport hosts the game popup menus. The menu
     /// stack renders inside that OS window (at its local click coords);
@@ -203,10 +208,13 @@ pub struct VellumGuiApp {
     /// Zoom factor pushed to egui at startup; afterwards egui owns it
     /// (Ctrl+= / Ctrl+- / Ctrl+0) and we persist changes back.
     zoom_applied: bool,
-    /// Deadline for delayed startup music ([sound] startup_music_delay_ms);
-    /// None once played, or when startup music is off. The player is !Send,
-    /// so the frame loop fires this instead of a timer thread — same
-    /// reasoning as the TUI runtime's deferred deadline.
+    /// Login music is armed when the first server data arrives — the
+    /// connection actually being established — not when the window opens.
+    startup_music_pending: bool,
+    /// Deadline for delayed startup music ([sound] startup_music_delay_ms,
+    /// counted from first server data); None once played or when off. The
+    /// player is !Send, so the frame loop fires this instead of a timer
+    /// thread — same reasoning as the TUI runtime's deferred deadline.
     startup_music_at: Option<std::time::Instant>,
     /// Title font size currently applied to the egui style; None forces
     /// a re-apply on the next frame.
@@ -216,6 +224,7 @@ pub struct VellumGuiApp {
     settings_editor: Option<editors::SettingsEditorState>,
     highlight_editor: Option<editors::HighlightEditorState>,
     keybind_editor: Option<editors::KeybindEditorState>,
+    hotbar_editor: Option<editors::HotbarEditorState>,
     colors_editor: Option<editors::ColorsEditorState>,
     theme_browser: Option<editors::ThemeBrowserState>,
     theme_editor: Option<editors::ThemeEditorState>,
@@ -421,21 +430,11 @@ impl VellumGuiApp {
         let command_history =
             Self::load_command_history(app_core.config.character.as_deref());
 
-        // Startup music, exactly like the TUI runtime: play now, or arm a
-        // deadline the frame loop fires.
-        let mut startup_music_at = None;
-        if app_core.config.sound.startup_music && app_core.sound_player.is_some() {
-            let delay_ms = app_core.config.sound.startup_music_delay_ms;
-            if delay_ms > 0 {
-                startup_music_at = Some(
-                    std::time::Instant::now() + std::time::Duration::from_millis(delay_ms),
-                );
-            } else if let Some(ref player) = app_core.sound_player {
-                if let Err(e) = player.play_from_sounds_dir("wizard_music", None) {
-                    tracing::debug!("Startup music not available: {e}");
-                }
-            }
-        }
+        // Login music plays when the game connection is established (first
+        // server data), not when the login screen opens — the frame loop
+        // arms the deadline on first receive.
+        let startup_music_pending =
+            app_core.config.sound.startup_music && app_core.sound_player.is_some();
 
         Ok(Self {
             app_core,
@@ -450,6 +449,7 @@ impl VellumGuiApp {
             history_draft: String::new(),
             close_requested: false,
             detached_tabs,
+            map_explorer: Default::default(),
             detached_context_menu: None,
             popup_menu_host: None,
             available_tabs,
@@ -475,12 +475,14 @@ impl VellumGuiApp {
             tab_settings,
             tab_groups,
             zoom_applied: false,
-            startup_music_at,
+            startup_music_pending,
+            startup_music_at: None,
             applied_title_font_size: None,
             applied_density: None,
             settings_editor: None,
             highlight_editor: None,
             keybind_editor: None,
+            hotbar_editor: None,
             colors_editor: None,
             theme_browser: None,
             theme_editor: None,
@@ -604,6 +606,7 @@ impl VellumGuiApp {
                 id: name.to_string(),
             },
             WidgetType::Compass => TabKey::Compass,
+            WidgetType::Map => TabKey::Map,
             WidgetType::Indicator => TabKey::Indicators,
             WidgetType::Targets => TabKey::Targets,
             WidgetType::Players => TabKey::Players,
@@ -648,6 +651,7 @@ impl VellumGuiApp {
         match &window.content {
             WindowContent::Text(content)
             | WindowContent::Inventory(content)
+            | WindowContent::Reserve(content)
             | WindowContent::Spells(content) => content
                 .streams
                 .iter()
@@ -934,6 +938,7 @@ impl VellumGuiApp {
     fn widget_render_settings(&self, key: &TabKey) -> WidgetRenderSettings {
         WidgetRenderSettings {
             text_size: self.effective_text_size(key),
+            map_zoom: self.tab_settings.get(key).and_then(|s| s.map_zoom),
             font_family: self.effective_font_family(key),
             effects_bar_height: self.ui_settings.effects_bar_height.clamp(10.0, 60.0),
             bar_corner_radius: self.ui_settings.bar_corner_radius.clamp(0.0, 12.0),
@@ -998,9 +1003,14 @@ impl VellumGuiApp {
             .unwrap_or(false);
 
         let mut clicked = None;
+        // Each member's screen rect, recorded so window-level drag-and-drop
+        // can resolve drops to the member under the pointer instead of the
+        // whole group window (e.g. left vs right hand in a hand group).
+        let mut member_rects: Vec<(String, Rect)> = Vec::with_capacity(members.len());
         if horizontal {
             ui.columns(members.len(), |columns| {
                 for (column, member) in columns.iter_mut().zip(members.iter()) {
+                    member_rects.push((member.window_name.clone(), column.max_rect()));
                     column.push_id(&member.id.key, |ui| {
                         if let Some(click) = Self::render_window_content(
                             &self.app_core,
@@ -1021,7 +1031,7 @@ impl VellumGuiApp {
                 .max(24.0);
             let width = ui.available_width().max(1.0);
             for member in &members {
-                ui.push_id(&member.id.key, |ui| {
+                let block = ui.push_id(&member.id.key, |ui| {
                     ui.allocate_ui(Vec2::new(width, each_height), |ui| {
                         ui.set_min_size(Vec2::new(width, each_height));
                         ui.set_max_height(each_height);
@@ -1033,11 +1043,21 @@ impl VellumGuiApp {
                         ) {
                             clicked = Some(click);
                         }
-                    });
+                    })
                 });
+                member_rects.push((member.window_name.clone(), block.inner.response.rect));
             }
         }
+        ui.ctx().data_mut(|data| {
+            data.insert_temp(Self::group_member_rects_id(&tab.id.key), member_rects);
+        });
         clicked
+    }
+
+    /// egui temp-data key for a group leader's per-member screen rects,
+    /// refreshed every frame the group renders.
+    fn group_member_rects_id(leader: &TabKey) -> egui::Id {
+        egui::Id::new("gui_group_member_rects").with(leader)
     }
 
     /// Handle `action:setskin:<name>` from dot-commands or menus. "none"
@@ -1642,10 +1662,30 @@ impl VellumGuiApp {
             }
         }
 
+        // Drain map worker results (mapdb load, layout generation), the
+        // mapdb release updater, and the walk executor.
+        self.app_core.poll_map();
+        // Commands the walk executor queued go out through the same path as
+        // typed commands (echo, ghost-room labels, network).
+        for command in self.app_core.take_outbound() {
+            self.dispatch_command(command);
+        }
+
         let mut received_text = false;
         while let Ok(message) = self.server_rx.try_recv() {
             match message {
                 ServerMessage::Text(line) => {
+                    // First data from the game = connection established:
+                    // time the login music from here.
+                    if self.startup_music_pending {
+                        self.startup_music_pending = false;
+                        self.startup_music_at = Some(
+                            std::time::Instant::now()
+                                + std::time::Duration::from_millis(
+                                    self.app_core.config.sound.startup_music_delay_ms,
+                                ),
+                        );
+                    }
                     self.app_core
                         .perf_stats
                         .record_bytes_received((line.len() + 1) as u64);
@@ -2716,6 +2756,7 @@ impl VellumGuiApp {
                     .filter_map(|window| match &window.content {
                         WindowContent::Text(content)
                         | WindowContent::Inventory(content)
+                        | WindowContent::Reserve(content)
                         | WindowContent::Spells(content) => Some(content),
                         WindowContent::TabbedText(tabbed) => tabbed
                             .tabs
@@ -2859,6 +2900,18 @@ impl VellumGuiApp {
             if !entry.rect.contains(pointer_pos) {
                 continue;
             }
+            // Grouped windows resolve to the member under the pointer
+            // (a hand group is one window but two drop targets).
+            if self.group_for_tab(&entry.tab_key).is_some() {
+                let member_rects: Option<Vec<(String, Rect)>> = ctx
+                    .data(|data| data.get_temp(Self::group_member_rects_id(&entry.tab_key)));
+                if let Some(member) = member_rects.iter().flatten().find_map(|(name, rect)| {
+                    rect.contains(pointer_pos).then_some(name.as_str())
+                }) {
+                    target = Some(self.drag_drop_target_for_window(member));
+                    break;
+                }
+            }
             let Some(window_name) = self
                 .available_tabs
                 .get(&entry.tab_key)
@@ -2866,33 +2919,38 @@ impl VellumGuiApp {
             else {
                 continue;
             };
-            let Some(window) = self.app_core.ui_state.windows.get(&window_name) else {
-                continue;
-            };
-            let name_lower = window_name.to_ascii_lowercase();
-            target = Some(match &window.content {
-                WindowContent::Hand { .. } if name_lower.contains("left") => "left".to_string(),
-                WindowContent::Hand { .. } if name_lower.contains("right") => "right".to_string(),
-                WindowContent::Inventory(_) => "wear".to_string(),
-                WindowContent::Container { container_title } => {
-                    match self
-                        .app_core
-                        .game_state
-                        .container_cache
-                        .find_by_title(container_title)
-                    {
-                        Some(container) => format!("#{}", container.id),
-                        None => "drop".to_string(),
-                    }
-                }
-                _ => "drop".to_string(),
-            });
+            target = Some(self.drag_drop_target_for_window(&window_name));
             break;
         }
 
         let target = target.unwrap_or_else(|| "drop".to_string());
         let command = format!("_drag #{} {}", payload.exist_id, target);
         self.dispatch_raw_command(command);
+    }
+
+    /// The `_drag` protocol target a drop on this window's body maps to.
+    fn drag_drop_target_for_window(&self, window_name: &str) -> String {
+        let Some(window) = self.app_core.ui_state.windows.get(window_name) else {
+            return "drop".to_string();
+        };
+        let name_lower = window_name.to_ascii_lowercase();
+        match &window.content {
+            WindowContent::Hand { .. } if name_lower.contains("left") => "left".to_string(),
+            WindowContent::Hand { .. } if name_lower.contains("right") => "right".to_string(),
+            WindowContent::Inventory(_) => "wear".to_string(),
+            WindowContent::Container { container_title } => {
+                match self
+                    .app_core
+                    .game_state
+                    .container_cache
+                    .find_by_title(container_title)
+                {
+                    Some(container) => format!("#{}", container.id),
+                    None => "drop".to_string(),
+                }
+            }
+            _ => "drop".to_string(),
+        }
     }
 
     /// Add a window from a layout template (menu `__ADD__<template>` path).
@@ -3057,6 +3115,10 @@ impl VellumGuiApp {
         }
         if action == "action:keybinds" {
             self.open_keybind_editor();
+            return true;
+        }
+        if action == "action:hotbars" {
+            self.open_hotbar_editor();
             return true;
         }
         if action == "action:addkeybind" {
@@ -3288,7 +3350,13 @@ impl VellumGuiApp {
                 self.app_core.request_menu(exist_id, noun, click.click_pos)
             }
         };
-        self.dispatch_raw_command(outbound);
+        // Direct links carrying a dot command (e.g. the map's native ".go2")
+        // are client commands, not game text.
+        if outbound.starts_with('.') {
+            self.dispatch_command(outbound);
+        } else {
+            self.dispatch_raw_command(outbound);
+        }
     }
 }
 
@@ -3347,6 +3415,16 @@ impl eframe::App for VellumGuiApp {
             .apply_if_changed(&ctx, self.app_core.config.active_skin.as_deref());
         self.apply_ui_sizing(&ctx);
         self.pump_server_messages();
+        // Keep painting while the map worker, mapdb download, or walk
+        // executor is busy so results and progress appear without waiting
+        // for user input or game text (travel needs ticks for RT waits).
+        if self.app_core.map.has_pending()
+            || self.app_core.map_updater.in_flight()
+            || self.app_core.travel.is_traveling()
+        {
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(150));
+        }
         self.sync_room_windows_from_components();
         self.refresh_available_tabs_if_needed();
         let monitor_bounds = Self::monitor_bounds_from_ctx(&ctx);
@@ -3778,6 +3856,7 @@ impl eframe::App for VellumGuiApp {
         });
 
         let detached_link_clicks = self.render_detached_viewports(&ctx);
+        self.render_map_explorer(&ctx);
 
         let zone_drop_result =
             self.render_zone_drop_overlay(&ctx, &visible_zone_rects, &zone_window_rects);
@@ -3903,7 +3982,7 @@ impl eframe::App for VellumGuiApp {
         // exempt so the captured key doesn't also type into the input.
         if let Some(input_id) = self.command_input_id {
             let nothing_focused = ctx.memory(|memory| memory.focused().is_none());
-            if nothing_focused && !self.keybind_capture_armed() {
+            if nothing_focused && !self.keybind_capture_armed() && !self.hotbar_capture_armed() {
                 ctx.memory_mut(|memory| memory.request_focus(input_id));
             }
         }
@@ -4326,21 +4405,40 @@ mod tests {
 
     #[test]
     fn test_format_target_line_respects_status_position() {
-        let mut cfg = TargetListConfig::default();
+        let cfg = TargetListConfig::default();
         let creature = Creature {
             name: "a goblin".to_string(),
             noun: Some("goblin".to_string()),
             id: "#101".to_string(),
             status: Some("stunned".to_string()),
+            flags: None,
         };
 
-        cfg.status_position = "start".to_string();
-        let start = VellumGuiApp::format_target_line(&creature, &cfg);
+        let start = VellumGuiApp::format_target_line(&creature, &cfg, "start");
         assert_eq!(start, "[stu] a goblin");
 
-        cfg.status_position = "end".to_string();
-        let end = VellumGuiApp::format_target_line(&creature, &cfg);
+        let end = VellumGuiApp::format_target_line(&creature, &cfg, "end");
         assert_eq!(end, "a goblin [stu]");
+    }
+
+    #[test]
+    fn test_format_target_line_joins_crtr_statuses() {
+        let cfg = TargetListConfig::default();
+        let creature = Creature {
+            name: "a sea nymph".to_string(),
+            noun: Some("nymph".to_string()),
+            id: "#607736".to_string(),
+            // Structured flags beat the legacy text status
+            status: Some("stunned".to_string()),
+            flags: Some(crate::core::state::CreatureFlags {
+                statuses: vec!["stunned".to_string(), "prone".to_string()],
+                hostile: true,
+                ..Default::default()
+            }),
+        };
+
+        let line = VellumGuiApp::format_target_line(&creature, &cfg, &cfg.status_position);
+        assert_eq!(line, "a sea nymph [stu,prn]");
     }
 
     #[test]
@@ -4370,12 +4468,14 @@ mod tests {
             noun: Some("goblin".to_string()),
             id: "#1".to_string(),
             status: Some("dead".to_string()),
+            flags: None,
         };
         let body_part_creature = Creature {
             name: "an arm".to_string(),
             noun: Some("arm".to_string()),
             id: "#2".to_string(),
             status: None,
+            flags: None,
         };
 
         assert!(VellumGuiApp::should_filter_target_creature(
@@ -4396,6 +4496,7 @@ mod tests {
             noun: Some("troll".to_string()),
             id: "#3".to_string(),
             status: Some("stunned".to_string()),
+            flags: None,
         };
 
         assert!(!VellumGuiApp::should_filter_target_creature(

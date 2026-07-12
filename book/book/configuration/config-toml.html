@@ -35,10 +35,10 @@
             const path_to_root = "../";
             const default_light_theme = "coal";
             const default_dark_theme = "coal";
-            window.path_to_searchindex_js = "../searchindex-b2b40ef9.js";
+            window.path_to_searchindex_js = "../searchindex-6e538b1c.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-f5efc91a.js"></script>
+        <script src="../toc-a5192a6c.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -244,12 +244,16 @@ order = []                      # Custom focus order (empty = layout order)
 status_position = "end"         # "end" or "start"
 truncation_mode = "noun"        # "full" or "noun"
 excluded_nouns = ["arm", "coal"]
+boss_color = "#ff5555"          # AscensionBoss / MiniBoss creatures
+challenging_color = "#ffaa55"   # "challenging" creatures
 
 [target_list.status_abbrev]
 stunned = "stu"
 frozen = "frz"
 dead = "ded"
 </code></pre>
+<p>The boss and challenging colors apply when the game’s structured creature
+status feed classifies a creature; see <a href="../widgets/targets.html">Targets</a>.</p>
 <h2 id="highlights"><a class="header" href="#highlights">Highlights</a></h2>
 <p>Global toggles for the highlight system:</p>
 <pre><code class="language-toml">[highlights]
@@ -258,6 +262,15 @@ replace_enabled = true          # Apply text replacements
 redirect_enabled = true         # Route lines to other windows
 coloring_enabled = true         # Apply color highlighting
 </code></pre>
+<h2 id="map"><a class="header" href="#map">Map</a></h2>
+<p>Where the <a href="../widgets/map.html">map widget</a> finds its data (GUI):</p>
+<pre><code class="language-toml">[map]
+lich_dir = "C:/Lich5"              # Lich install (folder containing data/)
+# mapdb_path = "C:/maps/map.json"    # explicit file; overrides everything
+mapdb_repo = "Nisugi/mapdb"        # GitHub repo for Settings &gt; Map downloads
+</code></pre>
+<p>All three are editable in <strong>Settings → Map</strong> in the GUI. Downloaded map
+data outranks the Lich folder; an empty <code>mapdb_repo</code> disables downloads.</p>
 <h2 id="sound"><a class="header" href="#sound">Sound</a></h2>
 <pre><code class="language-toml">[sound]
 enabled = true

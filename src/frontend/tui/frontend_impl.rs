@@ -109,6 +109,7 @@ impl Frontend for TuiFrontend {
         self.sync_hand_widgets(app_core, &theme);
         self.sync_spacer_widgets(app_core, &theme);
         self.sync_quickbar_widgets(app_core, &theme);
+        self.sync_hotkey_bars(app_core, &theme);
         self.sync_indicator_widgets(app_core, &theme);
         self.sync_targets_widgets(app_core, &theme);  // New component-based
         self.sync_players_widgets(app_core, &theme);
@@ -138,6 +139,7 @@ impl Frontend for TuiFrontend {
         let mut hand_widgets = std::mem::take(&mut self.widget_manager.hand_widgets);
         let mut spacer_widgets = std::mem::take(&mut self.widget_manager.spacer_widgets);
         let mut quickbar_widgets = std::mem::take(&mut self.widget_manager.quickbar_widgets);
+        let mut hotkey_bar_widgets = std::mem::take(&mut self.widget_manager.hotkey_bar_widgets);
         let mut indicator_widgets = std::mem::take(&mut self.widget_manager.indicator_widgets);
         let mut targets_widgets = std::mem::take(&mut self.widget_manager.targets_widgets);
         let mut players_widgets = std::mem::take(&mut self.widget_manager.players_widgets);
@@ -282,6 +284,12 @@ impl Frontend for TuiFrontend {
                             quickbar_widget.render(area, f.buffer_mut(), focused);
                         }
                     }
+                    WindowContent::Hotkeybar { .. } => {
+                        if let Some(bar_widget) = hotkey_bar_widgets.get_mut(name) {
+                            let focused = app_core.ui_state.focused_window.as_ref() == Some(name);
+                            bar_widget.render(area, f.buffer_mut(), focused);
+                        }
+                    }
                     WindowContent::Progress(_) => {
                         // Use the ProgressBar widget for proper rendering
                         if let Some(progress_bar) = progress_bars.get_mut(name) {
@@ -323,8 +331,9 @@ impl Frontend for TuiFrontend {
                             room_window.render(area, f.buffer_mut());
                         }
                     }
-                    WindowContent::Inventory(_) => {
+                    WindowContent::Inventory(_) | WindowContent::Reserve(_) => {
                         // Use the InventoryWindow widget for proper link rendering
+                        // (reserve windows share the same widget cache, keyed by name)
                         if let Some(inventory_window) = inventory_windows.get_mut(name) {
                             inventory_window.render(area, f.buffer_mut());
                         }
@@ -394,6 +403,14 @@ impl Frontend for TuiFrontend {
                         if let Some(injury_doll_widget) = injury_doll_widgets.get_mut(name) {
                             injury_doll_widget.render(area, f.buffer_mut());
                         }
+                    }
+                    WindowContent::Map(_) => {
+                        // The map is GUI-only; show a hint instead of a blank pane.
+                        let hint = ratatui::widgets::Paragraph::new(
+                            "Map is available in the GUI frontend (--frontend gui)",
+                        )
+                        .wrap(ratatui::widgets::Wrap { trim: true });
+                        ratatui::widgets::Widget::render(hint, area, f.buffer_mut());
                     }
                     WindowContent::Empty => {
                         // Check if this is a spacer widget
@@ -546,6 +563,9 @@ impl Frontend for TuiFrontend {
             if let Some(ref mut keybind_form) = self.keybind_form {
                 keybind_form.render(screen_area, f.buffer_mut(), &app_core.config, &theme);
             }
+            if let Some(ref mut hotbar_editor) = self.hotbar_editor {
+                hotbar_editor.render(screen_area, f.buffer_mut(), &app_core.config, &theme);
+            }
             if let Some(ref mut color_palette_browser) = self.color_palette_browser {
                 color_palette_browser.render(screen_area, f.buffer_mut(), &app_core.config, &theme);
             }
@@ -638,6 +658,7 @@ impl Frontend for TuiFrontend {
         self.widget_manager.hand_widgets = hand_widgets;
         self.widget_manager.spacer_widgets = spacer_widgets;
         self.widget_manager.quickbar_widgets = quickbar_widgets;
+        self.widget_manager.hotkey_bar_widgets = hotkey_bar_widgets;
         self.widget_manager.indicator_widgets = indicator_widgets;
         self.widget_manager.targets_widgets = targets_widgets;
         self.widget_manager.players_widgets = players_widgets;

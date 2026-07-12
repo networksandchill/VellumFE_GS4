@@ -269,6 +269,9 @@ impl AppCore {
                     WindowContent::Inventory(text) => {
                         text.title = base.title.clone().unwrap_or_default();
                     }
+                    WindowContent::Reserve(text) => {
+                        text.title = base.title.clone().unwrap_or_default();
+                    }
                     WindowContent::Spells(text) => {
                         text.title = base.title.clone().unwrap_or_default();
                     }
@@ -299,10 +302,12 @@ impl AppCore {
             "indicator" => (2, 1),
             "progress" | "countdown" | "hands" | "hand" => (10, 1),
             "compass" => (13, 5),
+            "map" => (10, 5),
             "injury_doll" => (20, 10),
             "dashboard" => (15, 3),
             "command_input" => (20, 1),
             "quickbar" => (20, 1),
+            "hotkeybar" => (20, 1),
             _ => (5, 3), // text, room, tabbed, etc.
         }
     }
@@ -1386,6 +1391,7 @@ mod tests {
             terminal_height: Some(24),
             base_layout: None,
             theme: None,
+            unknown_windows: Vec::new(),
         }
     }
 
@@ -1396,6 +1402,7 @@ mod tests {
             terminal_height: Some(24),
             base_layout: None,
             theme: None,
+            unknown_windows: Vec::new(),
         }
     }
 
@@ -1411,6 +1418,7 @@ mod tests {
             "dashboard" => (15, 3),
             "command_input" => (20, 1),
             "quickbar" => (20, 1),
+            "hotkeybar" => (20, 1),
             _ => (5, 3), // text, room, tabbed, etc.
         }
     }

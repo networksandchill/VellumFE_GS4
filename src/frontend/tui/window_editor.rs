@@ -1661,13 +1661,15 @@ impl WindowEditor {
                 fields.push(FieldRef::Timestamps);
                 fields.push(FieldRef::TextCompact);
             }
-            WindowDef::Inventory { .. } => {
+            WindowDef::Inventory { .. } | WindowDef::Reserve { .. } => {
+                // No Timestamps here: timestamps are for chatter-style text
+                // windows (thoughts, speech), not inventory-style lists.
                 fields.push(FieldRef::Streams);
                 fields.push(FieldRef::BufferSize);
                 fields.push(FieldRef::Wordwrap);
-                fields.push(FieldRef::Timestamps);
             }
             WindowDef::Quickbar { .. } => {}
+            WindowDef::Hotkeybar { .. } => {}
             WindowDef::TabbedText { .. } => {
                 fields.push(FieldRef::TabBarPosition);
                 fields.push(FieldRef::TabSeparator);
@@ -1701,17 +1703,18 @@ impl WindowEditor {
                 fields.push(FieldRef::CompassActiveColor);
                 fields.push(FieldRef::CompassInactiveColor);
             }
+            // GUI-only widget: no TUI-editable special fields.
+            WindowDef::Map { .. } => {}
             WindowDef::InjuryDoll { .. } => {
+                // Tab order matches the rendered rows: Wound/Scar pairs,
+                // then the uninjured default.
                 fields.push(FieldRef::Injury1Color);
-                fields.push(FieldRef::Injury2Color);
-                fields.push(FieldRef::Injury3Color);
-                fields.push(FieldRef::InjuryDefaultColor);
-                fields.push(FieldRef::Injury1Color);
-                fields.push(FieldRef::Injury2Color);
-                fields.push(FieldRef::Injury3Color);
                 fields.push(FieldRef::Scar1Color);
+                fields.push(FieldRef::Injury2Color);
                 fields.push(FieldRef::Scar2Color);
+                fields.push(FieldRef::Injury3Color);
                 fields.push(FieldRef::Scar3Color);
+                fields.push(FieldRef::InjuryDefaultColor);
             }
             WindowDef::Indicator { .. } => {
                 fields.push(FieldRef::IndicatorId);
@@ -1903,7 +1906,9 @@ impl WindowEditor {
             text_show_timestamps = data.show_timestamps;
             text_compact = data.compact;
         }
-        if let crate::config::WindowDef::Inventory { data, .. } = &window_def {
+        if let crate::config::WindowDef::Inventory { data, .. }
+        | crate::config::WindowDef::Reserve { data, .. } = &window_def
+        {
             streams_input.insert_str(data.streams.join(", "));
             buffer_size_input.insert_str(data.buffer_size.to_string());
             text_wordwrap = data.wordwrap;
@@ -4492,7 +4497,9 @@ impl WindowEditor {
             data.compact = self.text_compact;
         }
 
-        if let crate::config::WindowDef::Inventory { data, .. } = &mut self.window_def {
+        if let crate::config::WindowDef::Inventory { data, .. }
+        | crate::config::WindowDef::Reserve { data, .. } = &mut self.window_def
+        {
             let streams: Vec<String> = self.streams_input.lines()[0]
                 .split(',')
                 .map(|s| s.trim().to_string())
@@ -4680,6 +4687,12 @@ impl WindowEditor {
                 .and_then(|s| s.chars().next());
             data.color = self
                 .countdown_color_input
+                .lines()
+                .get(0)
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            data.background_color = self
+                .countdown_bg_color_input
                 .lines()
                 .get(0)
                 .map(|s| s.trim().to_string())
@@ -6250,7 +6263,7 @@ impl WindowEditor {
                     self.field_click_areas.push((special_row, left_x, FieldRef::TextCompact));
                 }
             }
-            WindowDef::Inventory { .. } => {
+            WindowDef::Inventory { .. } | WindowDef::Reserve { .. } => {
                 self.render_textarea_compact(
                     FieldRef::Streams.legacy_field_id(),
                     "Streams:",
@@ -6620,6 +6633,18 @@ impl WindowEditor {
                     is_focus(FieldRef::CountdownColor, self.focused_field),
                 );
                 self.field_click_areas.push((special_row, left_x, FieldRef::CountdownColor));
+                self.render_color_field(
+                    FieldRef::CountdownBgColor.legacy_field_id(),
+                    "BG Color",
+                    &self.countdown_bg_color_input,
+                    right_x,
+                    special_row,
+                    8,
+                    buf,
+                    theme,
+                    is_focus(FieldRef::CountdownBgColor, self.focused_field),
+                );
+                self.field_click_areas.push((special_row, right_x, FieldRef::CountdownBgColor));
             }
             WindowDef::Compass { .. } => {
                 // Clear left column row for a clean right-column layout
@@ -7486,6 +7511,7 @@ mod tests {
             terminal_height: None,
             base_layout: None,
             theme: None,
+            unknown_windows: Vec::new(),
         };
 
         let editor = WindowEditor::new_window_with_layout("spacer".to_string(), &layout);
@@ -7531,6 +7557,7 @@ mod tests {
             terminal_height: None,
             base_layout: None,
             theme: None,
+            unknown_windows: Vec::new(),
         };
 
         let editor = WindowEditor::new_window_with_layout("spacer".to_string(), &layout);
@@ -7548,6 +7575,7 @@ mod tests {
             terminal_height: None,
             base_layout: None,
             theme: None,
+            unknown_windows: Vec::new(),
         };
 
         let editor = WindowEditor::new_window_with_layout("tabbedtext".to_string(), &layout);
@@ -7565,6 +7593,7 @@ mod tests {
             terminal_height: None,
             base_layout: None,
             theme: None,
+            unknown_windows: Vec::new(),
         };
 
         let editor = WindowEditor::new_window_with_layout("text".to_string(), &layout);
@@ -7582,6 +7611,7 @@ mod tests {
             terminal_height: None,
             base_layout: None,
             theme: None,
+            unknown_windows: Vec::new(),
         };
 
         let editor = WindowEditor::new_window_with_layout("progress".to_string(), &layout);
@@ -7600,6 +7630,7 @@ mod tests {
             terminal_height: None,
             base_layout: None,
             theme: None,
+            unknown_windows: Vec::new(),
         };
 
         // Test tabbedtext_custom generates same pattern as tabbedtext
@@ -7629,6 +7660,7 @@ mod tests {
             terminal_height: None,
             base_layout: None,
             theme: None,
+            unknown_windows: Vec::new(),
         };
 
         let indicators = WindowEditor::indicators_from_layout(&layout);
@@ -7684,6 +7716,7 @@ mod tests {
             terminal_height: None,
             base_layout: None,
             theme: None,
+            unknown_windows: Vec::new(),
         };
         let mut editor = WindowEditor::new_window_with_layout("text_custom".to_string(), &layout);
         // No streams seeded yet -> picker does not open.
@@ -7703,6 +7736,7 @@ mod tests {
             terminal_height: None,
             base_layout: None,
             theme: None,
+            unknown_windows: Vec::new(),
         };
         let mut editor = WindowEditor::new_window_with_layout("text_custom".to_string(), &layout);
         // text_custom seeds streams = ["custom"]; start from a clean field.

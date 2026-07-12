@@ -348,6 +348,20 @@ pub struct TargetListConfig {
     /// Nouns to exclude from room objs parsing (e.g., "arm", "coal")
     #[serde(default = "default_excluded_nouns")]
     pub excluded_nouns: Vec<String>,
+    /// Text color for AscensionBoss/MiniBoss creatures (from <crtrStatus>)
+    #[serde(default = "default_boss_color")]
+    pub boss_color: Option<String>,
+    /// Text color for "challenging" creatures (from <crtrStatus>)
+    #[serde(default = "default_challenging_color")]
+    pub challenging_color: Option<String>,
+}
+
+fn default_boss_color() -> Option<String> {
+    Some("#ff5555".to_string())
+}
+
+fn default_challenging_color() -> Option<String> {
+    Some("#ffaa55".to_string())
 }
 
 fn default_target_status_position() -> String {
@@ -390,6 +404,8 @@ impl Default for TargetListConfig {
             truncation_mode: default_target_truncation_mode(),
             status_abbrev: default_status_abbrev(),
             excluded_nouns: default_excluded_nouns(),
+            boss_color: default_boss_color(),
+            challenging_color: default_challenging_color(),
         }
     }
 }
@@ -552,6 +568,64 @@ impl Default for WebConfig {
             port: default_web_port(),
             bind: default_web_bind(),
             pinned: false,
+        }
+    }
+}
+
+/// Native travel (`.go2`) configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Go2Config {
+    /// Saved travel targets: name → mapdb room id (`.go2 save <name>`).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub saved: std::collections::BTreeMap<String, u32>,
+    /// Mini map / explorer clicks travel natively instead of sending `;go2`
+    /// to Lich. Native works everywhere (mobile!); Lich's go2 knows silvers,
+    /// day passes, and other special travel that native v1 does not.
+    #[serde(default = "default_true")]
+    pub native_map_clicks: bool,
+}
+
+impl Default for Go2Config {
+    fn default() -> Self {
+        Self {
+            saved: Default::default(),
+            native_map_clicks: true,
+        }
+    }
+}
+
+/// Testing-phase default for `MapConfig::mapdb_repo`; flip to
+/// `elanthia-online/mapdb` when the Cartographer pipeline launches upstream.
+pub const DEFAULT_MAPDB_REPO: &str = "Nisugi/mapdb";
+
+fn default_mapdb_repo() -> String {
+    DEFAULT_MAPDB_REPO.to_string()
+}
+
+/// Map system configuration (mini map widget + map explorer).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MapConfig {
+    /// Lich install directory (the folder containing `data/`). The newest
+    /// `data/<GAME>/map-<timestamp>.json` build for the connected game is
+    /// used. Edited from the GUI settings editor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lich_dir: Option<String>,
+    /// Explicit mapdb JSON file; overrides `lich_dir` discovery when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mapdb_path: Option<String>,
+    /// GitHub repository (`owner/repo`) whose releases carry a `mapdb.json`
+    /// asset; the Download button in Settings > Map pulls from here.
+    /// Downloaded data outranks `lich_dir`. Empty disables downloads.
+    #[serde(default = "default_mapdb_repo")]
+    pub mapdb_repo: String,
+}
+
+impl Default for MapConfig {
+    fn default() -> Self {
+        Self {
+            lich_dir: None,
+            mapdb_path: None,
+            mapdb_repo: default_mapdb_repo(),
         }
     }
 }
