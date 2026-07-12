@@ -59,6 +59,27 @@ impl PopupMenu {
             height,
         };
 
+        // The corner cells keep the background that was underneath the menu:
+        // filling them with the menu background puts a solid square behind
+        // the rounded ╭╮╰╯ glyphs and reads as hard corners.
+        let corners = [
+            (menu_rect.x, menu_rect.y),
+            (menu_rect.x + menu_rect.width - 1, menu_rect.y),
+            (menu_rect.x, menu_rect.y + menu_rect.height - 1),
+            (
+                menu_rect.x + menu_rect.width - 1,
+                menu_rect.y + menu_rect.height - 1,
+            ),
+        ];
+        let saved_bg: Vec<_> = corners
+            .iter()
+            .map(|&(cx, cy)| {
+                (cx < buf.area().width && cy < buf.area().height)
+                    .then(|| buf[(cx, cy)].style().bg)
+                    .flatten()
+            })
+            .collect();
+
         // Clear the area behind the menu
         Clear.render(menu_rect, buf);
 
@@ -99,5 +120,19 @@ impl PopupMenu {
         let paragraph = Paragraph::new(lines).block(block);
 
         ratatui::widgets::Widget::render(paragraph, menu_rect, buf);
+
+        // Restore the underlying background outside the corner arcs.
+        for (&(cx, cy), saved) in corners.iter().zip(saved_bg) {
+            if cx < buf.area().width && cy < buf.area().height {
+                match saved {
+                    Some(bg) => {
+                        buf[(cx, cy)].set_bg(bg);
+                    }
+                    None => {
+                        buf[(cx, cy)].bg = ratatui::style::Color::Reset;
+                    }
+                }
+            }
+        }
     }
 }
