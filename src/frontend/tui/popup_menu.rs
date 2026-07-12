@@ -62,17 +62,17 @@ impl PopupMenu {
         // Clear the area behind the menu
         Clear.render(menu_rect, buf);
 
-        // Build menu lines
+        // Build menu lines (theme menu_* colors, not the browser palette)
         let mut lines = Vec::new();
         for (idx, item) in self.items.iter().enumerate() {
             let style = if idx == self.selected {
                 Style::default()
-                    .fg(crossterm_bridge::to_ratatui_color(theme.browser_background))
-                    .bg(crossterm_bridge::to_ratatui_color(theme.form_label_focused))
+                    .fg(crossterm_bridge::to_ratatui_color(theme.menu_item_selected))
+                    .bg(crossterm_bridge::to_ratatui_color(theme.menu_item_focused))
             } else {
                 Style::default()
-                    .fg(crossterm_bridge::to_ratatui_color(theme.text_primary))
-                    .bg(crossterm_bridge::to_ratatui_color(theme.browser_background))
+                    .fg(crossterm_bridge::to_ratatui_color(theme.menu_item_normal))
+                    .bg(crossterm_bridge::to_ratatui_color(theme.menu_background))
             };
 
             let line = Line::from(vec![
@@ -83,14 +83,17 @@ impl PopupMenu {
             lines.push(line);
         }
 
-        // Create block with border
+        // Create block with rounded border
         let block = Block::default()
             .borders(Borders::ALL)
+            .border_type(ratatui::widgets::BorderType::Rounded)
             .border_style(
-                Style::default().fg(crossterm_bridge::to_ratatui_color(theme.menu_border)),
+                Style::default()
+                    .fg(crossterm_bridge::to_ratatui_color(theme.menu_border))
+                    .bg(crossterm_bridge::to_ratatui_color(theme.menu_background)),
             )
             .style(
-                Style::default().bg(crossterm_bridge::to_ratatui_color(theme.browser_background)),
+                Style::default().bg(crossterm_bridge::to_ratatui_color(theme.menu_background)),
             );
 
         let paragraph = Paragraph::new(lines).block(block);
