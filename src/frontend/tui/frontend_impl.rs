@@ -495,6 +495,8 @@ impl Frontend for TuiFrontend {
                 }
             }
 
+            let menu_rounded = app_core.config.ui.menu_border_style != "square";
+
             // Render popup menu if active
             if let Some(ref popup_menu) = app_core.ui_state.popup_menu {
                 // Convert from ui_state::PopupMenu to rendering popup_menu::PopupMenu
@@ -513,7 +515,7 @@ impl Frontend for TuiFrontend {
                     popup_menu.position,
                     popup_menu.selected,
                 );
-                render_menu.render(screen_area, f.buffer_mut(), &theme);
+                render_menu.render(screen_area, f.buffer_mut(), &theme, menu_rounded);
             }
 
             // Render submenu if active (level 2)
@@ -533,7 +535,7 @@ impl Frontend for TuiFrontend {
                     submenu.position,
                     submenu.selected,
                 );
-                render_submenu.render(screen_area, f.buffer_mut(), &theme);
+                render_submenu.render(screen_area, f.buffer_mut(), &theme, menu_rounded);
             }
 
             // Render nested submenu if active (level 3)
@@ -553,7 +555,7 @@ impl Frontend for TuiFrontend {
                     nested_submenu.position,
                     nested_submenu.selected,
                 );
-                render_nested.render(screen_area, f.buffer_mut(), &theme);
+                render_nested.render(screen_area, f.buffer_mut(), &theme, menu_rounded);
             }
 
             // Render deep submenu if active (level 4)
@@ -573,7 +575,7 @@ impl Frontend for TuiFrontend {
                     deep_submenu.position,
                     deep_submenu.selected,
                 );
-                render_deep.render(screen_area, f.buffer_mut(), &theme);
+                render_deep.render(screen_area, f.buffer_mut(), &theme, menu_rounded);
             }
 
             // Render browsers and forms if active

@@ -589,6 +589,7 @@ impl TuiFrontend {
 
                 // Update configuration and value
                 if let Some(progress_bar) = self.widget_manager.progress_bars.get_mut(name) {
+                    progress_bar.set_pill(app_core.config.ui.progress_bar_style != "flat");
                     // Set value from game data
                     if let Some(ref custom_text) = progress_data.color {
                         // color field is being used as custom text (e.g., "clear as a bell")
@@ -2535,6 +2536,7 @@ impl TuiFrontend {
 
                 // Update show_label on every sync (cached widget may have stale value)
                 enc_widget.set_show_label(show_label);
+                enc_widget.set_pill(app_core.config.ui.progress_bar_style != "flat");
 
                 // Update show_border, show_title, border_sides on every sync
                 let show_border = window_def

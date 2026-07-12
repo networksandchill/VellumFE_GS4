@@ -48,6 +48,8 @@ pub struct Encumbrance {
     color_critical: Color,
     /// Background color (from theme)
     background_color: Option<Color>,
+    /// Pill style bar (rounded end caps); from ui.progress_bar_style
+    pill: bool,
 }
 
 impl Encumbrance {
@@ -76,6 +78,7 @@ impl Encumbrance {
             color_heavy: Color::Rgb(255, 165, 0), // Orange
             color_critical: Color::Red,
             background_color: None,
+            pill: true,
         }
     }
 
@@ -95,6 +98,10 @@ impl Encumbrance {
     }
 
     /// Set whether to show the label
+    pub fn set_pill(&mut self, pill: bool) {
+        self.pill = pill;
+    }
+
     pub fn set_show_label(&mut self, show: bool) {
         self.show_label = show;
     }
@@ -183,7 +190,7 @@ impl Encumbrance {
         let bar_color = self.get_bar_color();
 
         // Pill style like the progress bars; narrow areas keep the old fill.
-        if bar_width >= 3 {
+        if self.pill && bar_width >= 3 {
             let track = self
                 .background_color
                 .unwrap_or_else(|| super::progress_bar::dim_color(bar_color));

@@ -379,6 +379,26 @@ impl SettingsEditor {
                         }
                     }
                 }
+                "ui.progress_bar_style" => {
+                    if let SettingValue::Enum(ref v, _) = item.value {
+                        config.ui.progress_bar_style = v.clone();
+                    }
+                }
+                "ui.menu_border_style" => {
+                    if let SettingValue::Enum(ref v, _) = item.value {
+                        config.ui.menu_border_style = v.clone();
+                    }
+                }
+                "targets.show_dead" => {
+                    if let SettingValue::Boolean(v) = item.value {
+                        config.target_list.show_dead = v;
+                    }
+                }
+                "targets.truncation_mode" => {
+                    if let SettingValue::Enum(ref v, _) = item.value {
+                        config.target_list.truncation_mode = v.clone();
+                    }
+                }
                 "ui.drag_modifier_key" => {
                     if let SettingValue::Enum(ref v, _) = item.value {
                         config.ui.drag_modifier_key = v.clone();

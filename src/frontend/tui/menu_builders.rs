@@ -175,6 +175,70 @@ pub fn build_settings_items_with_source(
 
     items.push(SettingItem {
         category: "UI".to_string(),
+        key: "ui.progress_bar_style".to_string(),
+        display_name: "Progress Bar Style".to_string(),
+        value: SettingValue::Enum(
+            config.ui.progress_bar_style.clone(),
+            vec!["pill".to_string(), "flat".to_string()],
+        ),
+        description: Some(
+            "Bar look: pill (rounded end caps, needs a Nerd Font) or flat".to_string(),
+        ),
+        editable: true,
+        name_width: None,
+        is_global: ui_is_global,
+    });
+
+    items.push(SettingItem {
+        category: "UI".to_string(),
+        key: "ui.menu_border_style".to_string(),
+        display_name: "Menu Border Style".to_string(),
+        value: SettingValue::Enum(
+            config.ui.menu_border_style.clone(),
+            vec!["rounded".to_string(), "square".to_string()],
+        ),
+        description: Some("Popup/context menu border corners".to_string()),
+        editable: true,
+        name_width: None,
+        is_global: ui_is_global,
+    });
+
+    items.push(SettingItem {
+        category: "Targets".to_string(),
+        key: "targets.show_dead".to_string(),
+        display_name: "Show Dead Creatures".to_string(),
+        value: SettingValue::Boolean(config.target_list.show_dead),
+        description: Some(
+            "Keep dead/gone creatures in the target list with their status".to_string(),
+        ),
+        editable: true,
+        name_width: None,
+        is_global: ui_is_global,
+    });
+
+    items.push(SettingItem {
+        category: "Targets".to_string(),
+        key: "targets.truncation_mode".to_string(),
+        display_name: "Name Truncation".to_string(),
+        value: SettingValue::Enum(
+            config.target_list.truncation_mode.clone(),
+            vec![
+                "full".to_string(),
+                "noun".to_string(),
+                "noun_always".to_string(),
+            ],
+        ),
+        description: Some(
+            "full: whole name; noun: noun when it won't fit; noun_always: just the noun"
+                .to_string(),
+        ),
+        editable: true,
+        name_width: None,
+        is_global: ui_is_global,
+    });
+
+    items.push(SettingItem {
+        category: "UI".to_string(),
         key: "ui.drag_modifier_key".to_string(),
         display_name: "Drag Modifier Key".to_string(),
         value: SettingValue::Enum(

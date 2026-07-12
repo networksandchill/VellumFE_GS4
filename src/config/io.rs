@@ -571,6 +571,8 @@ impl Default for Config {
                 open_dialog_blocklist: default_open_dialog_blocklist(),
                 focus: FocusConfig::default(),
                 terminal_title: String::new(),
+                progress_bar_style: crate::config::settings::default_progress_bar_style(),
+                menu_border_style: crate::config::settings::default_menu_border_style(),
             },
             highlights: HashMap::new(),     // Loaded from highlights.toml
             keybinds: HashMap::new(),       // Loaded from keybinds.toml

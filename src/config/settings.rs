@@ -155,6 +155,21 @@ pub struct UiConfig {
     /// Empty string = don't modify terminal title
     #[serde(default)]
     pub terminal_title: String,
+    /// Progress bar style: "pill" (rounded end caps with a track, needs a
+    /// Nerd Font) or "flat" (upstream solid fill)
+    #[serde(default = "default_progress_bar_style")]
+    pub progress_bar_style: String,
+    /// Popup/context menu border style: "rounded" or "square"
+    #[serde(default = "default_menu_border_style")]
+    pub menu_border_style: String,
+}
+
+pub(crate) fn default_progress_bar_style() -> String {
+    "pill".to_string()
+}
+
+pub(crate) fn default_menu_border_style() -> String {
+    "rounded".to_string()
 }
 
 impl Default for UiConfig {
@@ -196,6 +211,8 @@ impl Default for UiConfig {
             open_dialog_blocklist: default_open_dialog_blocklist(),
             focus: FocusConfig::default(),
             terminal_title: String::new(),
+            progress_bar_style: default_progress_bar_style(),
+            menu_border_style: default_menu_border_style(),
         }
     }
 }

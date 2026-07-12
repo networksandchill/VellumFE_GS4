@@ -34,8 +34,15 @@ impl PopupMenu {
         }
     }
 
-    /// Render the menu at its position
-    pub fn render(&self, area: Rect, buf: &mut Buffer, theme: &crate::theme::AppTheme) {
+    /// Render the menu at its position. `rounded` picks the border corners
+    /// (ui.menu_border_style: "rounded" or "square").
+    pub fn render(
+        &self,
+        area: Rect,
+        buf: &mut Buffer,
+        theme: &crate::theme::AppTheme,
+        rounded: bool,
+    ) {
         // Calculate menu dimensions
         let max_width = self
             .items
@@ -74,7 +81,7 @@ impl PopupMenu {
         let saved_bg: Vec<_> = corners
             .iter()
             .map(|&(cx, cy)| {
-                (cx < buf.area().width && cy < buf.area().height)
+                (rounded && cx < buf.area().width && cy < buf.area().height)
                     .then(|| buf[(cx, cy)].style().bg)
                     .flatten()
             })
@@ -104,10 +111,14 @@ impl PopupMenu {
             lines.push(line);
         }
 
-        // Create block with rounded border
+        // Create block with the configured border corners
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_type(ratatui::widgets::BorderType::Rounded)
+            .border_type(if rounded {
+                ratatui::widgets::BorderType::Rounded
+            } else {
+                ratatui::widgets::BorderType::Plain
+            })
             .border_style(
                 Style::default()
                     .fg(crossterm_bridge::to_ratatui_color(theme.menu_border))
@@ -122,6 +133,9 @@ impl PopupMenu {
         ratatui::widgets::Widget::render(paragraph, menu_rect, buf);
 
         // Restore the underlying background outside the corner arcs.
+        if !rounded {
+            return;
+        }
         for (&(cx, cy), saved) in corners.iter().zip(saved_bg) {
             if cx < buf.area().width && cy < buf.area().height {
                 match saved {
