@@ -4585,10 +4585,13 @@ impl TuiFrontend {
         room_id: u32,
     ) -> Vec<crate::data::ui_state::PopupMenuItem> {
         use crate::data::ui_state::PopupMenuItem;
+        // NOTE: `disabled` menu items are HIDDEN by the renderer (it filters
+        // them out), so info lines are plain items with an empty command —
+        // selecting them is a no-op.
         let info = |text: String| PopupMenuItem {
             text,
             command: String::new(),
-            disabled: true,
+            disabled: false,
         };
         let mut items = Vec::new();
 
