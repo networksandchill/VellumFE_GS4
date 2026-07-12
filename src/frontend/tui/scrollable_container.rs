@@ -340,8 +340,10 @@ impl ScrollableContainer {
                     source_text.clone()
                 };
 
-                // Create a progress bar for this item
+                // Create a progress bar for this item (flat — the row text is
+                // padded to the full width, which pill caps would truncate)
                 let mut pb = ProgressBar::new("");
+                pb.set_pill(false);
                 pb.set_value_with_text(item.value, item.max, Some(display_text));
                 pb.set_text_align_left(true);
 

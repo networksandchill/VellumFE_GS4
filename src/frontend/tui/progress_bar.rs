@@ -27,6 +27,9 @@ pub struct ProgressBar {
     transparent_background: bool,
     text_color: Option<Color>,
     text_align_left: bool,
+    /// Pill style: rounded end caps with a visible track. Effect-list rows
+    /// (ScrollableContainer) turn this off — they pad text to full width.
+    pill: bool,
 }
 
 impl ProgressBar {
@@ -46,7 +49,12 @@ impl ProgressBar {
             transparent_background: true,
             text_color: Some(Color::White),
             text_align_left: false,
+            pill: true,
         }
+    }
+
+    pub fn set_pill(&mut self, pill: bool) {
+        self.pill = pill;
     }
 
     pub fn set_border_config(
@@ -262,11 +270,46 @@ impl ProgressBar {
             .or(self.window_background)
             .unwrap_or(Color::Reset);
 
+        let y = inner_area.y;
+        let fraction = if self.max > 0 {
+            (self.current as f64 / self.max as f64).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+
+        // Pill style: rounded end caps with the fill/track between them.
+        // Needs three columns; narrower bars fall back to the flat style.
+        if self.pill && available_width >= 3 {
+            let track = if self.transparent_background {
+                dim_color(bar_color)
+            } else {
+                self.bar_background
+                    .or(self.window_background)
+                    .unwrap_or_else(|| dim_color(bar_color))
+            };
+            let text_fg = Self::ensure_contrast(
+                self.text_color.unwrap_or(Color::White),
+                Some(if fraction > 0.0 { bar_color } else { track }),
+            );
+            render_pill_bar(
+                buf,
+                inner_area.x,
+                y,
+                available_width,
+                fraction,
+                bar_color,
+                track,
+                &display_text,
+                text_fg,
+                self.text_align_left,
+            );
+            return;
+        }
+
         // Calculate split point based on percentage
         let split_position = ((percentage as f64 / 100.0) * available_width as f64) as u16;
 
         // Render the bar background
-        let y = inner_area.y;
         if y < buf.area().height {
             for i in 0..available_width {
                 let x = inner_area.x + i;
@@ -320,6 +363,82 @@ impl ProgressBar {
 
 }
 
+/// Powerline half-circle end caps (Nerd Font, U+E0B6 / U+E0B4).
+const PILL_LEFT: char = '\u{e0b6}';
+const PILL_RIGHT: char = '\u{e0b4}';
+
+/// Dim a color toward black for the unfilled pill track.
+pub(crate) fn dim_color(c: Color) -> Color {
+    match c {
+        Color::Rgb(r, g, b) => Color::Rgb(r / 4, g / 4, b / 4),
+        _ => Color::DarkGray,
+    }
+}
+
+/// Draw a one-row pill-style bar: rounded caps colored to match the fill (or
+/// track when empty/partial), the body as background fill with the text over
+/// it. Caps leave the cell background untouched so the round ends blend with
+/// whatever is behind the widget.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn render_pill_bar(
+    buf: &mut Buffer,
+    x: u16,
+    y: u16,
+    width: u16,
+    fraction: f64,
+    fill: Color,
+    track: Color,
+    text: &str,
+    text_fg: Color,
+    text_align_left: bool,
+) {
+    if width < 3 || y >= buf.area().height {
+        return;
+    }
+    let bar_w = width - 2;
+    let split = (fraction.clamp(0.0, 1.0) * bar_w as f64).round() as u16;
+
+    let left_fg = if split > 0 { fill } else { track };
+    let right_fg = if split >= bar_w { fill } else { track };
+    if x < buf.area().width {
+        buf[(x, y)].set_char(PILL_LEFT).set_fg(left_fg);
+    }
+    let rx = x + width - 1;
+    if rx < buf.area().width {
+        buf[(rx, y)].set_char(PILL_RIGHT).set_fg(right_fg);
+    }
+
+    for i in 0..bar_w {
+        let cx = x + 1 + i;
+        if cx >= buf.area().width {
+            break;
+        }
+        buf[(cx, y)]
+            .set_char(' ')
+            .set_bg(if i < split { fill } else { track });
+    }
+
+    let tw = text.len() as u16;
+    if tw > 0 && tw <= bar_w {
+        let start = if text_align_left {
+            x + 1
+        } else {
+            x + 1 + (bar_w - tw) / 2
+        };
+        for (i, c) in text.chars().enumerate() {
+            let cx = start + i as u16;
+            if cx >= buf.area().width || cx >= x + 1 + bar_w {
+                break;
+            }
+            let filled = cx - (x + 1) < split;
+            buf[(cx, y)]
+                .set_char(c)
+                .set_fg(text_fg)
+                .set_bg(if filled { fill } else { track });
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -367,8 +486,9 @@ mod tests {
         let mut buf = Buffer::empty(area);
         bar.render(area, &mut buf);
 
-        assert_eq!(buf[(0, 0)].symbol(), "H");
-        assert_eq!(buf[(1, 0)].symbol(), "P");
+        // Pill style: column 0 is the rounded cap, text starts at 1
+        assert_eq!(buf[(1, 0)].symbol(), "H");
+        assert_eq!(buf[(2, 0)].symbol(), "P");
     }
 
     #[test]

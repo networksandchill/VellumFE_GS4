@@ -182,6 +182,26 @@ impl Encumbrance {
         // Get the bar color based on encumbrance level
         let bar_color = self.get_bar_color();
 
+        // Pill style like the progress bars; narrow areas keep the old fill.
+        if bar_width >= 3 {
+            let track = self
+                .background_color
+                .unwrap_or_else(|| super::progress_bar::dim_color(bar_color));
+            super::progress_bar::render_pill_bar(
+                buf,
+                area.x,
+                area.y,
+                bar_width as u16,
+                (self.value.min(100) as f64) / 100.0,
+                bar_color,
+                track,
+                display_text,
+                self.text_color,
+                false,
+            );
+            return;
+        }
+
         // Unfilled background: use theme background or transparent (no change)
         let unfilled_bg = self.background_color;
 
