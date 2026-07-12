@@ -361,6 +361,8 @@ mod tests {
                 group: 0,
                 entrance: i == 1,
                 title: format!("[East Row {i}]"),
+                node: false,
+                supernode: false,
             })
             .collect();
         let scene = MapScene {

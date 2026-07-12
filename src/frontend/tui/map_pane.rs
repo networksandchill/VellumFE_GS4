@@ -26,6 +26,17 @@ use super::crossterm_bridge;
 const MIN_ZOOM: u16 = 2;
 const MAX_ZOOM: u16 = 12;
 
+/// Room glyphs for the smallest zoom tier (one character per room).
+const GLYPH_ROOM: char = '■';
+const GLYPH_NODE: char = '■';
+const GLYPH_SUPERNODE: char = '◆';
+const GLYPH_ENTRANCE: char = '⌂';
+const GLYPH_CURRENT: char = '◉';
+
+/// Node rooms render pastel blue; supernodes a touch brighter.
+const NODE_COLOR: Color = Color::Rgb(0xA7, 0xC7, 0xE7);
+const SUPERNODE_COLOR: Color = Color::Rgb(0xBF, 0xE3, 0xFF);
+
 pub struct MapPane {
     /// Columns per scene cell.
     zoom: u16,
@@ -252,34 +263,141 @@ impl MapPane {
             });
         canvas.render(area, buf);
 
-        // Rooms.
+        // Rooms. The footprint grows with zoom: a single glyph when tight,
+        // bracketed glyph at mid zoom, rounded boxes (with the room id
+        // inside at the top tier) when there's space.
+        //
+        // (box width, box height): odd width keeps the box centered on the
+        // cell anchor where edges terminate.
+        let (bw, bh): (i32, i32) = match self.zoom {
+            0..=3 => (1, 1),
+            4..=5 => (3, 1),
+            6..=7 => (5, 2),
+            _ => (7, 3),
+        };
+        let mut put = |buf: &mut Buffer, sx: i32, sy: i32, c: char, style: Style| {
+            if in_area(sx, sy) {
+                buf[(sx as u16, sy as u16)].set_char(c).set_style(style);
+            }
+        };
         for room in &sheet.rooms {
             if !group_visible(room.group) {
                 continue;
             }
             let (sx, sy) = to_char(&room.cell);
-            if !in_area(sx, sy) {
+            let x0 = sx - bw / 2;
+            let y0 = sy - bh / 2;
+            // Skip rooms with no visible part.
+            if x0 + bw <= area.x as i32
+                || x0 >= (area.x + area.width) as i32
+                || y0 + bh <= area.y as i32
+                || y0 >= (area.y + area.height) as i32
+            {
                 continue;
             }
+
             let is_current = current == Some(room.id);
-            let (glyph, style) = if is_current {
-                (
-                    '◉',
-                    Style::default().fg(accent).add_modifier(Modifier::BOLD),
-                )
+            let mut style = if is_current {
+                Style::default().fg(accent).add_modifier(Modifier::BOLD)
+            } else if room.supernode {
+                Style::default().fg(SUPERNODE_COLOR)
+            } else if room.node {
+                Style::default().fg(NODE_COLOR)
             } else if room.entrance {
-                ('⌂', Style::default().fg(entrance_color))
+                Style::default().fg(entrance_color)
             } else {
-                ('■', Style::default().fg(room_color))
+                Style::default().fg(room_color)
             };
-            buf[(sx as u16, sy as u16)].set_char(glyph).set_style(style);
-            // Generous hit box: the glyph plus one column either side.
+
+            if bh == 1 && bw == 1 {
+                let glyph = if is_current {
+                    GLYPH_CURRENT
+                } else if room.supernode {
+                    GLYPH_SUPERNODE
+                } else if room.node {
+                    GLYPH_NODE
+                } else if room.entrance {
+                    GLYPH_ENTRANCE
+                } else {
+                    GLYPH_ROOM
+                };
+                put(buf, sx, sy, glyph, style);
+            } else if bh == 1 {
+                // Mid zoom: bracketed glyph, rounded by the parens.
+                let glyph = if is_current {
+                    GLYPH_CURRENT
+                } else if room.supernode {
+                    GLYPH_SUPERNODE
+                } else if room.entrance {
+                    GLYPH_ENTRANCE
+                } else {
+                    GLYPH_ROOM
+                };
+                put(buf, sx - 1, sy, '(', style);
+                put(buf, sx, sy, glyph, style);
+                put(buf, sx + 1, sy, ')', style);
+            } else {
+                // Rounded box. Nodes keep their color on the outline.
+                if is_current {
+                    style = style.add_modifier(Modifier::BOLD);
+                }
+                let (x1, y1) = (x0 + bw - 1, y0 + bh - 1);
+                put(buf, x0, y0, '╭', style);
+                put(buf, x1, y0, '╮', style);
+                put(buf, x0, y1, '╰', style);
+                put(buf, x1, y1, '╯', style);
+                for x in x0 + 1..x1 {
+                    put(buf, x, y0, '─', style);
+                    put(buf, x, y1, '─', style);
+                }
+                for y in y0 + 1..y1 {
+                    put(buf, x0, y, '│', style);
+                    put(buf, x1, y, '│', style);
+                }
+                // Interior: clear it so edge lines don't run through the
+                // room, then center the room id (top tier) or a marker.
+                for y in y0 + 1..y1 {
+                    for x in x0 + 1..x1 {
+                        put(buf, x, y, ' ', style);
+                    }
+                }
+                if bh >= 3 {
+                    let label = room.id.to_string();
+                    let inner_w = (bw - 2) as usize;
+                    let cy = y0 + bh / 2;
+                    if label.len() <= inner_w {
+                        let lx = x0 + 1 + (inner_w - label.len()) as i32 / 2;
+                        for (i, c) in label.chars().enumerate() {
+                            put(buf, lx + i as i32, cy, c, style);
+                        }
+                    }
+                } else if is_current || room.entrance || room.supernode {
+                    let glyph = if is_current {
+                        GLYPH_CURRENT
+                    } else if room.supernode {
+                        GLYPH_SUPERNODE
+                    } else {
+                        GLYPH_ENTRANCE
+                    };
+                    // 2-row box has no middle row; mark the top edge center.
+                    put(buf, sx, y0, glyph, style);
+                }
+                // Entrance door marker on the box for bigger tiers.
+                if bh >= 3 && room.entrance && !is_current {
+                    put(buf, sx, y0, GLYPH_ENTRANCE, style);
+                }
+            }
+
+            let clip_x0 = x0.max(area.x as i32);
+            let clip_y0 = y0.max(area.y as i32);
+            let clip_x1 = (x0 + bw).min((area.x + area.width) as i32);
+            let clip_y1 = (y0 + bh).min((area.y + area.height) as i32);
             self.hits.push((
                 Rect {
-                    x: (sx - 1).max(area.x as i32) as u16,
-                    y: sy as u16,
-                    width: 3.min((area.x + area.width) as i32 - (sx - 1).max(area.x as i32)) as u16,
-                    height: 1,
+                    x: clip_x0 as u16,
+                    y: clip_y0 as u16,
+                    width: (clip_x1 - clip_x0) as u16,
+                    height: (clip_y1 - clip_y0) as u16,
                 },
                 room.id,
             ));

@@ -44,6 +44,12 @@ pub struct SceneRoom {
     pub entrance: bool,
     /// First room title, for hover text.
     pub title: String,
+    /// Mapdb "node" tag (rest/mana rooms) — renderers set these apart.
+    #[serde(default)]
+    pub node: bool,
+    /// Mapdb "supernode" tag (includes "premium supernode").
+    #[serde(default)]
+    pub supernode: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -216,6 +222,12 @@ pub fn build_scene(
             .insert(group.index, group_anchor_key(group, lookup));
         for &id in &group.room_ids {
             let room = lookup.get(id);
+            let supernode = room.is_some_and(|r| {
+                r.tags.iter().any(|t| {
+                    t.eq_ignore_ascii_case("supernode")
+                        || t.eq_ignore_ascii_case("premium supernode")
+                })
+            });
             let scene_room = SceneRoom {
                 id,
                 uid: room.and_then(|r| r.uid.first().copied()),
@@ -226,6 +238,10 @@ pub fn build_scene(
                     .and_then(|r| r.title.first())
                     .cloned()
                     .unwrap_or_default(),
+                node: supernode
+                    || room
+                        .is_some_and(|r| r.tags.iter().any(|t| t.eq_ignore_ascii_case("node"))),
+                supernode,
             };
             let target = match sheet {
                 Sheet::Outdoor => &mut scene.outdoor,

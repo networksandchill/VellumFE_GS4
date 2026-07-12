@@ -14,7 +14,8 @@ use super::{generate_layout, Layout};
 
 /// Bump when the algorithms change so stale cached layouts regenerate.
 /// v4: zone-sized components (catacombs) no longer weld their neighbors.
-pub const ENGINE_VERSION: u32 = 4;
+/// v5: scene rooms carry node/supernode tags.
+pub const ENGINE_VERSION: u32 = 5;
 const FORMAT_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
