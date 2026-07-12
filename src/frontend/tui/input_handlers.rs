@@ -256,8 +256,9 @@ impl super::TuiFrontend {
                     crate::config::KeyBindAction::Action(s) if matches!(s.as_str(),
                         "scroll_current_window_up_one" | "scroll_current_window_down_one" |
                         "scroll_current_window_up_page" | "scroll_current_window_down_page" |
-                        "scroll_current_window_home" | "scroll_current_window_end"
-                    )
+                        "scroll_current_window_home" | "scroll_current_window_end" |
+                        "scroll_all_windows_end"
+                    ) || s.starts_with("scroll_window_end:")
                 );
 
                 if is_search_action {
@@ -325,6 +326,21 @@ impl super::TuiFrontend {
                                 // Scroll to bottom - use a large negative number
                                 self.scroll_window(&focused_name, -100000);
                                 tracing::debug!("Scrolled '{}' to bottom via frontend", focused_name);
+                            }
+                            "scroll_all_windows_end" => {
+                                self.scroll_all_windows_to_bottom();
+                                tracing::debug!("Scrolled all text windows to bottom");
+                            }
+                            s if s.starts_with("scroll_window_end:") => {
+                                // Parameterized: scroll named window(s) to bottom,
+                                // e.g. "scroll_window_end:main,thoughts"
+                                for name in s["scroll_window_end:".len()..].split(',') {
+                                    let name = name.trim();
+                                    if !name.is_empty() {
+                                        self.scroll_window(name, -100000);
+                                        tracing::debug!("Scrolled '{}' to bottom via keybind", name);
+                                    }
+                                }
                             }
                             _ => {}
                         }

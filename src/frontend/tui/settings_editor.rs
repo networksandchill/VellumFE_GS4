@@ -362,6 +362,23 @@ impl SettingsEditor {
                         config.ui.selection_auto_copy = v;
                     }
                 }
+                "ui.block_bank_dialog" => {
+                    if let SettingValue::Boolean(v) = item.value {
+                        let blocked = config
+                            .ui
+                            .open_dialog_blocklist
+                            .iter()
+                            .any(|b| b.eq_ignore_ascii_case("bank"));
+                        if v && !blocked {
+                            config.ui.open_dialog_blocklist.push("bank".to_string());
+                        } else if !v && blocked {
+                            config
+                                .ui
+                                .open_dialog_blocklist
+                                .retain(|b| !b.eq_ignore_ascii_case("bank"));
+                        }
+                    }
+                }
                 "ui.drag_modifier_key" => {
                     if let SettingValue::Enum(ref v, _) = item.value {
                         config.ui.drag_modifier_key = v.clone();

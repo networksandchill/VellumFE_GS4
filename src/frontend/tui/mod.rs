@@ -313,6 +313,16 @@ impl TuiFrontend {
         }
     }
 
+    /// Snap every text and tabbed-text window back to live view (bottom)
+    pub fn scroll_all_windows_to_bottom(&mut self) {
+        for window in self.widget_manager.text_windows.values_mut() {
+            window.scroll_down(100_000);
+        }
+        for window in self.widget_manager.tabbed_text_windows.values_mut() {
+            window.scroll_down(100_000);
+        }
+    }
+
     /// Scroll a window by a number of lines across supported widget types
     pub fn scroll_window(&mut self, window_name: &str, lines: i32) {
         // Try text window first

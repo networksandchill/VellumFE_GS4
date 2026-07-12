@@ -156,6 +156,25 @@ pub fn build_settings_items_with_source(
 
     items.push(SettingItem {
         category: "UI".to_string(),
+        key: "ui.block_bank_dialog".to_string(),
+        display_name: "Block Bank Window".to_string(),
+        value: SettingValue::Boolean(
+            config
+                .ui
+                .open_dialog_blocklist
+                .iter()
+                .any(|b| b.eq_ignore_ascii_case("bank")),
+        ),
+        description: Some(
+            "Prevent the bank popup from opening on balance/deposit/withdraw".to_string(),
+        ),
+        editable: true,
+        name_width: None,
+        is_global: ui_is_global,
+    });
+
+    items.push(SettingItem {
+        category: "UI".to_string(),
         key: "ui.drag_modifier_key".to_string(),
         display_name: "Drag Modifier Key".to_string(),
         value: SettingValue::Enum(

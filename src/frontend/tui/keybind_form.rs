@@ -110,6 +110,7 @@ const AVAILABLE_ACTIONS: &[&str] = &[
     "scroll_current_window_down_page",
     "scroll_current_window_home",
     "scroll_current_window_end",
+    "scroll_all_windows_end",
     "previous_command",
     "next_command",
     "send_last_command",

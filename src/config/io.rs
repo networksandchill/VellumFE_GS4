@@ -492,6 +492,9 @@ impl Config {
                 dest.ui.selection_respect_window_boundaries = src.ui.selection_respect_window_boundaries
             }
             "ui.selection_auto_copy" => dest.ui.selection_auto_copy = src.ui.selection_auto_copy,
+            "ui.block_bank_dialog" => {
+                dest.ui.open_dialog_blocklist = src.ui.open_dialog_blocklist.clone()
+            }
             "ui.drag_modifier_key" => dest.ui.drag_modifier_key = src.ui.drag_modifier_key.clone(),
             "ui.min_command_length" => dest.ui.min_command_length = src.ui.min_command_length,
 
