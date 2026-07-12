@@ -15,7 +15,7 @@ use ratatui::widgets::canvas::{Canvas, Line as CanvasLine};
 use ratatui::widgets::Widget;
 use std::collections::HashSet;
 
-use crate::core::layout_engine::scene::{SceneEdgeKind, Sheet, SheetScene};
+use crate::core::layout_engine::scene::{SceneEdgeKind, Sheet};
 use crate::core::map_service::DbState;
 use crate::theme::AppTheme;
 
@@ -33,6 +33,15 @@ pub struct MapPane {
     hits: Vec<(Rect, u32)>,
     /// Content area of the last render (wheel/click routing).
     last_area: Option<Rect>,
+    /// Manual pan offset in character cells, applied on top of the
+    /// current-room camera center. Reset when the character moves rooms.
+    pan_x: i32,
+    pan_y: i32,
+    /// Active click-hold drag: (start x, start y, pan at start, max pointer
+    /// displacement seen). Displacement distinguishes click from drag.
+    drag: Option<(u16, u16, (i32, i32), u16)>,
+    /// Room the camera last centered on; a change snaps the pan back.
+    last_centered_room: Option<u32>,
 }
 
 impl Default for MapPane {
@@ -41,6 +50,10 @@ impl Default for MapPane {
             zoom: 4,
             hits: Vec::new(),
             last_area: None,
+            pan_x: 0,
+            pan_y: 0,
+            drag: None,
+            last_centered_room: None,
         }
     }
 }
@@ -48,6 +61,37 @@ impl Default for MapPane {
 impl MapPane {
     pub fn zoom_by(&mut self, delta: i16) {
         self.zoom = (self.zoom as i16 + delta).clamp(MIN_ZOOM as i16, MAX_ZOOM as i16) as u16;
+    }
+
+    /// Begin a click-hold drag at the given buffer position.
+    pub fn begin_drag(&mut self, x: u16, y: u16) {
+        self.drag = Some((x, y, (self.pan_x, self.pan_y), 0));
+    }
+
+    /// Update an active drag; returns true if a drag is in progress.
+    /// Dragging moves the map with the pointer (grab-and-pull).
+    pub fn drag_to(&mut self, x: u16, y: u16) -> bool {
+        let Some((sx, sy, (opx, opy), moved)) = self.drag else {
+            return false;
+        };
+        let dx = x as i32 - sx as i32;
+        let dy = y as i32 - sy as i32;
+        self.pan_x = opx + dx;
+        self.pan_y = opy + dy;
+        let dist = dx.unsigned_abs().max(dy.unsigned_abs()) as u16;
+        self.drag = Some((sx, sy, (opx, opy), moved.max(dist)));
+        true
+    }
+
+    /// Finish a drag. Returns Some(moved) when a drag was active — `moved`
+    /// false means the pointer never left the click threshold, i.e. this
+    /// release is a plain click.
+    pub fn end_drag(&mut self) -> Option<bool> {
+        self.drag.take().map(|(_, _, _, moved)| moved > 1)
+    }
+
+    pub fn dragging(&self) -> bool {
+        self.drag.is_some()
     }
 
     /// Room under the given absolute buffer position from the last render.
@@ -141,12 +185,21 @@ impl MapPane {
         };
         let sheet = scene.sheet(sheet_kind);
 
+        // Walking to a new room snaps any manual pan back to following the
+        // character; panning is for looking around from where you stand.
+        if current != self.last_centered_room {
+            self.last_centered_room = current;
+            self.pan_x = 0;
+            self.pan_y = 0;
+            self.drag = None;
+        }
+
         // Cell -> absolute char coordinates. Rows per cell are half the
         // columns so distances read equally in both axes.
         let cw = self.zoom as i32;
         let ch = (self.zoom as i32 / 2).max(1);
-        let ox = area.x as i32 + area.width as i32 / 2 - center.x * cw;
-        let oy = area.y as i32 + area.height as i32 / 2 - center.y * ch;
+        let ox = area.x as i32 + area.width as i32 / 2 - center.x * cw + self.pan_x;
+        let oy = area.y as i32 + area.height as i32 / 2 - center.y * ch + self.pan_y;
         let to_char = |cell: &crate::core::layout_engine::positioner::Cell| -> (i32, i32) {
             (ox + cell.x * cw, oy + cell.y * ch)
         };

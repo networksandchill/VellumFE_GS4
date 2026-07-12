@@ -117,6 +117,8 @@ pub struct TuiFrontend {
     pub theme_editor: Option<theme_editor::ThemeEditor>,
     /// Active settings editor (if any)
     pub settings_editor: Option<settings_editor::SettingsEditor>,
+    /// Window whose map pane is being click-hold dragged (pan), if any
+    map_drag_window: Option<String>,
     /// Debouncer for terminal resize events (100ms debounce)
     resize_debouncer: ResizeDebouncer,
     /// Theme cache to avoid HashMap lookup + clone every render
@@ -261,6 +263,7 @@ impl TuiFrontend {
             theme_browser: None,
             theme_editor: None,
             settings_editor: None,
+            map_drag_window: None,
             resize_debouncer: ResizeDebouncer::new(300), // 300ms debounce
             theme_cache: ThemeCache::new(),
             window_order_cache: WindowOrderCache::default(),

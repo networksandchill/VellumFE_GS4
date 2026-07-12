@@ -1636,23 +1636,17 @@ impl TuiFrontend {
                         };
                         if is_map_surface {
                             if let Some(pane) =
-                                self.widget_manager.map_panes.get(&window_name)
+                                self.widget_manager.map_panes.get_mut(&window_name)
                             {
                                 if pane.contains(*x, *y) {
                                     if should_focus {
                                         app_core.ui_state.set_focus(Some(window_name.clone()));
                                     }
-                                    if let Some(room_id) = pane.room_at(*x, *y) {
-                                        tracing::info!(
-                                            "Map click on room {room_id} in '{window_name}' -> .go2"
-                                        );
-                                        let cmd =
-                                            self.handle_command_submission(
-                                                format!(".go2 {room_id}"),
-                                                app_core,
-                                            )?;
-                                        return Ok((true, cmd));
-                                    }
+                                    // Click-hold drags pan the map; the
+                                    // click-vs-drag call is made on release
+                                    // (click on a room -> .go2).
+                                    pane.begin_drag(*x, *y);
+                                    self.map_drag_window = Some(window_name.clone());
                                     app_core.needs_render = true;
                                     return Ok((true, None));
                                 }
@@ -1735,6 +1729,15 @@ impl TuiFrontend {
                 return Ok((true, None));
             }
             MouseEventKind::Drag(crate::data::input::MouseButton::Left) => {
+                if let Some(name) = self.map_drag_window.clone() {
+                    if let Some(pane) = self.widget_manager.map_panes.get_mut(&name) {
+                        if pane.drag_to(*x, *y) {
+                            app_core.needs_render = true;
+                            return Ok((true, None));
+                        }
+                    }
+                    self.map_drag_window = None;
+                }
                 if let Some(ref mut link_drag) = app_core.ui_state.link_drag_state {
                     link_drag.current_pos = (*x, *y);
                     app_core.needs_render = true;
@@ -1866,6 +1869,29 @@ impl TuiFrontend {
             }
             MouseEventKind::Up(crate::data::input::MouseButton::Left) => {
                 let mut command_to_send: Option<String> = None;
+
+                // Map pane click-hold release: a real drag just ends (the pan
+                // already happened); a plain click on a room travels there.
+                if let Some(name) = self.map_drag_window.take() {
+                    if let Some(pane) = self.widget_manager.map_panes.get_mut(&name) {
+                        if let Some(moved) = pane.end_drag() {
+                            app_core.needs_render = true;
+                            if !moved {
+                                if let Some(room_id) = pane.room_at(*x, *y) {
+                                    tracing::info!(
+                                        "Map click on room {room_id} in '{name}' -> .go2"
+                                    );
+                                    let cmd = self.handle_command_submission(
+                                        format!(".go2 {room_id}"),
+                                        app_core,
+                                    )?;
+                                    return Ok((true, cmd));
+                                }
+                            }
+                            return Ok((true, None));
+                        }
+                    }
+                }
 
                 if let Some(link_drag) = app_core.ui_state.link_drag_state.take() {
                     let dx = (*x as i16 - link_drag.start_pos.0 as i16).abs();
