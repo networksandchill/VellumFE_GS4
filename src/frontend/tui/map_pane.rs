@@ -69,6 +69,44 @@ impl Default for MapPane {
     }
 }
 
+/// Liang–Barsky clip of a segment to [0, w] x [0, h]. Returns the clipped
+/// segment, or None when it lies entirely outside.
+fn clip_segment(
+    (x1, y1, x2, y2): (f64, f64, f64, f64),
+    w: f64,
+    h: f64,
+) -> Option<(f64, f64, f64, f64)> {
+    let (dx, dy) = (x2 - x1, y2 - y1);
+    let mut t0: f64 = 0.0;
+    let mut t1: f64 = 1.0;
+    for (p, q) in [
+        (-dx, x1),      // left:   x >= 0
+        (dx, w - x1),   // right:  x <= w
+        (-dy, y1),      // bottom: y >= 0
+        (dy, h - y1),   // top:    y <= h
+    ] {
+        if p == 0.0 {
+            if q < 0.0 {
+                return None;
+            }
+            continue;
+        }
+        let r = q / p;
+        if p < 0.0 {
+            if r > t1 {
+                return None;
+            }
+            t0 = t0.max(r);
+        } else {
+            if r < t0 {
+                return None;
+            }
+            t1 = t1.min(r);
+        }
+    }
+    Some((x1 + t0 * dx, y1 + t0 * dy, x1 + t1 * dx, y1 + t1 * dy))
+}
+
 impl MapPane {
     pub fn zoom_by(&mut self, delta: i16) {
         self.zoom = (self.zoom as i16 + delta).clamp(MIN_ZOOM as i16, MAX_ZOOM as i16) as u16;
@@ -243,22 +281,24 @@ impl MapPane {
                     }
                     let (ax, ay) = to_char(&edge.a);
                     let (bx, by) = to_char(&edge.b);
-                    // Draw when either endpoint is visible; clipping is the
-                    // canvas's job.
-                    if !in_area(ax, ay) && !in_area(bx, by) {
-                        continue;
-                    }
+                    // ratatui's canvas Line drops the whole segment when an
+                    // endpoint is out of bounds, so clip to the pane here and
+                    // always draw the visible portion.
                     let color = match edge.kind {
                         SceneEdgeKind::Directional => edge_color,
                         _ => connector_color,
                     };
-                    ctx.draw(&CanvasLine {
-                        x1: (ax - area.x as i32) as f64 + 0.5,
-                        y1: flip_y(ay),
-                        x2: (bx - area.x as i32) as f64 + 0.5,
-                        y2: flip_y(by),
-                        color,
-                    });
+                    let seg = (
+                        (ax - area.x as i32) as f64 + 0.5,
+                        flip_y(ay),
+                        (bx - area.x as i32) as f64 + 0.5,
+                        flip_y(by),
+                    );
+                    if let Some((x1, y1, x2, y2)) =
+                        clip_segment(seg, area.width as f64, area.height as f64)
+                    {
+                        ctx.draw(&CanvasLine { x1, y1, x2, y2, color });
+                    }
                 }
             });
         canvas.render(area, buf);
@@ -389,6 +429,27 @@ impl MapPane {
                 },
                 room.id,
             ));
+        }
+
+        // Connector labels ("stairway", "arch", ...) at the edge midpoint,
+        // only at the top zoom tier where there's room for text.
+        if self.zoom >= 8 {
+            let label_style = Style::default()
+                .fg(connector_color)
+                .add_modifier(Modifier::ITALIC);
+            for edge in &sheet.edges {
+                let Some(label) = &edge.label else { continue };
+                if edge.kind == SceneEdgeKind::Stub || !group_visible(edge.group) {
+                    continue;
+                }
+                let (ax, ay) = to_char(&edge.a);
+                let (bx, by) = to_char(&edge.b);
+                let (mx, my) = ((ax + bx) / 2, (ay + by) / 2);
+                let start = mx - label.chars().count() as i32 / 2;
+                for (i, c) in label.chars().enumerate() {
+                    put(buf, start + i as i32, my, c, label_style);
+                }
+            }
         }
 
         // Status line: current room title (or hovered target hint) in the
