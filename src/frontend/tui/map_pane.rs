@@ -361,17 +361,9 @@ impl MapPane {
                         put(buf, x, y, ' ', style);
                     }
                 }
-                if bh >= 3 {
-                    let label = room.id.to_string();
-                    let inner_w = (bw - 2) as usize;
-                    let cy = y0 + bh / 2;
-                    if label.len() <= inner_w {
-                        let lx = x0 + 1 + (inner_w - label.len()) as i32 / 2;
-                        for (i, c) in label.chars().enumerate() {
-                            put(buf, lx + i as i32, cy, c, style);
-                        }
-                    }
-                } else if is_current || room.entrance || room.supernode {
+                // Marker in the box center (3-row tier) or on the top edge
+                // (2-row tier, which has no middle row).
+                if is_current || room.entrance || room.supernode {
                     let glyph = if is_current {
                         GLYPH_CURRENT
                     } else if room.supernode {
@@ -379,12 +371,8 @@ impl MapPane {
                     } else {
                         GLYPH_ENTRANCE
                     };
-                    // 2-row box has no middle row; mark the top edge center.
-                    put(buf, sx, y0, glyph, style);
-                }
-                // Entrance door marker on the box for bigger tiers.
-                if bh >= 3 && room.entrance && !is_current {
-                    put(buf, sx, y0, GLYPH_ENTRANCE, style);
+                    let gy = if bh >= 3 { y0 + bh / 2 } else { y0 };
+                    put(buf, sx, gy, glyph, style);
                 }
             }
 

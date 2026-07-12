@@ -2153,6 +2153,43 @@ impl TuiFrontend {
                 return Ok((true, command_to_send));
             }
             MouseEventKind::Down(crate::data::input::MouseButton::Right) => {
+                // Right-click on a map room: info + travel context menu
+                {
+                    let target = find_topmost_window_at(app_core, *x, *y);
+                    let is_map_surface = match app_core
+                        .ui_state
+                        .get_window(&target)
+                        .map(|w| &w.content)
+                    {
+                        Some(crate::data::WindowContent::Map(_)) => true,
+                        Some(crate::data::WindowContent::TabbedText(_)) => self
+                            .widget_manager
+                            .tabbed_text_windows
+                            .get(&target)
+                            .is_some_and(|w| w.active_tab_is_map()),
+                        _ => false,
+                    };
+                    if is_map_surface {
+                        if let Some(pane) = self.widget_manager.map_panes.get(&target) {
+                            if pane.contains(*x, *y) {
+                                if let Some(room_id) = pane.room_at(*x, *y) {
+                                    let items =
+                                        Self::build_map_room_menu(app_core, room_id);
+                                    app_core.ui_state.popup_menu = Some(
+                                        crate::data::ui_state::PopupMenu::new(
+                                            items,
+                                            (*x, *y + 1),
+                                        ),
+                                    );
+                                    app_core.ui_state.input_mode = InputMode::Menu;
+                                    app_core.needs_render = true;
+                                }
+                                return Ok((true, None));
+                            }
+                        }
+                    }
+                }
+
                 // Right-click on performance overlay: show metrics toggle menu
                 if let Some(window) = app_core.ui_state.windows.get("performance_overlay") {
                     let pos = &window.position;
@@ -4541,6 +4578,90 @@ impl TuiFrontend {
     }
 
     /// Build performance overlay metrics context menu with checkmarks for enabled metrics
+    /// Context menu for a right-clicked map room: scene/mapdb info lines
+    /// (disabled) plus travel actions.
+    fn build_map_room_menu(
+        app_core: &crate::core::AppCore,
+        room_id: u32,
+    ) -> Vec<crate::data::ui_state::PopupMenuItem> {
+        use crate::data::ui_state::PopupMenuItem;
+        let info = |text: String| PopupMenuItem {
+            text,
+            command: String::new(),
+            disabled: true,
+        };
+        let mut items = Vec::new();
+
+        let scene_room = app_core
+            .map
+            .current_scene()
+            .and_then(|s| s.room(room_id))
+            .map(|(_, r)| r.clone());
+        let title = scene_room
+            .as_ref()
+            .filter(|r| !r.title.is_empty())
+            .map(|r| r.title.clone())
+            .unwrap_or_else(|| format!("Room {room_id}"));
+        items.push(info(title));
+        items.push(info(format!("id {room_id}")));
+
+        if let Some(db) = app_core.map.mapdb() {
+            if let Some(room) = db.room(room_id) {
+                // Terrain / climate when the mapdb knows them.
+                let mut env: Vec<&str> = Vec::new();
+                if let Some(t) = room.terrain.as_deref().filter(|t| *t != "none") {
+                    env.push(t);
+                }
+                if let Some(c) = room.climate.as_deref().filter(|c| *c != "none") {
+                    env.push(c);
+                }
+                if !env.is_empty() {
+                    items.push(info(env.join(" · ")));
+                }
+
+                // Tags worth surfacing: services, societies, node status.
+                // (Forage herbs and meta: bookkeeping stay out of the menu.)
+                const SERVICES: &[&str] = &[
+                    "node", "supernode", "premium supernode", "bank", "pawnshop",
+                    "furrier", "gemshop", "herbalist", "alchemist", "locksmith",
+                    "npchealer", "general store", "weaponshop", "fletcher",
+                    "sunfist", "closed", "gone",
+                ];
+                let mut tags: Vec<String> = room
+                    .tags
+                    .iter()
+                    .filter_map(|t| {
+                        if let Some(society) = t.strip_prefix("meta:society:") {
+                            Some(society.to_string())
+                        } else if SERVICES.iter().any(|s| t.eq_ignore_ascii_case(s)) {
+                            Some(t.clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                tags.dedup();
+                if !tags.is_empty() {
+                    items.push(info(format!("[{}]", tags.join(", "))));
+                }
+            }
+        }
+
+        items.push(PopupMenuItem {
+            text: "Travel here".to_string(),
+            command: format!(".go2 {room_id}"),
+            disabled: false,
+        });
+        if app_core.travel.task().is_some() {
+            items.push(PopupMenuItem {
+                text: "Stop travel".to_string(),
+                command: ".go2 stop".to_string(),
+                disabled: false,
+            });
+        }
+        items
+    }
+
     fn build_perf_metrics_context_menu(ui: &crate::config::UiConfig) -> Vec<crate::data::ui_state::PopupMenuItem> {
         let check = |on: bool| if on { "✓" } else { " " };
         vec![
