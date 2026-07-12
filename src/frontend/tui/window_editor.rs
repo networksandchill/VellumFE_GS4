@@ -287,6 +287,9 @@ struct TabEditItem {
     streams: Vec<String>,
     show_timestamps: bool,
     ignore_activity: bool,
+    /// Non-text tab kind ("map") — not editable in the form, but preserved
+    /// across edits so a map tab survives a round-trip through the editor.
+    kind: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -327,6 +330,7 @@ impl TabEditor {
                 streams: t.get_streams(),
                 show_timestamps: t.show_timestamps.unwrap_or(false),
                 ignore_activity: t.ignore_activity.unwrap_or(false),
+                kind: t.kind.clone(),
             })
             .collect();
 
@@ -336,6 +340,7 @@ impl TabEditor {
                 streams: vec!["main".to_string()],
                 show_timestamps: false,
                 ignore_activity: false,
+                kind: None,
             });
         }
 
@@ -384,6 +389,7 @@ impl TabEditor {
                 show_timestamps: Some(t.show_timestamps),
                 ignore_activity: Some(t.ignore_activity),
                 timestamp_position: None,
+                kind: t.kind.clone(),
             })
             .collect()
     }
@@ -440,6 +446,11 @@ impl TabEditor {
             streams,
             show_timestamps: self.show_timestamps,
             ignore_activity: self.ignore_activity,
+            // Preserve the kind of the tab being edited; new tabs are text.
+            kind: self
+                .editing_index
+                .and_then(|idx| self.tabs.get(idx))
+                .and_then(|t| t.kind.clone()),
         };
 
         if let Some(idx) = self.editing_index {

@@ -379,6 +379,10 @@ pub struct TabbedTextTab {
     /// Timestamp position (overrides ui.timestamp_position if Some)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timestamp_position: Option<TimestampPosition>,
+    /// Non-text tab kind. `kind = "map"` renders the live map (mini map with
+    /// click-to-travel) instead of stream text; `streams` is ignored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
 }
 
 impl TabbedTextTab {

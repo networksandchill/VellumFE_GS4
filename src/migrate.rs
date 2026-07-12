@@ -387,6 +387,7 @@ fn apply_widget_specific_fields(window: &mut WindowDef, table: &toml::value::Tab
                             show_timestamps,
                             ignore_activity,
                             timestamp_position: None,
+                            kind: None,
                         })
                     })
                     .collect();
@@ -398,6 +399,7 @@ fn apply_widget_specific_fields(window: &mut WindowDef, table: &toml::value::Tab
                     show_timestamps: None,
                     ignore_activity: None,
                     timestamp_position: None,
+                    kind: None,
                 }];
             }
         }

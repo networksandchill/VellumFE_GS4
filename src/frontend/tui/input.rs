@@ -1073,6 +1073,9 @@ impl TuiFrontend {
             MouseEventKind::ScrollUp => {
                 // Find topmost window at mouse position (ephemeral windows have higher z-order)
                 let target_window = find_topmost_window_at(app_core, *x, *y);
+                if self.map_zoom_at(app_core, &target_window, *x, *y, 1) {
+                    return Ok((true, None));
+                }
                 self.scroll_window(&target_window, 10);
                 app_core.needs_render = true;
                 return Ok((true, None));
@@ -1080,6 +1083,9 @@ impl TuiFrontend {
             MouseEventKind::ScrollDown => {
                 // Find topmost window at mouse position (ephemeral windows have higher z-order)
                 let target_window = find_topmost_window_at(app_core, *x, *y);
+                if self.map_zoom_at(app_core, &target_window, *x, *y, -1) {
+                    return Ok((true, None));
+                }
                 self.scroll_window(&target_window, -10);
                 app_core.needs_render = true;
                 return Ok((true, None));
@@ -1615,6 +1621,43 @@ impl TuiFrontend {
                             "Non-drag click on '{}' at ({}, {}), window_rect: y={}, height={}",
                             window_name, *x, *y, window_rect.y, window_rect.height
                         );
+
+                        // Map surface (standalone map window, or the active
+                        // map tab of a tabbed window): click a room to travel
+                        // there via the native walk executor.
+                        let is_map_surface = match &window.content {
+                            crate::data::WindowContent::Map(_) => true,
+                            crate::data::WindowContent::TabbedText(_) => self
+                                .widget_manager
+                                .tabbed_text_windows
+                                .get(&window_name)
+                                .is_some_and(|w| w.active_tab_is_map()),
+                            _ => false,
+                        };
+                        if is_map_surface {
+                            if let Some(pane) =
+                                self.widget_manager.map_panes.get(&window_name)
+                            {
+                                if pane.contains(*x, *y) {
+                                    if should_focus {
+                                        app_core.ui_state.set_focus(Some(window_name.clone()));
+                                    }
+                                    if let Some(room_id) = pane.room_at(*x, *y) {
+                                        tracing::info!(
+                                            "Map click on room {room_id} in '{window_name}' -> .go2"
+                                        );
+                                        let cmd =
+                                            self.handle_command_submission(
+                                                format!(".go2 {room_id}"),
+                                                app_core,
+                                            )?;
+                                        return Ok((true, cmd));
+                                    }
+                                    app_core.needs_render = true;
+                                    return Ok((true, None));
+                                }
+                            }
+                        }
 
                         if let Some(link_data) =
                             self.link_at_position(&window_name, *x, *y, window_rect)

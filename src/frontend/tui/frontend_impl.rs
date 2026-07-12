@@ -147,6 +147,7 @@ impl Frontend for TuiFrontend {
         let mut container_widgets = std::mem::take(&mut self.widget_manager.container_widgets);
         let mut dashboard_widgets = std::mem::take(&mut self.widget_manager.dashboard_widgets);
         let mut tabbed_text_windows = std::mem::take(&mut self.widget_manager.tabbed_text_windows);
+        let mut map_panes = std::mem::take(&mut self.widget_manager.map_panes);
         let mut compass_widgets = std::mem::take(&mut self.widget_manager.compass_widgets);
         let mut injury_doll_widgets = std::mem::take(&mut self.widget_manager.injury_doll_widgets);
         let mut performance_widgets = std::mem::take(&mut self.widget_manager.performance_widgets);
@@ -390,6 +391,18 @@ impl Frontend for TuiFrontend {
                                 window_index,
                                 &theme,
                             );
+                            // Map tabs: the widget drew chrome only; paint
+                            // the map pane into the content area.
+                            if tabbed_window.active_tab_is_map() {
+                                if let Some(content) = tabbed_window.last_content_area() {
+                                    map_panes.entry(name.clone()).or_default().render(
+                                        app_core,
+                                        content,
+                                        f.buffer_mut(),
+                                        &theme,
+                                    );
+                                }
+                            }
                         }
                     }
                     WindowContent::Compass(_) => {
@@ -405,12 +418,25 @@ impl Frontend for TuiFrontend {
                         }
                     }
                     WindowContent::Map(_) => {
-                        // The map is GUI-only; show a hint instead of a blank pane.
-                        let hint = ratatui::widgets::Paragraph::new(
-                            "Map is available in the GUI frontend (--frontend gui)",
-                        )
-                        .wrap(ratatui::widgets::Wrap { trim: true });
-                        ratatui::widgets::Widget::render(hint, area, f.buffer_mut());
+                        // Braille mini map: bordered block, map pane inside.
+                        let block = Block::default()
+                            .borders(Borders::ALL)
+                            .border_style(
+                                ratatui::style::Style::default().fg(
+                                    super::crossterm_bridge::to_ratatui_color(
+                                        theme.window_border,
+                                    ),
+                                ),
+                            )
+                            .title("Map");
+                        let inner = block.inner(area);
+                        ratatui::widgets::Widget::render(block, area, f.buffer_mut());
+                        map_panes.entry(name.clone()).or_default().render(
+                            app_core,
+                            inner,
+                            f.buffer_mut(),
+                            &theme,
+                        );
                     }
                     WindowContent::Empty => {
                         // Check if this is a spacer widget
@@ -666,6 +692,7 @@ impl Frontend for TuiFrontend {
         self.widget_manager.container_widgets = container_widgets;
         self.widget_manager.dashboard_widgets = dashboard_widgets;
         self.widget_manager.tabbed_text_windows = tabbed_text_windows;
+        self.widget_manager.map_panes = map_panes;
         self.widget_manager.compass_widgets = compass_widgets;
         self.widget_manager.injury_doll_widgets = injury_doll_widgets;
         self.widget_manager.performance_widgets = performance_widgets;

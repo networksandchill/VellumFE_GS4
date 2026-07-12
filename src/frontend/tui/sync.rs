@@ -1633,6 +1633,14 @@ impl TuiFrontend {
                         }
                     }
 
+                    // Apply per-tab kinds ("map" tabs render the map pane
+                    // instead of text) from the definition, index-aligned.
+                    if let Some(crate::config::WindowDef::TabbedText { data, .. }) = window_def {
+                        let kinds: Vec<Option<String>> =
+                            data.tabs.iter().map(|t| t.kind.clone()).collect();
+                        widget.set_tab_kinds(&kinds);
+                    }
+
                     // Set active tab
                     widget.switch_to_tab(tabbed_content.active_tab_index);
 

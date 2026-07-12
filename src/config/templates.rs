@@ -1162,6 +1162,7 @@ impl Config {
                             show_timestamps: None,
                             ignore_activity: Some(false),
                             timestamp_position: None,
+                            kind: None,
                         },
                         TabbedTextTab {
                             name: "Speech".to_string(),
@@ -1170,6 +1171,7 @@ impl Config {
                             show_timestamps: None,
                             ignore_activity: Some(false),
                             timestamp_position: None,
+                            kind: None,
                         },
                         TabbedTextTab {
                             name: "Announcements".to_string(),
@@ -1178,6 +1180,7 @@ impl Config {
                             show_timestamps: None,
                             ignore_activity: Some(false),
                             timestamp_position: None,
+                            kind: None,
                         },
                         TabbedTextTab {
                             name: "Loot".to_string(),
@@ -1186,6 +1189,7 @@ impl Config {
                             show_timestamps: None,
                             ignore_activity: Some(false),
                             timestamp_position: None,
+                            kind: None,
                         },
                         TabbedTextTab {
                             name: "Ambients".to_string(),
@@ -1194,6 +1198,7 @@ impl Config {
                             show_timestamps: None,
                             ignore_activity: Some(false),
                             timestamp_position: None,
+                            kind: None,
                         },
                     ],
                     buffer_size: 5000,
@@ -1223,6 +1228,7 @@ impl Config {
                         show_timestamps: None, // Per-tab setting, no global default
                         ignore_activity: Some(false),
                         timestamp_position: None,
+                        kind: None,
                     }],
                     buffer_size: 5000,
                     tab_bar_position: "top".to_string(),

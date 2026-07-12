@@ -447,6 +447,44 @@ impl super::TuiFrontend {
     }
 
     /// Handle command submission from CommandInput (extracted from main.rs Phase 4.2)
+    /// Mouse wheel over a map surface zooms it instead of scrolling. Returns
+    /// true when the event was consumed (the window shows a map under the
+    /// pointer: a standalone map window or a tabbed window's active map tab).
+    pub(super) fn map_zoom_at(
+        &mut self,
+        app_core: &mut crate::core::AppCore,
+        window_name: &str,
+        x: u16,
+        y: u16,
+        delta: i16,
+    ) -> bool {
+        let is_map_surface = match app_core
+            .ui_state
+            .get_window(window_name)
+            .map(|w| &w.content)
+        {
+            Some(crate::data::WindowContent::Map(_)) => true,
+            Some(crate::data::WindowContent::TabbedText(_)) => self
+                .widget_manager
+                .tabbed_text_windows
+                .get(window_name)
+                .is_some_and(|w| w.active_tab_is_map()),
+            _ => false,
+        };
+        if !is_map_surface {
+            return false;
+        }
+        let Some(pane) = self.widget_manager.map_panes.get_mut(window_name) else {
+            return false;
+        };
+        if !pane.contains(x, y) {
+            return false;
+        }
+        pane.zoom_by(delta);
+        app_core.needs_render = true;
+        true
+    }
+
     pub(super) fn handle_command_submission(
         &mut self,
         command: String,

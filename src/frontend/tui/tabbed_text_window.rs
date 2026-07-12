@@ -38,6 +38,8 @@ struct TabInfo {
     has_unread: bool,
     unread_count: usize,
     ignore_activity: bool,
+    /// Non-text tab kind ("map"); None = normal text tab
+    kind: Option<String>,
 }
 
 pub struct TabbedTextWindow {
@@ -59,6 +61,8 @@ pub struct TabbedTextWindow {
     show_tab_separator: bool,
     tab_bar_outside: bool,
     title_position: TitlePosition,
+    /// Content area of the last render, for non-text tab bodies (map)
+    last_content_area: Option<Rect>,
 }
 
 /// Left inset for the tab labels when the tab bar sits outside the border
@@ -85,6 +89,7 @@ impl TabbedTextWindow {
             show_tab_separator: false,
             tab_bar_outside: false,
             title_position: TitlePosition::TopLeft,
+            last_content_area: None,
         }
     }
 
@@ -206,7 +211,30 @@ impl TabbedTextWindow {
             has_unread: false,
             unread_count: 0,
             ignore_activity,
+            kind: None,
         });
+    }
+
+    /// Apply per-tab kinds from the window definition (index-aligned with
+    /// the definition's tab list). A "map" kind makes the tab render the map
+    /// pane instead of its (empty) text content.
+    pub fn set_tab_kinds(&mut self, kinds: &[Option<String>]) {
+        for (tab, kind) in self.tabs.iter_mut().zip(kinds.iter()) {
+            tab.kind = kind.clone();
+        }
+    }
+
+    /// Whether the active tab is a map tab.
+    pub fn active_tab_is_map(&self) -> bool {
+        self.tabs
+            .get(self.active_tab_index)
+            .is_some_and(|t| t.kind.as_deref() == Some("map"))
+    }
+
+    /// Content area of the last render — where a non-text tab body (map)
+    /// should be painted, and the target for its mouse hit-testing.
+    pub fn last_content_area(&self) -> Option<Rect> {
+        self.last_content_area
     }
 
     pub fn remove_tab(&mut self, name: &str) -> bool {
@@ -933,7 +961,12 @@ impl TabbedTextWindow {
             }
         }
 
-        // Render active tab content
+        // Render active tab content. Map tabs draw nothing here — the
+        // frontend paints the map pane into last_content_area after this.
+        self.last_content_area = Some(content_area);
+        if self.active_tab_is_map() {
+            return;
+        }
         if let Some(tab) = self.tabs.get_mut(self.active_tab_index) {
             tab.window.render_with_focus(
                 content_area,

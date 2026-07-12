@@ -34,6 +34,7 @@ mod items;
 pub mod keybind_browser;
 pub mod keybind_form;
 mod list_widget;
+pub mod map_pane;
 pub mod menu_actions;
 pub mod menu_builders;
 mod minivitals;

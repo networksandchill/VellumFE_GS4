@@ -42,6 +42,9 @@ pub struct WidgetManager {
     pub dashboard_widgets: HashMap<String, super::dashboard::Dashboard>,
     /// Cache of TabbedTextWindow widgets per window name
     pub tabbed_text_windows: HashMap<String, super::tabbed_text_window::TabbedTextWindow>,
+    /// Map pane state (camera/zoom + click hit map) per window name — used
+    /// both by standalone map windows and map tabs in tabbed windows
+    pub map_panes: HashMap<String, super::map_pane::MapPane>,
     /// Cache of Compass widgets per window name
     pub compass_widgets: HashMap<String, super::compass::Compass>,
     /// Cache of InjuryDoll widgets per window name
@@ -94,6 +97,7 @@ impl WidgetManager {
             container_widgets: HashMap::new(),
             dashboard_widgets: HashMap::new(),
             tabbed_text_windows: HashMap::new(),
+            map_panes: HashMap::new(),
             compass_widgets: HashMap::new(),
             injury_doll_widgets: HashMap::new(),
             performance_widgets: HashMap::new(),
