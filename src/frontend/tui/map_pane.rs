@@ -28,8 +28,8 @@ const MAX_ZOOM: u16 = 12;
 
 /// Room glyphs for the smallest zoom tier (one character per room).
 const GLYPH_ROOM: char = '■';
-const GLYPH_NODE: char = '■';
-const GLYPH_SUPERNODE: char = '◆';
+const GLYPH_NODE: char = '\u{F09D1}'; // nf-md-brain 󰧑 (needs a Nerd Font)
+const GLYPH_SUPERNODE: char = '\u{F09D1}'; // nf-md-brain 󰧑, brighter blue than plain nodes
 const GLYPH_ENTRANCE: char = '⌂';
 const GLYPH_CURRENT: char = '◉';
 
@@ -368,6 +368,8 @@ impl MapPane {
                     GLYPH_CURRENT
                 } else if room.supernode {
                     GLYPH_SUPERNODE
+                } else if room.node {
+                    GLYPH_NODE
                 } else if room.entrance {
                     GLYPH_ENTRANCE
                 } else {
@@ -403,11 +405,13 @@ impl MapPane {
                 }
                 // Marker in the box center (3-row tier) or on the top edge
                 // (2-row tier, which has no middle row).
-                if is_current || room.entrance || room.supernode {
+                if is_current || room.entrance || room.supernode || room.node {
                     let glyph = if is_current {
                         GLYPH_CURRENT
                     } else if room.supernode {
                         GLYPH_SUPERNODE
+                    } else if room.node {
+                        GLYPH_NODE
                     } else {
                         GLYPH_ENTRANCE
                     };
