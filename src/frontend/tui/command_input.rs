@@ -529,8 +529,9 @@ impl CommandInput {
         );
 
         // Build search prompt with match info
+        // (search_info() already returns a 1-based current index)
         let search_info_text = match search_info {
-            Some((current, total)) => format!(" [{}/{}]", current + 1, total),
+            Some((current, total)) => format!(" [{}/{}]", current, total),
             None => String::new(),
         };
         let prompt = format!("Search{}: ", search_info_text);

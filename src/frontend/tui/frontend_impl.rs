@@ -223,35 +223,29 @@ impl Frontend for TuiFrontend {
                         // If in Search mode, render search input instead of command input
                         if app_core.ui_state.input_mode == InputMode::Search {
                             if let Some(cmd_input) = command_inputs.get(name) {
-                                // Get search info from focused window (if any)
-                                let search_info = if let Some(focused_name) =
-                                    &app_core.ui_state.focused_window
-                                {
-                                    if let Some(window) = app_core.ui_state.windows.get(focused_name) {
-                                        if let WindowContent::Text(_) = &window.content {
-                                            text_windows
-                                                .get(focused_name)
+                                // Get search info from the window search acts on
+                                // (focused if searchable, else main, else first
+                                // searchable — same routing as the search keys)
+                                let search_window = super::search::resolve_search_window_name(
+                                    app_core,
+                                    &text_windows,
+                                    &tabbed_text_windows,
+                                );
+                                let search_info = search_window.as_ref().and_then(|window_name| {
+                                    text_windows
+                                        .get(window_name)
+                                        .and_then(|tw| tw.search_info())
+                                        .or_else(|| {
+                                            tabbed_text_windows
+                                                .get(window_name)
                                                 .and_then(|tw| tw.search_info())
-                                        } else {
-                                            None
-                                        }
-                                    } else {
-                                        None
-                                    }
-                                } else {
-                                    // No focused window, try main
-                                    if let Some(window) = app_core.ui_state.windows.get("main") {
-                                        if let WindowContent::Text(_) = &window.content {
-                                            text_windows
-                                                .get("main")
-                                                .and_then(|tw| tw.search_info())
-                                        } else {
-                                            None
-                                        }
-                                    } else {
-                                        None
-                                    }
-                                };
+                                        })
+                                });
+                                tracing::debug!(
+                                    "Search-mode render: window={:?}, info={:?}",
+                                    search_window,
+                                    search_info
+                                );
 
                                 // Render search mode using command_input's visual settings
                                 cmd_input.render_search_mode(

@@ -172,6 +172,7 @@ pub struct ProgressData {
 #[derive(Clone, Debug)]
 pub struct CountdownData {
     pub end_time: i64,         // Unix timestamp when timer expires
+    pub cast_end_time: i64,    // Cast RT end; merged into "roundtime" widgets
     pub label: String,         // Display label
     pub countdown_id: String,  // Feed id (XML event id), case-sensitive
     pub color: Option<String>, // Fill color override; None = id-based default

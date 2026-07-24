@@ -17,47 +17,29 @@ impl super::TuiFrontend {
         use crate::data::input::KeyCode;
 
         // Handle Ctrl+PageUp/PageDown for cycling through search results
+        // (ctrl+n / ctrl+p cycle too — friendlier on keyboards without easy
+        // PageUp/PageDown, e.g. Mac laptops)
         if modifiers.ctrl {
-            match code {
-                KeyCode::PageUp => {
-                    let focused_name = app_core.get_focused_window_name();
-                    if self.prev_search_match(&focused_name) {
-                        tracing::debug!("Jumped to previous search match in '{}'", focused_name);
+            let next = match code {
+                KeyCode::PageDown | KeyCode::Char('n') => Some(true),
+                KeyCode::PageUp | KeyCode::Char('p') => Some(false),
+                _ => None,
+            };
+            if let Some(forward) = next {
+                if let Some(window_name) = self.search_window_name(app_core) {
+                    let moved = if forward {
+                        self.next_search_match(&window_name)
                     } else {
-                        tracing::debug!("No more search matches in '{}'", focused_name);
-                    }
-                    app_core.needs_render = true;
-                    return Ok(None);
-                }
-                KeyCode::PageDown => {
-                    let focused_name = app_core.get_focused_window_name();
-                    if self.next_search_match(&focused_name) {
-                        tracing::debug!("Jumped to next search match in '{}'", focused_name);
+                        self.prev_search_match(&window_name)
+                    };
+                    if moved {
+                        tracing::debug!("Jumped to search match in '{}'", window_name);
                     } else {
-                        tracing::debug!("No more search matches in '{}'", focused_name);
+                        tracing::debug!("No search matches in '{}'", window_name);
                     }
-                    app_core.needs_render = true;
-                    return Ok(None);
                 }
-                // ctrl+n / ctrl+p cycle matches too — friendlier on
-                // keyboards without easy PageUp/PageDown (e.g. Mac laptops)
-                KeyCode::Char('n') => {
-                    let focused_name = app_core.get_focused_window_name();
-                    if self.next_search_match(&focused_name) {
-                        tracing::debug!("Jumped to next search match in '{}'", focused_name);
-                    }
-                    app_core.needs_render = true;
-                    return Ok(None);
-                }
-                KeyCode::Char('p') => {
-                    let focused_name = app_core.get_focused_window_name();
-                    if self.prev_search_match(&focused_name) {
-                        tracing::debug!("Jumped to previous search match in '{}'", focused_name);
-                    }
-                    app_core.needs_render = true;
-                    return Ok(None);
-                }
-                _ => {}
+                app_core.needs_render = true;
+                return Ok(None);
             }
         }
 
@@ -65,18 +47,28 @@ impl super::TuiFrontend {
             KeyCode::Enter => {
                 let pattern = app_core.ui_state.search_input.clone();
                 if !pattern.is_empty() {
-                    let window_name = app_core.get_focused_window_name();
-                    match self.execute_search(&window_name, &pattern) {
-                        Ok(count) => {
-                            if count > 0 {
-                                tracing::info!("Found {} matches for '{}'", count, pattern);
-                            } else {
-                                tracing::info!("No matches found for '{}'", pattern);
+                    if let Some(window_name) = self.search_window_name(app_core) {
+                        match self.execute_search(&window_name, &pattern) {
+                            Ok(count) => {
+                                if count > 0 {
+                                    app_core.add_system_message(&format!(
+                                        "Found {} matches for '{}'",
+                                        count, pattern
+                                    ));
+                                } else {
+                                    app_core.add_system_message(&format!(
+                                        "No matches found for '{}'",
+                                        pattern
+                                    ));
+                                }
+                                app_core.needs_render = true;
                             }
-                            app_core.needs_render = true;
-                        }
-                        Err(e) => {
-                            tracing::warn!("Invalid search regex '{}': {}", pattern, e);
+                            Err(e) => {
+                                app_core.add_system_message(&format!(
+                                    "Invalid search regex '{}': {}",
+                                    pattern, e
+                                ));
+                            }
                         }
                     }
                 }
@@ -118,7 +110,13 @@ impl super::TuiFrontend {
                 app_core.needs_render = true;
             }
             KeyCode::Esc => {
-                // Exit search mode
+                // Exit search mode: clear match highlights and return the
+                // searched window to live view (bottom)
+                let search_window = self.search_window_name(app_core);
+                self.clear_all_searches();
+                if let Some(window_name) = search_window {
+                    self.scroll_window(&window_name, -100000);
+                }
                 app_core.ui_state.input_mode = crate::data::InputMode::Normal;
                 app_core.ui_state.search_input.clear();
                 app_core.ui_state.search_cursor = 0;
@@ -273,19 +271,21 @@ impl super::TuiFrontend {
                                 tracing::debug!("Entered search mode");
                             }
                             "next_search_match" => {
-                                let focused_name = app_core.get_focused_window_name();
-                                if self.next_search_match(&focused_name) {
-                                    tracing::debug!("Jumped to next search match in '{}'", focused_name);
-                                } else {
-                                    tracing::debug!("No more search matches in '{}'", focused_name);
+                                if let Some(window_name) = self.search_window_name(app_core) {
+                                    if self.next_search_match(&window_name) {
+                                        tracing::debug!("Jumped to next search match in '{}'", window_name);
+                                    } else {
+                                        tracing::debug!("No more search matches in '{}'", window_name);
+                                    }
                                 }
                             }
                             "prev_search_match" => {
-                                let focused_name = app_core.get_focused_window_name();
-                                if self.prev_search_match(&focused_name) {
-                                    tracing::debug!("Jumped to previous search match in '{}'", focused_name);
-                                } else {
-                                    tracing::debug!("No more search matches in '{}'", focused_name);
+                                if let Some(window_name) = self.search_window_name(app_core) {
+                                    if self.prev_search_match(&window_name) {
+                                        tracing::debug!("Jumped to previous search match in '{}'", window_name);
+                                    } else {
+                                        tracing::debug!("No more search matches in '{}'", window_name);
+                                    }
                                 }
                             }
                             "clear_search" => {

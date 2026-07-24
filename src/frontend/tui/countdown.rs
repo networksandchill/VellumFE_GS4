@@ -16,13 +16,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// A countdown widget for displaying roundtime, casttime, stuntime, etc.
 pub struct Countdown {
     label: String,
-    end_time: i64, // Unix timestamp when countdown ends
+    end_time: i64,      // Unix timestamp when countdown ends
+    cast_end_time: i64, // Cast RT end; shown in cast_color when it outlasts end_time
     show_border: bool,
     border_style: Option<String>,
     border_color: Option<String>,
     border_sides: crate::config::BorderSides,
     title_position: TitlePosition,
     text_color: Option<String>,
+    cast_color: Option<String>,
     background_color: Option<String>,
     transparent_background: bool,
     icon: char, // Character to use for countdown blocks
@@ -33,12 +35,14 @@ impl Countdown {
         Self {
             label: label.to_string(),
             end_time: 0,
+            cast_end_time: 0,
             show_border: true,
             border_style: None,
             border_color: None,
             border_sides: crate::config::BorderSides::default(),
             title_position: TitlePosition::TopLeft,
             text_color: None,
+            cast_color: None,
             background_color: None,
             transparent_background: false,
             icon: '█', // Default to filled block
@@ -88,15 +92,29 @@ impl Countdown {
         self.end_time = end_time;
     }
 
+    pub fn set_cast_end_time(&mut self, end_time: i64) {
+        self.cast_end_time = end_time;
+    }
+
+    pub fn set_cast_color(&mut self, color: Option<String>) {
+        self.cast_color = color;
+    }
+
     /// Get remaining seconds
     /// Applies server_time_offset to local time to account for clock drift
-    fn remaining_seconds(&self, server_time_offset: i64) -> i64 {
+    fn remaining_seconds(&self, server_time_offset: i64) -> (i64, bool) {
         let local_time = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs() as i64;
         let adjusted_time = local_time + server_time_offset;
-        self.end_time - adjusted_time
+        let rt = self.end_time - adjusted_time;
+        let cast = self.cast_end_time - adjusted_time;
+        if cast > rt {
+            (cast, true)
+        } else {
+            (rt, false)
+        }
     }
 
     /// Parse a color string to ratatui Color (supports hex and color names)
@@ -179,13 +197,20 @@ impl Countdown {
             return;
         }
 
-        let remaining = self.remaining_seconds(server_time_offset).max(0) as u32;
+        let (remaining, is_cast) = self.remaining_seconds(server_time_offset);
+        let remaining = remaining.max(0) as u32;
 
-        let text_color = self
-            .text_color
-            .as_ref()
-            .and_then(|c| Self::parse_color_opt(c))
-            .unwrap_or(Color::White);
+        let text_color = if is_cast {
+            self.cast_color
+                .as_ref()
+                .and_then(|c| Self::parse_color_opt(c))
+                .unwrap_or(Color::Rgb(0, 191, 255))
+        } else {
+            self.text_color
+                .as_ref()
+                .and_then(|c| Self::parse_color_opt(c))
+                .unwrap_or(Color::White)
+        };
 
         // Clear the bar area with appropriate background
         let y = inner_area.y;

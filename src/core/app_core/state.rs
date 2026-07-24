@@ -1523,6 +1523,7 @@ impl AppCore {
 
                     WindowContent::Countdown(CountdownData {
                         end_time: 0,
+                        cast_end_time: 0,
                         label,
                         countdown_id,
                         color,
@@ -1869,6 +1870,7 @@ impl AppCore {
                     };
                 WindowContent::Countdown(CountdownData {
                     end_time: 0,
+                    cast_end_time: 0,
                     label,
                     countdown_id,
                     color,
@@ -3099,6 +3101,7 @@ impl AppCore {
             }),
             WidgetType::Countdown => WindowContent::Countdown(CountdownData {
                 end_time: 0,
+                cast_end_time: 0,
                 label: name.to_string(),
                 countdown_id: name.to_string(),
                 color: None,

@@ -716,8 +716,9 @@ impl TuiFrontend {
 
                 // Update configuration and value
                 if let Some(countdown_widget) = self.widget_manager.countdowns.get_mut(name) {
-                    // Set end time from game data
+                    // Set end times from game data
                     countdown_widget.set_end_time(countdown_data.end_time);
+                    countdown_widget.set_cast_end_time(countdown_data.cast_end_time);
 
                     // Apply window config from WindowDef
                     if let Some(def) = window_def {
@@ -744,6 +745,7 @@ impl TuiFrontend {
                             }
                             let text_color = data.color.clone().or_else(|| colors.text.clone());
                             countdown_widget.set_text_color(text_color);
+                            countdown_widget.set_cast_color(data.cast_color.clone());
                             let bg_color = data
                                 .background_color
                                 .clone()
@@ -2118,12 +2120,42 @@ impl TuiFrontend {
                 if let Some(ref title) = new_title {
                     room_window.clear_all_components();
 
+                    // Boss/challenging creature colors (same precedence as the
+                    // targets widget), keyed by exist id without the '#' prefix
+                    let target_cfg = &app_core.config.target_list;
+                    let creature_colors: std::collections::HashMap<&str, &str> = app_core
+                        .game_state
+                        .room_creatures
+                        .iter()
+                        .filter_map(|c| {
+                            let flags = c.flags.as_ref()?;
+                            let color = if flags.is_boss() {
+                                target_cfg.boss_color.as_deref()?
+                            } else if flags.challenging {
+                                target_cfg.challenging_color.as_deref()?
+                            } else {
+                                return None;
+                            };
+                            Some((c.id.trim_start_matches('#'), color))
+                        })
+                        .collect();
+
                     for (component_id, lines) in &app_core.room_components {
                         room_window.start_component(component_id.clone());
 
                         for line_segments in lines {
                             for segment in line_segments {
-                                room_window.add_segment(segment.clone());
+                                let mut segment = segment.clone();
+                                if component_id == "room objs" {
+                                    if let Some(color) = segment
+                                        .link_data
+                                        .as_ref()
+                                        .and_then(|l| creature_colors.get(l.exist_id.as_str()))
+                                    {
+                                        segment.fg = Some((*color).to_string());
+                                    }
+                                }
+                                room_window.add_segment(segment);
                             }
                             room_window.finish_line();
                         }

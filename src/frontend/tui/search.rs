@@ -1,6 +1,45 @@
 use super::*;
 
+/// Name of the window search keys should act on: the focused window if it
+/// supports search, otherwise "main", otherwise the first searchable window
+/// in layout order. Focus often sits on a non-searchable widget (e.g. the
+/// command input), which must not silently swallow the search.
+pub(super) fn resolve_search_window_name(
+    app_core: &crate::core::AppCore,
+    text_windows: &std::collections::HashMap<String, text_window::TextWindow>,
+    tabbed_text_windows: &std::collections::HashMap<String, tabbed_text_window::TabbedTextWindow>,
+) -> Option<String> {
+    let is_searchable =
+        |name: &str| text_windows.contains_key(name) || tabbed_text_windows.contains_key(name);
+
+    if let Some(focused) = app_core.ui_state.focused_window.as_deref() {
+        if is_searchable(focused) {
+            return Some(focused.to_string());
+        }
+    }
+    if is_searchable("main") {
+        return Some("main".to_string());
+    }
+    app_core
+        .layout
+        .windows
+        .iter()
+        .map(|w| w.name())
+        .find(|n| is_searchable(n))
+        .map(|n| n.to_string())
+}
+
 impl TuiFrontend {
+    /// Resolve the window that search input should act on (see
+    /// [`resolve_search_window_name`]).
+    pub fn search_window_name(&self, app_core: &crate::core::AppCore) -> Option<String> {
+        resolve_search_window_name(
+            app_core,
+            &self.widget_manager.text_windows,
+            &self.widget_manager.tabbed_text_windows,
+        )
+    }
+
     /// Convert mouse coordinates to text coordinates for a window.
     /// Works with text windows, tabbed text windows, and other text-containing widgets.
     pub fn mouse_to_text_coords(

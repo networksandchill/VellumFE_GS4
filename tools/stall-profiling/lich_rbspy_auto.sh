@@ -22,7 +22,9 @@ echo "rbspy auto-profiler START $(date +%H:%M:%S) as $(whoami) — watching Lich
 last=0
 for i in $(seq 1 $DURATION_TICKS); do
   sleep 0.2
-  LPID=$(pgrep -f 'lich.rbw' | head -1)
+  # Match only the ruby interpreter itself — gs may launch Lich under a
+  # `sh -c` wrapper whose cmdline also contains lich.rbw but never burns CPU.
+  LPID=$(pgrep -f '^ruby.*lich\.rbw' | head -1)
   [ -z "$LPID" ] && continue
   cpu=$(ps -o %cpu= -p "$LPID" 2>/dev/null | tr -d ' '); [ -z "$cpu" ] && cpu=0
   now=$(date +%s)
@@ -31,7 +33,7 @@ for i in $(seq 1 $DURATION_TICKS); do
       last=$now; ts=$(date +%H%M%S)
       f="/tmp/lich_rbspy_$ts.txt"
       echo "$(date +%H:%M:%S)  PEG cpu=$cpu%  -> rbspy recording ${RECORD_SECS}s -> $f" | tee -a "$OUT"
-      rbspy record --pid "$LPID" --duration "$RECORD_SECS" --format summary_by_line --file "$f" 2>>"$OUT"
+      rbspy record --pid "$LPID" --duration "$RECORD_SECS" --format summary-by-line --file "$f" 2>>"$OUT"
       chmod 644 "$f" 2>/dev/null
       echo "$(date +%H:%M:%S)  capture done: $f" | tee -a "$OUT"
     fi

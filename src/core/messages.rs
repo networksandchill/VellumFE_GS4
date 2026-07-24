@@ -789,6 +789,20 @@ impl MessageProcessor {
 
                 // Update countdowns that listen for "casttime"
                 self.update_countdown_by_id(ui_state, "casttime", end_time_server);
+
+                // Also merge into "roundtime" widgets so a combined RT bar can
+                // show cast RT (rendered in the cast color).
+                for (name, window) in ui_state
+                    .windows
+                    .iter_mut()
+                    .filter(|(_, w)| matches!(w.content, WindowContent::Countdown(_)))
+                {
+                    if let WindowContent::Countdown(ref mut cd) = window.content {
+                        if cd.countdown_id == "roundtime" || name == "roundtime" {
+                            cd.cast_end_time = end_time_server;
+                        }
+                    }
+                }
             }
             ParsedElement::LeftHand { item, link } => {
                 self.chunk_has_silent_updates = true; // Mark as silent update

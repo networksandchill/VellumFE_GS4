@@ -101,6 +101,7 @@ fn add_countdown_window(ui_state: &mut UiState, name: &str, countdown_id: &str) 
         widget_type: WidgetType::Countdown,
         content: WindowContent::Countdown(CountdownData {
             end_time: 0,
+            cast_end_time: 0,
             label: name.to_string(),
             countdown_id: countdown_id.to_string(),
             color: None,

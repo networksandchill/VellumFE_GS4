@@ -428,6 +428,9 @@ pub struct CountdownWidgetData {
     pub icon: Option<char>,
     #[serde(default)]
     pub color: Option<String>,
+    /// Color while cast RT is the active timer (roundtime widgets only)
+    #[serde(default)]
+    pub cast_color: Option<String>,
     #[serde(default)]
     pub background_color: Option<String>,
 }
