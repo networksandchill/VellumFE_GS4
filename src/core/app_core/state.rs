@@ -113,6 +113,10 @@ pub struct AppCore {
     /// (client_id, request_id, location).
     pending_map_views: Vec<(u64, u64, String)>,
 
+    /// Session-only mapping observations (forage sense, ranger sense),
+    /// keyed by room uid. Dies on relog by design — see core::evidence.
+    pub evidence: crate::core::evidence::EvidenceStore,
+
     pub nav_room_id: Option<String>,
 
     /// Lich room ID extracted from room display
@@ -277,6 +281,7 @@ impl AppCore {
             show_perf_stats: false,
             sound_player,
             tts_manager,
+            evidence: crate::core::evidence::EvidenceStore::default(),
             nav_room_id: None,
             lich_room_id: None,
             room_subtitle: None,
@@ -410,6 +415,7 @@ impl AppCore {
             active_spells: &active_spells,
             rt_remaining: self.game_state.roundtime_remaining() as f64,
             now_ms: self.travel.now_ms(),
+            pathcodes: &self.config.go2.pathcodes,
         };
         let events = self.travel.tick(ctx);
         for event in events {
@@ -422,7 +428,7 @@ impl AppCore {
                     seconds,
                 } => {
                     self.add_system_message(&format!(
-                        "[go2] arrived at room {destination} — travel time {}",
+                        "[go2] arrived at room {destination} - travel time {}",
                         crate::core::travel::format_eta(seconds)
                     ));
                 }
@@ -444,7 +450,7 @@ impl AppCore {
     pub fn start_travel(&mut self, destination: u32) {
         let Some(db) = self.map.mapdb().cloned() else {
             self.add_system_message(
-                "[go2] map database not loaded — configure it in Settings > Map",
+                "[go2] map database not loaded - configure it in Settings > Map",
             );
             return;
         };
@@ -475,7 +481,7 @@ impl AppCore {
                     .and_then(|r| r.title.first().cloned())
                     .unwrap_or_default();
                 self.add_system_message(&format!(
-                    "[go2] → {title} ({destination}): {} rooms, ETA {}",
+                    "[go2] -> {title} ({destination}): {} rooms, ETA {}",
                     task.rooms_total(),
                     crate::core::travel::format_eta(eta)
                 ));
@@ -528,9 +534,29 @@ impl AppCore {
             .lich_room_id
             .as_deref()
             .and_then(|s| s.trim().parse::<u32>().ok());
+        // Plain-text "room desc" for the uid-less content fallback; lines
+        // are joined with a space to mirror the single-string mapdb form.
+        let description = self
+            .room_components
+            .get("room desc")
+            .map(|lines| {
+                lines
+                    .iter()
+                    .map(|segments| {
+                        segments
+                            .iter()
+                            .map(|seg| seg.text.as_str())
+                            .collect::<String>()
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
         let snapshot = crate::core::ghost_rooms::RoomSnapshot {
             title: self.game_state.room_name.clone(),
             exits: self.game_state.exits.clone(),
+            description,
         };
         self.map.note_room(uid, lich_id, snapshot);
     }
@@ -1175,8 +1201,9 @@ impl AppCore {
             None => (Sheet::Outdoor, None, None),
         };
 
-        // Ghost sketch overlay (session-only unmapped interiors).
-        let overlay = (!map.ghosts().is_empty()).then(|| {
+        // Ghost sketch overlay (session-only unmapped interiors); rendered
+        // only in cartography mode — everyday play shows mapdb truth.
+        let overlay = (self.config.map.mapping_mode && !map.ghosts().is_empty()).then(|| {
             crate::core::ghost_rooms::build_overlay(map.ghosts(), scene, sheet, filter.as_ref())
         });
         let ghost_cell = map
@@ -2149,6 +2176,47 @@ impl AppCore {
                 self.game_state.queue_sound(sound);
             }
 
+            // Attribute mapping observations to the current room uid
+            if !self.message_processor.pending_evidence.is_empty() {
+                let uid = self
+                    .nav_room_id
+                    .as_deref()
+                    .and_then(|s| s.trim().parse::<i64>().ok())
+                    .filter(|&u| u != 0);
+                for obs in self.message_processor.pending_evidence.drain(..) {
+                    if let Some(uid) = uid {
+                        self.evidence.record(
+                            uid,
+                            self.game_state.room_name.clone(),
+                            obs,
+                            self.game_state.game_time,
+                        );
+                    }
+                }
+            }
+
+            // A pathcode NPC spoke a route: persist it for the maze whose
+            // entrance we're standing at (works mid-.go2 or asked by hand).
+            if let Some(route) = self.message_processor.pending_pathcode.take() {
+                let maze = self
+                    .map
+                    .current_room_id
+                    .and_then(crate::core::travel::mazes::maze_at_entrance);
+                if let Some(maze) = maze {
+                    let steps = route.len();
+                    self.config.go2.pathcodes.insert(maze.name.clone(), route);
+                    if let Err(e) = self.save_config() {
+                        tracing::warn!("pathcode save failed: {e}");
+                    }
+                    self.add_system_message(&format!(
+                        "[go2] pathcode for {} captured ({steps} steps)",
+                        maze.name
+                    ));
+                } else {
+                    tracing::debug!("pathcode heard away from any maze entrance; ignored");
+                }
+            }
+
             // Transfer bounty buffer to GameState if any
             if let Some((raw_text, compact_lines)) = self.message_processor.take_bounty_buffer() {
                 self.game_state.bounty.update(raw_text, compact_lines);
@@ -2184,6 +2252,47 @@ impl AppCore {
             // Transfer pending sounds from MessageProcessor to GameState
             for sound in self.message_processor.pending_sounds.drain(..) {
                 self.game_state.queue_sound(sound);
+            }
+
+            // Attribute mapping observations to the current room uid
+            if !self.message_processor.pending_evidence.is_empty() {
+                let uid = self
+                    .nav_room_id
+                    .as_deref()
+                    .and_then(|s| s.trim().parse::<i64>().ok())
+                    .filter(|&u| u != 0);
+                for obs in self.message_processor.pending_evidence.drain(..) {
+                    if let Some(uid) = uid {
+                        self.evidence.record(
+                            uid,
+                            self.game_state.room_name.clone(),
+                            obs,
+                            self.game_state.game_time,
+                        );
+                    }
+                }
+            }
+
+            // A pathcode NPC spoke a route: persist it for the maze whose
+            // entrance we're standing at (works mid-.go2 or asked by hand).
+            if let Some(route) = self.message_processor.pending_pathcode.take() {
+                let maze = self
+                    .map
+                    .current_room_id
+                    .and_then(crate::core::travel::mazes::maze_at_entrance);
+                if let Some(maze) = maze {
+                    let steps = route.len();
+                    self.config.go2.pathcodes.insert(maze.name.clone(), route);
+                    if let Err(e) = self.save_config() {
+                        tracing::warn!("pathcode save failed: {e}");
+                    }
+                    self.add_system_message(&format!(
+                        "[go2] pathcode for {} captured ({steps} steps)",
+                        maze.name
+                    ));
+                } else {
+                    tracing::debug!("pathcode heard away from any maze entrance; ignored");
+                }
             }
 
             // Transfer bounty buffer to GameState if any

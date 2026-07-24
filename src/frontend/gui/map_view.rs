@@ -45,6 +45,8 @@ pub struct MapStyle {
     pub directional: Stroke,
     pub connector: Stroke,
     pub label: Color32,
+    /// Chip painted behind label text so it stays readable over rooms.
+    pub label_bg: Color32,
     pub current_fill: Color32,
     pub current_ring: Stroke,
 }
@@ -60,9 +62,50 @@ impl MapStyle {
             directional: Stroke::new(1.5, visuals.widgets.noninteractive.fg_stroke.color),
             connector: Stroke::new(1.0, visuals.weak_text_color()),
             label: visuals.weak_text_color(),
+            label_bg: visuals.extreme_bg_color.gamma_multiply(0.75),
             current_fill: accent,
             current_ring: Stroke::new(2.0, visuals.strong_text_color()),
         }
+    }
+}
+
+/// A text label whose paint is deferred until after the rooms. `candidates`
+/// lists alternative anchor positions in preference order; the first whose
+/// spot is free of room squares wins, so labels land in empty space instead
+/// of on rooms. The chip background is the fallback when every spot is taken.
+struct DeferredLabel {
+    candidates: Vec<Pos2>,
+    align: Align2,
+    text: String,
+    font_size: f32,
+}
+
+fn paint_deferred_labels(
+    painter: &egui::Painter,
+    labels: Vec<DeferredLabel>,
+    style: &MapStyle,
+    is_free: impl Fn(Rect) -> bool,
+) {
+    // Labels also avoid each other (short adjacent connectors would stack
+    // their labels otherwise); the first candidate + chip is the fallback.
+    let mut placed: Vec<Rect> = Vec::new();
+    for label in labels {
+        let galley = painter.layout_no_wrap(
+            label.text,
+            FontId::proportional(label.font_size),
+            style.label,
+        );
+        let mut rect = label.align.anchor_size(label.candidates[0], galley.size());
+        for candidate in &label.candidates {
+            let r = label.align.anchor_size(*candidate, galley.size());
+            if is_free(r) && !placed.iter().any(|p| p.intersects(r)) {
+                rect = r;
+                break;
+            }
+        }
+        placed.push(rect);
+        painter.rect_filled(rect.expand(2.0), 3.0, style.label_bg);
+        painter.galley(rect.min, galley, style.label);
     }
 }
 
@@ -101,6 +144,9 @@ pub fn paint_sheet(
     let show_labels = ppc >= 12.0;
     let show_connector_labels = ppc >= 14.0;
     let show_room_ids = ppc >= 20.0;
+    // Text painted after the rooms, so a label can never be buried under a
+    // room square (they used to paint in the edge pass, beneath everything).
+    let mut deferred_labels: Vec<DeferredLabel> = Vec::new();
 
     // --- Edges (under rooms) ---
     for edge in &sheet.edges {
@@ -125,17 +171,31 @@ pub fn paint_sheet(
                     ppc * 0.25,
                     ppc * 0.18,
                 ));
-                // Declutter: labels only when zoomed in and the passage is
-                // long enough that the text doesn't sit on the rooms.
-                if show_connector_labels && chebyshev_px(a, b) >= ppc * 1.9 {
+                // Labels whenever zoomed in enough to read them — short
+                // passages included ("go arch" between adjacent bank rooms);
+                // the deferred placement hunts for empty space around the
+                // line, so the old minimum-length gate is unnecessary.
+                if show_connector_labels {
                     if let Some(label) = &edge.label {
-                        painter.text(
-                            a.lerp(b, 0.5),
-                            Align2::CENTER_CENTER,
-                            label,
-                            FontId::proportional((ppc * 0.45).clamp(8.0, 13.0)),
-                            style.label,
-                        );
+                        // Slide along the line, then perpendicular of the
+                        // midpoint, hunting for a room-free spot.
+                        let perp = {
+                            let d = (b - a).normalized();
+                            Vec2::new(-d.y, d.x) * ppc * 0.75
+                        };
+                        let mid = a.lerp(b, 0.5);
+                        deferred_labels.push(DeferredLabel {
+                            candidates: vec![
+                                mid,
+                                a.lerp(b, 0.35),
+                                a.lerp(b, 0.65),
+                                mid + perp,
+                                mid - perp,
+                            ],
+                            align: Align2::CENTER_CENTER,
+                            text: label.clone(),
+                            font_size: (ppc * 0.45).clamp(8.0, 13.0),
+                        });
                     }
                 }
             }
@@ -167,13 +227,15 @@ pub fn paint_sheet(
                         Stroke::NONE,
                     ));
                     if show_labels {
-                        painter.text(
-                            tip + toward * 2.0,
-                            Align2::CENTER_CENTER,
-                            partner.to_string(),
-                            FontId::proportional((ppc * 0.45).clamp(7.0, 12.0)),
-                            style.label,
-                        );
+                        deferred_labels.push(DeferredLabel {
+                            candidates: vec![
+                                tip + toward * 2.0,
+                                tip + toward * (ppc * 0.6),
+                            ],
+                            align: Align2::CENTER_CENTER,
+                            text: partner.to_string(),
+                            font_size: (ppc * 0.45).clamp(7.0, 12.0),
+                        });
                     }
                 }
             }
@@ -190,18 +252,27 @@ pub fn paint_sheet(
             if !visible(cx, cy) {
                 continue;
             }
-            painter.text(
-                to_screen(cx, cy) - Vec2::new(room_size / 2.0, room_size),
-                Align2::LEFT_BOTTOM,
-                &label.text,
-                FontId::proportional((ppc * 0.5).clamp(9.0, 14.0)),
-                style.label,
-            );
+            // Anchored above the cluster's top-left; walk upward (then aside)
+            // until the text sits on empty cells.
+            let base = to_screen(cx, cy) - Vec2::new(room_size / 2.0, room_size);
+            deferred_labels.push(DeferredLabel {
+                candidates: vec![
+                    base,
+                    base - Vec2::new(0.0, ppc),
+                    base - Vec2::new(0.0, ppc * 2.0),
+                    base - Vec2::new(ppc, 0.0),
+                ],
+                align: Align2::LEFT_BOTTOM,
+                text: label.text.clone(),
+                font_size: (ppc * 0.5).clamp(9.0, 14.0),
+            });
         }
     }
 
     // --- Rooms ---
     let mut result = MapViewResult::default();
+    // Visible room rects, kept for label collision avoidance below.
+    let mut room_rects: Vec<Rect> = Vec::new();
     for room in &sheet.rooms {
         if group_filter.is_some_and(|set| !set.contains(&room.group)) {
             continue;
@@ -212,6 +283,7 @@ pub fn paint_sheet(
         }
         let center = to_screen(cx, cy);
         let room_rect = Rect::from_center_size(center, Vec2::splat(room_size));
+        room_rects.push(room_rect);
         let is_current = current_room == Some(room.id);
 
         if is_current {
@@ -270,6 +342,12 @@ pub fn paint_sheet(
             }
         }
     }
+
+    // --- Labels, on top and hunting for empty space (a label under a room
+    // is decoration; the chip is only the last resort) ---
+    paint_deferred_labels(&painter, deferred_labels, style, |r| {
+        !room_rects.iter().any(|room| room.intersects(r))
+    });
 
     result
 }
@@ -364,7 +442,7 @@ pub fn paint_ghosts(
         );
         if response.hovered() {
             let title = node.title.as_deref().unwrap_or("unknown room");
-            response.on_hover_text(format!("{title} — unmapped (session sketch)"));
+            response.on_hover_text(format!("{title} - unmapped (session sketch)"));
         }
     }
 }

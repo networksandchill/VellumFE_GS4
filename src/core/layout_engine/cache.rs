@@ -14,8 +14,13 @@ use super::{generate_layout, Layout};
 
 /// Bump when the algorithms change so stale cached layouts regenerate.
 /// v4: zone-sized components (catacombs) no longer weld their neighbors.
-/// v5: scene rooms carry node/supernode tags.
-pub const ENGINE_VERSION: u32 = 5;
+/// v5: classifier propagation respects decisive paths/exits majorities;
+///     hill-climb penalizes sign-violated edges; chain re-weld pass
+///     repairs rip-displaced runs.
+/// v6: try-inline pass seats clean-fitting interior buildings on the
+///     outdoor sheet instead of the shelf.
+/// v7: scene rooms carry node/supernode tags.
+pub const ENGINE_VERSION: u32 = 7;
 const FORMAT_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

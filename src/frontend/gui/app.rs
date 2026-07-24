@@ -231,6 +231,7 @@ pub struct VellumGuiApp {
     indicator_templates_editor: Option<editors::IndicatorTemplatesEditorState>,
     window_editor: Option<editors::WindowEditorState>,
     custom_windows_editor: Option<editors::CustomWindowsEditorState>,
+    doll_calibration: Option<editors::DollCalibrationState>,
     search_bar_needs_focus: bool,
     /// Cached search-bar match count: (lowercased query, content fingerprint, count).
     search_match_cache: Option<(String, u64, usize)>,
@@ -489,6 +490,7 @@ impl VellumGuiApp {
             indicator_templates_editor: None,
             window_editor: None,
             custom_windows_editor: None,
+            doll_calibration: None,
             search_bar_needs_focus: false,
             search_match_cache: None,
             available_tabs_fingerprint: None,
@@ -1025,12 +1027,76 @@ impl VellumGuiApp {
             });
         } else {
             let gap = ui.spacing().item_spacing.y;
-            let member_count = members.len() as f32;
-            let each_height = ((ui.available_height() - gap * (member_count - 1.0))
-                / member_count)
-                .max(24.0);
+            // Compact widgets (bars, timers, hands) only ever draw one row,
+            // so they get exactly that; the leftover splits among flexible
+            // members (doll, text, ...) instead of equal N-way shares that
+            // leave dead space under each bar.
+            let bar_height = ui.spacing().interact_size.y.max(16.0);
+            let natural_heights: Vec<Option<f32>> = members
+                .iter()
+                .map(|member| {
+                    match self
+                        .app_core
+                        .ui_state
+                        .windows
+                        .get(&member.window_name)
+                        .map(|window| &window.content)
+                    {
+                        Some(
+                            WindowContent::Progress(_)
+                            | WindowContent::Countdown(_)
+                            | WindowContent::Hand { .. },
+                        ) => Some(bar_height),
+                        Some(WindowContent::Betrayer)
+                            if self.app_core.game_state.betrayer.items.is_empty() =>
+                        {
+                            Some(bar_height)
+                        }
+                        Some(WindowContent::Encumbrance) => {
+                            let (show_bar, show_label) =
+                                Self::encumbrance_flags(&self.app_core, &member.window_name);
+                            let rows = (show_bar as u32 + show_label as u32).max(1) as f32;
+                            Some(bar_height * rows + gap * (rows - 1.0))
+                        }
+                        Some(WindowContent::GS4Experience) => {
+                            let (level, mind, exp_bar, total, ascension) =
+                                Self::gs4_experience_flags(&self.app_core, &member.window_name);
+                            let rows = ([level, mind, exp_bar, total, ascension]
+                                .into_iter()
+                                .filter(|on| *on)
+                                .count()
+                                .max(1)) as f32;
+                            Some(bar_height * rows + gap * (rows - 1.0))
+                        }
+                        Some(WindowContent::MiniVitals) => {
+                            use crate::frontend::gui::persistence::VitalsOrientation;
+                            let vitals = &self.ui_settings.vitals;
+                            let row = vitals.bar_height.clamp(8.0, 60.0);
+                            match vitals.orientation {
+                                VitalsOrientation::Horizontal => Some(row),
+                                VitalsOrientation::Vertical => {
+                                    let count = vitals.bars.len().max(1) as f32;
+                                    Some(row * count + gap * (count - 1.0))
+                                }
+                            }
+                        }
+                        _ => None,
+                    }
+                })
+                .collect();
+            let fixed_total: f32 = natural_heights.iter().flatten().sum();
+            let flexible_count =
+                natural_heights.iter().filter(|h| h.is_none()).count() as f32;
+            let total_gap = gap * (members.len() as f32 - 1.0);
+            let flex_height = if flexible_count > 0.0 {
+                ((ui.available_height() - total_gap - fixed_total) / flexible_count)
+                    .max(24.0)
+            } else {
+                0.0
+            };
             let width = ui.available_width().max(1.0);
-            for member in &members {
+            for (member, natural) in members.iter().zip(&natural_heights) {
+                let each_height = natural.unwrap_or(flex_height);
                 let block = ui.push_id(&member.id.key, |ui| {
                     ui.allocate_ui(Vec2::new(width, each_height), |ui| {
                         ui.set_min_size(Vec2::new(width, each_height));
@@ -1070,7 +1136,7 @@ impl VellumGuiApp {
             self.app_core.add_system_message("Skin disabled.");
             return;
         }
-        match skin::load_manifest(name) {
+        match crate::config::skins::load_manifest(name) {
             Ok(_) => {
                 self.app_core.config.active_skin = Some(name.to_string());
                 self.save_config_after_skin_change();
@@ -1078,7 +1144,7 @@ impl VellumGuiApp {
                     .add_system_message(&format!("Skin switched to: {}", name));
             }
             Err(err) => {
-                let available = skin::list_skins();
+                let available = crate::config::skins::list_skins();
                 if available.is_empty() {
                     self.app_core.add_system_message(&format!(
                         "Cannot load skin '{}': {}. No skins installed; create one under ~/.vellum-fe/skins/<name>/skin.toml",
@@ -1098,7 +1164,7 @@ impl VellumGuiApp {
 
     /// Handle `action:skins`: list installed skins in the main window.
     fn list_skins_to_window(&mut self) {
-        let available = skin::list_skins();
+        let available = crate::config::skins::list_skins();
         if available.is_empty() {
             self.app_core.add_system_message(
                 "No skins installed. Create one under ~/.vellum-fe/skins/<name>/skin.toml",
@@ -1124,7 +1190,7 @@ impl VellumGuiApp {
     /// user how to proceed. Does not activate it — a fresh scaffold is all
     /// comments, so activating it would visibly do nothing.
     fn make_skin_scaffold(&mut self, name: &str) {
-        match skin::write_scaffold(name) {
+        match crate::config::skins::write_scaffold(name) {
             Ok(path) => {
                 self.app_core.add_system_message(&format!(
                     "Created skin '{}' at {}",
@@ -2152,6 +2218,27 @@ impl VellumGuiApp {
         let mut consumed_keyboard_input = false;
 
         for key_press in key_presses {
+            // Esc cancels an active .go2 trip from anywhere in the GUI. Gated
+            // on the same text-capture modes as macro dispatch so an editor
+            // that owns the keyboard keeps its Esc semantics.
+            if key_press.key_event.code == crate::data::input::KeyCode::Esc
+                && key_press.key_event.modifiers == crate::data::input::KeyModifiers::NONE
+                && !suppress_macro_dispatch
+                && self.app_core.travel.is_traveling()
+            {
+                self.app_core.stop_travel();
+                consumed_keyboard_input = true;
+                ctx.input_mut(|input| {
+                    if let Some(logical_key) = key_press.logical_key {
+                        input.consume_key(key_press.modifiers, logical_key);
+                    }
+                    if let Some(physical_key) = key_press.physical_key {
+                        input.consume_key(key_press.modifiers, physical_key);
+                    }
+                });
+                continue;
+            }
+
             let target = Self::resolve_global_dispatch_target(
                 key_press.key_event,
                 &self.app_core.keybind_map,

@@ -2508,6 +2508,9 @@ impl TuiFrontend {
                     // Apply show toggles from config
                     gs4_exp_widget.set_show_level(data.show_level);
                     gs4_exp_widget.set_show_exp_bar(data.show_exp_bar);
+                    gs4_exp_widget.set_show_mind_bar(data.show_mind_bar);
+                    gs4_exp_widget.set_show_total_exp(data.show_total_exp);
+                    gs4_exp_widget.set_show_ascension_exp(data.show_ascension_exp);
                     // Apply custom bar colors (if configured)
                     if let Some(color_str) = &data.mind_bar_color {
                         if let Ok(c) = parse_hex_color(color_str) {
@@ -2539,20 +2542,28 @@ impl TuiFrontend {
                 // Look up the WindowDef from layout to get config
                 let window_def = window_defs.get(name.as_str()).copied();
 
-                // Get align, show_label, and color settings from WindowDef
-                let (align, show_label, color_light, color_moderate, color_heavy, color_critical) =
-                    if let Some(crate::config::WindowDef::Encumbrance { data, .. }) = window_def {
-                        (
-                            data.align.clone(),
-                            data.show_label,
-                            data.color_light.clone(),
-                            data.color_moderate.clone(),
-                            data.color_heavy.clone(),
-                            data.color_critical.clone(),
-                        )
-                    } else {
-                        ("left".to_string(), true, None, None, None, None)
-                    };
+                // Get align, show toggles, and color settings from WindowDef
+                let (
+                    align,
+                    show_label,
+                    show_bar,
+                    color_light,
+                    color_moderate,
+                    color_heavy,
+                    color_critical,
+                ) = if let Some(crate::config::WindowDef::Encumbrance { data, .. }) = window_def {
+                    (
+                        data.align.clone(),
+                        data.show_label,
+                        data.show_bar,
+                        data.color_light.clone(),
+                        data.color_moderate.clone(),
+                        data.color_heavy.clone(),
+                        data.color_critical.clone(),
+                    )
+                } else {
+                    ("left".to_string(), true, true, None, None, None, None)
+                };
 
                 // Get or create the widget
                 let enc_widget = self
@@ -2566,9 +2577,10 @@ impl TuiFrontend {
                         super::encumbrance::Encumbrance::new(&title, &align, show_label)
                     });
 
-                // Update show_label on every sync (cached widget may have stale value)
+                // Update show toggles on every sync (cached widget may have stale values)
                 enc_widget.set_show_label(show_label);
                 enc_widget.set_pill(app_core.config.ui.progress_bar_style != "flat");
+                enc_widget.set_show_bar(show_bar);
 
                 // Update show_border, show_title, border_sides on every sync
                 let show_border = window_def

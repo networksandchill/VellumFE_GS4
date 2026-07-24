@@ -1102,6 +1102,16 @@ impl VellumGuiApp {
         }
     }
 
+    /// Human-readable body part name for a hover tooltip ("leftArm" ->
+    /// "left arm"); unknown protocol keys pass through unchanged.
+    fn doll_part_display_name(part: &str) -> &str {
+        crate::config::skins::DOLL_PARTS
+            .iter()
+            .find(|(key, _, _)| key.eq_ignore_ascii_case(part))
+            .map(|(_, display, _)| *display)
+            .unwrap_or(part)
+    }
+
     /// Human-readable severity for a hover tooltip.
     fn injury_severity_text(level: u8) -> &'static str {
         match level.min(6) {
@@ -1125,8 +1135,10 @@ impl VellumGuiApp {
         injuries: &HashMap<String, u8>,
         skin_art: Option<&crate::frontend::gui::skin::SkinWidgetArt>,
     ) {
-        // Sprite mode: skin-supplied base body plus per-part severity
-        // overlays, authored on the same canvas so they stack in place.
+        // Sprite mode: skin-supplied base body, then per part either a
+        // hand-drawn severity overlay (authored on the base's canvas so it
+        // stacks in place) or a generated dot at the part's calibrated
+        // anchor point.
         if let Some(base) = skin_art.and_then(|art| art.doll_base) {
             let art = skin_art.unwrap();
             let avail = ui.available_size();
@@ -1137,6 +1149,8 @@ impl VellumGuiApp {
             let painter = ui.painter().with_clip_rect(outer);
             let dest = crate::frontend::gui::skin::sprite_dest(&base, outer);
             crate::frontend::gui::skin::paint_sprite(&painter, dest, &base, Color32::WHITE);
+            let dot_radius =
+                (art.doll_dots.diameter * dest.height() / 2.0).max(4.0);
             let mut wounds: Vec<String> = Vec::new();
             for (part, level) in injuries {
                 if *level == 0 {
@@ -1149,8 +1163,23 @@ impl VellumGuiApp {
                         &overlay,
                         Color32::WHITE,
                     );
+                } else {
+                    let anchor = art.doll_anchor(part);
+                    let center = dest.min
+                        + Vec2::new(anchor.x * dest.width(), anchor.y * dest.height());
+                    crate::frontend::gui::skin::paint_severity_dot(
+                        &painter,
+                        center,
+                        dot_radius,
+                        *level,
+                        &art.doll_dots,
+                    );
                 }
-                wounds.push(format!("{}: {}", part, Self::injury_severity_text(*level)));
+                wounds.push(format!(
+                    "{}: {}",
+                    Self::doll_part_display_name(part),
+                    Self::injury_severity_text(*level)
+                ));
             }
             if wounds.is_empty() {
                 response.on_hover_text("uninjured");
@@ -1413,7 +1442,8 @@ impl VellumGuiApp {
 
         // Unmapped interiors: session ghost sketches hang off their anchor
         // room; standing in one moves the camera and the current ring to it.
-        let ghost_overlay = (!map.ghosts().is_empty()).then(|| {
+        // Rendered only in cartography mode — everyday play shows mapdb truth.
+        let ghost_overlay = (app_core.config.map.mapping_mode && !map.ghosts().is_empty()).then(|| {
             crate::core::ghost_rooms::build_overlay(
                 map.ghosts(),
                 scene,
@@ -1478,7 +1508,7 @@ impl VellumGuiApp {
             if let Some(db) = map.mapdb() {
                 let done = task.rooms_total().saturating_sub(task.rooms_remaining());
                 let label = format!(
-                    "→ {} · {}/{} rooms · ETA {}",
+                    "-> {} | {}/{} rooms | ETA {}",
                     task.destination,
                     done,
                     task.rooms_total(),
@@ -1799,6 +1829,7 @@ impl VellumGuiApp {
         hand_prefix: &str,
         item: &Option<String>,
         link: &Option<LinkData>,
+        skin_art: Option<&crate::frontend::gui::skin::SkinWidgetArt>,
     ) -> Option<GuiLinkClick> {
         let empty_text = if hand_prefix == "S" { "None" } else { "Empty" };
         let item_text = item
@@ -1812,6 +1843,14 @@ impl VellumGuiApp {
             "S" => "[S]",
             _ => "[?]",
         };
+        // Skin sprite for this hand (icons table: lefthand/righthand/spellhand);
+        // without one the bracket text stays.
+        let icon_id = match hand_prefix {
+            "L" => "lefthand",
+            "R" => "righthand",
+            _ => "spellhand",
+        };
+        let icon_sprite = skin_art.and_then(|art| art.icon(icon_id));
         // Keep hand rows compact and content-sized so they don't request full window width.
         let display_text = if item_text.chars().count() > 56 {
             let mut truncated: String = item_text.chars().take(53).collect();
@@ -1835,10 +1874,24 @@ impl VellumGuiApp {
         let mut clicked_link = None;
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 0.0;
-            ui.add_sized(
-                [icon_width, row_height],
-                egui::Label::new(RichText::new(icon_text).monospace().strong()),
-            );
+            if let Some(sprite) = icon_sprite {
+                let (rect, _) = ui.allocate_exact_size(
+                    Vec2::new(icon_width, row_height),
+                    egui::Sense::hover(),
+                );
+                let dest = crate::frontend::gui::skin::sprite_dest(&sprite, rect);
+                crate::frontend::gui::skin::paint_sprite(
+                    ui.painter(),
+                    dest,
+                    &sprite,
+                    Color32::WHITE,
+                );
+            } else {
+                ui.add_sized(
+                    [icon_width, row_height],
+                    egui::Label::new(RichText::new(icon_text).monospace().strong()),
+                );
+            }
             ui.add_space(icon_gap);
             let text_width = (ui.available_width() - handle_gutter_width).max(1.0);
             if let Some(link_data) = item_link {
@@ -1877,22 +1930,82 @@ impl VellumGuiApp {
         clicked_link
     }
 
+    /// Per-window field toggles for the gs4_experience widget, from its
+    /// layout def: (level, mind bar, exp bar, total exp, ascension exp).
+    /// Missing def falls back to the widget's classic three-line look.
+    pub(super) fn gs4_experience_flags(
+        app_core: &AppCore,
+        window_name: &str,
+    ) -> (bool, bool, bool, bool, bool) {
+        match app_core
+            .layout
+            .windows
+            .iter()
+            .find(|w| w.name() == window_name)
+        {
+            Some(crate::config::WindowDef::GS4Experience { data, .. }) => (
+                data.show_level,
+                data.show_mind_bar,
+                data.show_exp_bar,
+                data.show_total_exp,
+                data.show_ascension_exp,
+            ),
+            _ => (true, true, true, false, false),
+        }
+    }
+
+    /// Per-window field toggles for the encum widget: (bar, blurb text).
+    pub(super) fn encumbrance_flags(app_core: &AppCore, window_name: &str) -> (bool, bool) {
+        match app_core
+            .layout
+            .windows
+            .iter()
+            .find(|w| w.name() == window_name)
+        {
+            Some(crate::config::WindowDef::Encumbrance { data, .. }) => {
+                (data.show_bar, data.show_label)
+            }
+            _ => (true, true),
+        }
+    }
+
+    /// Group digits in threes: 1234567 -> "1,234,567".
+    fn format_thousands(value: u64) -> String {
+        let digits = value.to_string();
+        let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+        for (i, ch) in digits.chars().enumerate() {
+            if i > 0 && (digits.len() - i) % 3 == 0 {
+                out.push(',');
+            }
+            out.push(ch);
+        }
+        out
+    }
+
     pub(super) fn render_gs4_experience_content(
         app_core: &AppCore,
         ui: &mut egui::Ui,
+        window_name: &str,
         settings: &WidgetRenderSettings,
     ) {
         let exp = &app_core.game_state.gs4_experience;
-        if exp.level_text.is_empty() && exp.mind_state_text.is_empty() && exp.next_level_text.is_empty() {
+        if exp.level_text.is_empty()
+            && exp.mind_state_text.is_empty()
+            && exp.next_level_text.is_empty()
+            && exp.exp.is_none()
+            && exp.ascension_exp.is_none()
+        {
             ui.weak("No experience data yet.");
             return;
         }
 
-        if !exp.level_text.is_empty() {
+        let (show_level, show_mind_bar, show_exp_bar, show_total_exp, show_ascension_exp) =
+            Self::gs4_experience_flags(app_core, window_name);
+        if show_level && !exp.level_text.is_empty() {
             ui.label(RichText::new(&exp.level_text).strong());
         }
         let bar_height = ui.spacing().interact_size.y.max(16.0);
-        if !exp.mind_state_text.is_empty() {
+        if show_mind_bar && !exp.mind_state_text.is_empty() {
             let fraction =
                 Self::animated_fraction(ui, "gs4_mind", exp.mind_state_value.min(100) as f32 / 100.0);
             let bar = Self::styled_progress_bar(
@@ -1904,7 +2017,7 @@ impl VellumGuiApp {
             );
             ui.add_sized([ui.available_width().max(40.0), bar_height], bar);
         }
-        if !exp.next_level_text.is_empty() {
+        if show_exp_bar && !exp.next_level_text.is_empty() {
             let fraction =
                 Self::animated_fraction(ui, "gs4_next", exp.next_level_value.min(100) as f32 / 100.0);
             let bar = Self::styled_progress_bar(
@@ -1915,6 +2028,16 @@ impl VellumGuiApp {
                 format!("Next: {}", exp.next_level_text),
             );
             ui.add_sized([ui.available_width().max(40.0), bar_height], bar);
+        }
+        if show_total_exp {
+            if let Some(total) = exp.exp {
+                ui.label(format!("Exp: {}", Self::format_thousands(total)));
+            }
+        }
+        if show_ascension_exp {
+            if let Some(ascension) = exp.ascension_exp {
+                ui.label(format!("Ascension: {}", Self::format_thousands(ascension)));
+            }
         }
     }
 
@@ -1941,25 +2064,29 @@ impl VellumGuiApp {
     pub(super) fn render_encumbrance_content(
         app_core: &AppCore,
         ui: &mut egui::Ui,
+        window_name: &str,
         settings: &WidgetRenderSettings,
     ) {
         let enc = &app_core.game_state.encumbrance;
-        let value = enc.value.min(100);
-        let fill = match value {
-            0..=33 => Color32::from_rgb(0x55, 0xb8, 0x6c),
-            34..=66 => Color32::from_rgb(0xff, 0x88, 0x00),
-            _ => Color32::from_rgb(0xcd, 0x4d, 0x4d),
-        };
-        let text = if enc.text.is_empty() {
-            format!("Encumbrance: {}%", value)
-        } else {
-            format!("Encumbrance: {}", enc.text)
-        };
-        let bar_height = ui.spacing().interact_size.y.max(16.0);
-        let fraction = Self::animated_fraction(ui, "encumbrance", value as f32 / 100.0);
-        let bar = Self::styled_progress_bar(ui, settings, fraction, fill, text);
-        ui.add_sized([ui.available_width().max(40.0), bar_height], bar);
-        if !enc.blurb.is_empty() {
+        let (show_bar, show_label) = Self::encumbrance_flags(app_core, window_name);
+        if show_bar {
+            let value = enc.value.min(100);
+            let fill = match value {
+                0..=33 => Color32::from_rgb(0x55, 0xb8, 0x6c),
+                34..=66 => Color32::from_rgb(0xff, 0x88, 0x00),
+                _ => Color32::from_rgb(0xcd, 0x4d, 0x4d),
+            };
+            let text = if enc.text.is_empty() {
+                format!("Encumbrance: {}%", value)
+            } else {
+                format!("Encumbrance: {}", enc.text)
+            };
+            let bar_height = ui.spacing().interact_size.y.max(16.0);
+            let fraction = Self::animated_fraction(ui, "encumbrance", value as f32 / 100.0);
+            let bar = Self::styled_progress_bar(ui, settings, fraction, fill, text);
+            ui.add_sized([ui.available_width().max(40.0), bar_height], bar);
+        }
+        if show_label && !enc.blurb.is_empty() {
             ui.weak(&enc.blurb);
         }
     }
@@ -2741,7 +2868,7 @@ impl VellumGuiApp {
                         let hover = if time.is_empty() {
                             effect.text.clone()
                         } else {
-                            format!("{} — {}", effect.text, time)
+                            format!("{} - {}", effect.text, time)
                         };
                         response.on_hover_text(hover);
                     }
@@ -3581,7 +3708,13 @@ impl VellumGuiApp {
                 } else {
                     "S"
                 };
-                Self::render_hand_content(ui, hand_prefix, item, link)
+                Self::render_hand_content(
+                    ui,
+                    hand_prefix,
+                    item,
+                    link,
+                    settings.skin_art.as_deref(),
+                )
             }
             WindowContent::TabbedText(tabbed) => {
                 let mut clicked_link =
@@ -3697,7 +3830,7 @@ impl VellumGuiApp {
                 None
             }
             WindowContent::GS4Experience => {
-                Self::render_gs4_experience_content(app_core, ui, &settings);
+                Self::render_gs4_experience_content(app_core, ui, &tab.window_name, &settings);
                 None
             }
             WindowContent::Experience => {
@@ -3705,7 +3838,7 @@ impl VellumGuiApp {
                 None
             }
             WindowContent::Encumbrance => {
-                Self::render_encumbrance_content(app_core, ui, &settings);
+                Self::render_encumbrance_content(app_core, ui, &tab.window_name, &settings);
                 None
             }
             WindowContent::Betrayer => {

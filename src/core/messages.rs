@@ -109,6 +109,16 @@ pub struct MessageProcessor {
     /// Pending sounds from highlight processing (to be transferred to GameState)
     pub pending_sounds: Vec<super::highlight_engine::SoundTrigger>,
 
+    /// Mapping observations parsed off the main stream (forage sense, ranger
+    /// sense). AppCore drains these and attributes them to the current room
+    /// uid — the processor has no room context, same split as sounds.
+    pub pending_evidence: Vec<super::evidence::Observation>,
+
+    /// A maze route heard from a pathcode NPC ("Your route is: ...").
+    /// AppCore attributes it to the maze whose entrance we're standing at
+    /// and persists it under that maze's name.
+    pub pending_pathcode: Option<Vec<String>>,
+
     /// Saved dialog positions for persistence across sessions
     pub saved_dialog_positions: SavedDialogPositions,
 
@@ -202,6 +212,8 @@ impl MessageProcessor {
             newly_registered_container: None,
             pending_webui_handshake: None,
             pending_sounds: Vec::new(),
+            pending_evidence: Vec::new(),
+            pending_pathcode: None,
             saved_dialog_positions,
             bounty_buffer: None,
             society_buffer: Vec::new(),
@@ -403,6 +415,15 @@ impl MessageProcessor {
                 *nav_room_id = Some(id.clone());
                 *room_window_dirty = true;
                 tracing::debug!("Room ID updated: {}", id);
+            }
+            ParsedElement::RoomMeta { attrs } => {
+                self.chunk_has_silent_updates = true;
+                if game_state
+                    .room_meta
+                    .update_from_attrs(attrs.iter().map(|(n, v)| (n.as_str(), v.as_str())))
+                {
+                    tracing::debug!("roommeta update: {:?}", game_state.room_meta);
+                }
             }
             ParsedElement::StreamPush { id } => {
                 self.flush_current_stream_with_tts(ui_state, tts_manager.as_deref_mut());
@@ -1024,6 +1045,8 @@ impl MessageProcessor {
                 }
 
                 // Update GS4 experience state for expr dialog elements
+                // (the exact-exp attributes on the mindState bar arrive as a
+                // separate MindStateExp element right after this one)
                 match id.as_str() {
                     "mindState" => {
                         game_state.gs4_experience.update_mind_state(*value, text.clone());
@@ -1036,6 +1059,28 @@ impl MessageProcessor {
                     }
                     _ => {}
                 }
+            }
+            ParsedElement::MindStateExp {
+                field_exp,
+                max_field_exp,
+                exp,
+                ascension_exp,
+                until_next,
+                fashlonae,
+                lumnis,
+                rpa,
+            } => {
+                self.chunk_has_silent_updates = true;
+                game_state.gs4_experience.update_exp_attrs(
+                    *field_exp,
+                    *max_field_exp,
+                    *exp,
+                    *ascension_exp,
+                    *until_next,
+                    *fashlonae,
+                    *lumnis,
+                    *rpa,
+                );
             }
             ParsedElement::Label { id, value } => {
                 self.chunk_has_silent_updates = true;
@@ -2483,6 +2528,22 @@ impl MessageProcessor {
             );
             self.current_segments.clear();
             return; // Discard line completely
+        }
+
+        // Mapping evidence capture (forage sense / ranger sense responses on
+        // the main stream). Cheap: a few substring checks per line.
+        if self.current_stream == "main" {
+            if let Some(items) = crate::core::evidence::parse_forage_line(&full_text) {
+                self.pending_evidence
+                    .push(crate::core::evidence::Observation::Forage(items));
+            } else if let Some(data) = crate::core::evidence::parse_sense_line(&full_text) {
+                self.pending_evidence
+                    .push(crate::core::evidence::Observation::Sense(data));
+            } else if let Some(route) =
+                crate::core::travel::mazes::parse_pathcode_line(&full_text)
+            {
+                self.pending_pathcode = Some(route);
+            }
         }
 
         // Check for redirect match (after squelch, as squelch takes precedence)

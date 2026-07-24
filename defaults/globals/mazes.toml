@@ -1,0 +1,24 @@
+# Curated maze definitions - regions where the mapdb's movement edges are
+# junk (the game scrambles or gates movement) and go2 must use a special
+# strategy instead of walking edges. Shipped entries are maintained with
+# the app; a ~/.vellum-fe/mazes.toml can add or replace entries by name.
+#
+# Fields:
+#   name     - stable identifier (pathcodes are stored under this key)
+#   type     - strategy; only "pathcode" is implemented so far
+#   rooms    - mapdb room ids inside the maze (movement scrambles here)
+#   start    - room the route is walked from
+#   entrance - room just outside where the pathcode NPC stands
+#   inside   - far-side anchor room the route lands at; destinations
+#              reachable from it are "behind" this maze, so planning
+#              routes to the entrance when no direct path exists
+#   ask      - command that makes the NPC reveal your personal route
+
+[[maze]]
+name = "ranger-guild-mist-harbor"
+type = "pathcode"
+rooms = [15606, 19415, 20889, 20890, 20891, 20892, 20893, 20894, 20997, 20998]
+start = 15606
+entrance = 20886
+inside = 30870
+ask = "ask beyor about path"
