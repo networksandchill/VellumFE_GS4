@@ -63,7 +63,8 @@ port.
 ## Playing from the Browser
 
 - **Read the game** live, with streams as filter chips (unread badges;
-  long-press a chip to reorder — remembered per device).
+  long-press a chip to reorder — the order follows your character across
+  devices).
 - **Send commands** — identical to typing at the PC, including
   dot-commands. With a keyboard, Up/Down browse command history; the ↻
   button resends the last command, and long-pressing it opens a history
@@ -107,7 +108,56 @@ The gear button (also reachable from the login screen) opens Settings:
   contrast, parchment), show/hide toggles for every piece of chrome
   (macro bar, compass, vitals, hands, RT label, effect pills, chips),
   and opacity sliders for floating buttons, drawers, and bottom sheets.
-  The **Aa** button sets story text from 6 to 24 px. All per-device.
+  The **Aa** button sets story text from 6 to 24 px. Theme, text size,
+  and chip order **roam with your character** (the profile value wins on
+  connect); the chrome toggles and opacities stay per-device.
+- **Speech** — read incoming lines aloud with the browser's speech
+  synthesis, with per-stream toggles (thoughts on by default). Voice
+  availability depends on the phone; the first utterance may need a tap.
+- **Controller** — pair a gamepad (Backbone, Kishi, Bluetooth Xbox or
+  PlayStation, MFi): the left stick walks the 8 compass directions,
+  the right stick scrolls the story, and the d-pad defaults to
+  `up`/`down`/`out` with left running `.portal`; `look` sits on South.
+  Bind a button to `shift` for a second bank while held. All
+  rebindable here — tap a row, or press the button on the pad to jump
+  to it. The pad also **rumbles** on chosen streams (whispers and
+  deaths by default; toggles in this sheet). Whenever a bottom sheet
+  is open — context menus, tap-to-target — the d-pad navigates it:
+  up/down move, South taps, East closes. Per-device.
+
+  Hold a button bound to `wheel` (R2 by default) for the **radial
+  command wheel** — the same wheel the desktop GUI shows, defined once
+  in the host's `keybinds.toml`, wedge widths, ring rotation and
+  per-slice aim floors included: aim a slice with the free stick (the
+  one that isn't walking), release to fire it; South opens a folder
+  slice, East backs up a level. `wheel:<name>` opens a named wheel — and `wheel:portals`
+  (R3 by default) is always available, its slices built live from the
+  current room's noun exits (go gate, climb ladder). Buttons can also run
+  client-side **UI actions** instead of game commands: `left_panel` /
+  `right_panel` toggle the drawers, `map` the map overlay, `interact`
+  toggles interact mode, and `effects`, `settings`, `appearance`,
+  `speech`, `controller` open those sheets (which the d-pad then
+  navigates).
+
+- **Interact mode** — the desktop focus cycle, phone-sized: the ◎
+  button (or a pad button bound to `interact`; Start by default)
+  opens a bar that walks the room's **Creatures / Objects / Players /
+  Exits**. On a pad the **right stick** does the cycling — up/down
+  switch categories, left/right step entities — and **South** selects:
+  the entity's server context menu (the usual bottom sheet, which the
+  d-pad navigates) or walking the exit. Everything else keeps its
+  binds: the left stick still walks, the d-pad still runs its
+  commands, and West/North/East (plus the whole shift bank) fire
+  their macros — with `<target_id>` / `<target_noun>` filled from the
+  focused entity at press time, so `target #<target_id>\rincant 611`
+  on a face button casts at whatever the ring is on. Close the mode
+  with its toggle or the ✕ (walking an exit closes it too). On
+  screen, the bar has category/entity arrows plus **Go**. Focus
+  follows the entity by id, so room churn doesn't steal it.
+- **Sound alerts / login music** — browser playback toggles.
+- **Client settings (saved on host)** — the full desktop settings
+  registry over the wire: every setting, editable at character or global
+  scope, saved on the hosting machine exactly as if edited there.
 - **Highlight editor** — add/edit highlight rules with color pickers, a
   sound dropdown, and a live preview; fields the form doesn't cover
   (redirects, squelch, ...) are preserved for desktop editing.

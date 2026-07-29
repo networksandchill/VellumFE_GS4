@@ -17,14 +17,39 @@ pub struct WebUiHandshake {
     /// "ok", "disabled", or "stopped"
     pub status: String,
     pub port: u16,
-    /// Landing page URL, e.g. "http://127.0.0.1:51423/"
+    /// Landing page URL. Loopback for a local Lich
+    /// ("http://127.0.0.1:51423/"); a reachable LAN/VPN address when Lich
+    /// runs elsewhere, e.g. in a container ("http://192.168.86.4:8200/").
     pub url: String,
-    /// Tokenized auth URL: "http://127.0.0.1:51423/auth?token=<64 hex>"
+    /// Tokenized auth URL: "<url>auth?token=<64 hex>"
     pub auth: String,
     pub schema: u32,
 }
 
 impl WebUiHandshake {
+    /// Host and port to dial, taken from the `url` attribute — Lich builds
+    /// it as an address reachable from the FE (loopback normally, the LAN
+    /// address for a containerized Lich). Falls back to loopback + the
+    /// `port` attribute when `url` is absent or unparseable, and to the
+    /// `port` attribute when the url carries no explicit port.
+    pub fn endpoint(&self) -> (String, u16) {
+        let fallback = || ("127.0.0.1".to_string(), self.port);
+        let Some((_, rest)) = self.url.split_once("://") else {
+            return fallback();
+        };
+        let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+        if authority.is_empty() {
+            return fallback();
+        }
+        match authority.rsplit_once(':') {
+            Some((host, port)) if !host.is_empty() => match port.parse() {
+                Ok(port) => (host.to_string(), port),
+                Err(_) => fallback(),
+            },
+            _ => (authority.to_string(), self.port),
+        }
+    }
+
     /// Extracts the auth token from the auth URL. The token doubles as the
     /// value of the `lich_webui` cookie, so a native client can skip the
     /// HTTP /auth round-trip and present the cookie directly.
@@ -149,6 +174,12 @@ pub struct WebUiNode {
     pub headings: Option<Vec<String>>,
     #[serde(default)]
     pub rows: Option<Vec<Vec<String>>>,
+
+    // textarea
+    /// Visible-height hint in text rows (a distinct wire field from the
+    /// table's `rows` so both stay simply typed).
+    #[serde(default)]
+    pub rows_hint: Option<u32>,
     #[serde(default)]
     pub sortable: Option<bool>,
     #[serde(default)]
@@ -165,6 +196,11 @@ pub struct WebUiNode {
     pub compact: Option<bool>,
     #[serde(default)]
     pub weights: Option<Vec<f32>>,
+
+    // grid (aligned matrix of `cell` children, row-major)
+    /// Column count; rows = ceil(children / cols)
+    #[serde(default)]
+    pub cols: Option<u32>,
 
     // tabs
     #[serde(default)]
@@ -299,6 +335,11 @@ pub struct WebUiPanelContent {
     pub page_id: String,
     /// Display title (descriptor title, falls back to page id)
     pub title: String,
+    /// Author embedding hint from the page descriptor, remembered here
+    /// because the descriptor is gone from the registry by the time the
+    /// page closes. `Some("panel")` = persistent (keep the window on page
+    /// end, it auto-resumes); anything else = transient (auto-close).
+    pub kind: Option<String>,
     /// Latest component tree; None until the first render arrives
     pub tree: Option<WebUiNode>,
     /// Last applied render sequence (stale/out-of-order renders are dropped)
@@ -336,6 +377,54 @@ mod tests {
             schema: 1,
         };
         assert_eq!(hs.token(), Some("abc123def"));
+    }
+
+    #[test]
+    fn endpoint_prefers_url_authority() {
+        // Local Lich: loopback url.
+        let hs = WebUiHandshake {
+            status: "ok".into(),
+            port: 51423,
+            url: "http://127.0.0.1:51423/".into(),
+            auth: "http://127.0.0.1:51423/auth?token=abc".into(),
+            schema: 1,
+        };
+        assert_eq!(hs.endpoint(), ("127.0.0.1".to_string(), 51423));
+
+        // Containerized Lich: url carries the reachable LAN address, and its
+        // port wins even if docker remapped it away from the `port` attr.
+        let hs = WebUiHandshake {
+            url: "http://192.168.86.4:8200/".into(),
+            port: 51423,
+            ..hs
+        };
+        assert_eq!(hs.endpoint(), ("192.168.86.4".to_string(), 8200));
+
+        // Hostname without an explicit port: keep the port attribute.
+        let hs = WebUiHandshake {
+            url: "http://lich.tailnet.ts.net/".into(),
+            port: 8200,
+            ..hs
+        };
+        assert_eq!(hs.endpoint(), ("lich.tailnet.ts.net".to_string(), 8200));
+    }
+
+    #[test]
+    fn endpoint_falls_back_to_loopback() {
+        let hs = WebUiHandshake {
+            status: "ok".into(),
+            port: 51423,
+            url: String::new(),
+            auth: String::new(),
+            schema: 1,
+        };
+        assert_eq!(hs.endpoint(), ("127.0.0.1".to_string(), 51423));
+
+        let hs = WebUiHandshake {
+            url: "not a url".into(),
+            ..hs
+        };
+        assert_eq!(hs.endpoint(), ("127.0.0.1".to_string(), 51423));
     }
 
     #[test]
@@ -433,6 +522,45 @@ mod tests {
         assert_eq!(markers[0].kind.as_deref(), Some("current"));
         assert_eq!(markers[0].x2, 54.0);
         assert_eq!(markers[1].label, None);
+    }
+
+    #[test]
+    fn parses_grid_node_sample() {
+        // Spec sample from lich5-docker/docs/webui-grid-node.md: 3-col,
+        // 6-cell matrix of unlabeled checkboxes under a text header cell.
+        let raw = include_str!("../../tests/data/webui-grid-node-sample.json");
+        let node: WebUiNode = serde_json::from_str(raw).unwrap();
+        assert_eq!(node.t, "grid");
+        assert_eq!(node.cols, Some(3));
+        assert_eq!(node.children().len(), 6);
+        assert_eq!(node.children()[0].t, "cell");
+        assert_eq!(node.children()[0].children()[0].t, "text");
+        let checkbox = &node.children()[2].children()[0];
+        assert_eq!(checkbox.t, "checkbox");
+        assert_eq!(checkbox.checked, Some(true));
+        assert_eq!(checkbox.label.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn textarea_rows_hint_is_distinct_from_table_rows() {
+        // textarea emits rows_hint (int); table keeps rows (arrays) - two
+        // separate wire fields by design, both simply typed.
+        let ta: WebUiNode = serde_json::from_str(
+            r#"{ "t": "textarea", "cid": "textarea:notes", "label": "Notes",
+                 "value": "line one\nline two", "placeholder": "...", "rows_hint": 5 }"#,
+        )
+        .unwrap();
+        assert_eq!(ta.rows_hint, Some(5));
+        assert!(ta.rows.is_none());
+        assert_eq!(ta.value_str(), Some("line one\nline two"));
+
+        let table: WebUiNode = serde_json::from_str(
+            r#"{ "t": "table", "cid": "table:0", "headings": ["A"],
+                 "rows": [["1"],["2"]] }"#,
+        )
+        .unwrap();
+        assert_eq!(table.rows.as_ref().unwrap().len(), 2);
+        assert_eq!(table.rows_hint, None);
     }
 
     #[test]

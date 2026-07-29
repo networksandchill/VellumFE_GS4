@@ -28,6 +28,11 @@ pub(super) struct MainWindowRectSnapshot {
     pub(super) key: TabKey,
     /// [x, y, width, height] in points
     pub(super) rect: [f32; 4],
+    /// Sidebar stacks only: desired empty space above this window, in
+    /// points (free vertical placement). Defaults to 0 so layouts saved
+    /// before the field existed load unchanged.
+    #[serde(default)]
+    pub(super) gap_above: f32,
 }
 
 /// Everything a persisted layout file restores, reconciled against the tabs
@@ -37,6 +42,7 @@ pub(super) struct MainWindowRectSnapshot {
 pub(super) struct RestoredLayoutState {
     pub(super) hidden_tabs: HashSet<TabKey>,
     pub(super) main_window_rects: HashMap<TabKey, [f32; 4]>,
+    pub(super) sidebar_gap_above: HashMap<TabKey, f32>,
     pub(super) tab_zones: HashMap<TabKey, GuiShellZone>,
     pub(super) no_title_tabs: HashSet<TabKey>,
     pub(super) shell_layout: ShellLayoutSnapshot,
@@ -87,6 +93,18 @@ impl VellumGuiApp {
             })
             .unwrap_or_default();
         main_window_rects.retain(|key, _| available_tabs.contains_key(key));
+        let sidebar_gap_above: HashMap<TabKey, f32> = snapshot
+            .as_ref()
+            .map(|snapshot| {
+                snapshot
+                    .main_window_rects
+                    .iter()
+                    .filter(|entry| available_tabs.contains_key(&entry.key))
+                    .filter(|entry| entry.gap_above.is_finite() && entry.gap_above > 0.0)
+                    .map(|entry| (entry.key.clone(), entry.gap_above))
+                    .collect()
+            })
+            .unwrap_or_default();
         let mut tab_zones = snapshot
             .as_ref()
             .map(|snapshot| {
@@ -147,6 +165,7 @@ impl VellumGuiApp {
         RestoredLayoutState {
             hidden_tabs,
             main_window_rects,
+            sidebar_gap_above,
             tab_zones,
             no_title_tabs,
             shell_layout,
@@ -195,10 +214,13 @@ impl VellumGuiApp {
         let min_h = MIN_DOCKED_WINDOW_HEIGHT.min(bounds_h);
         let width = rect.width().clamp(min_w, bounds_w);
         let height = rect.height().clamp(min_h, bounds_h);
+        // Bounds can be narrower than the minimum window size (or inverted,
+        // e.g. a center zone squeezed below zero width); f32::clamp panics
+        // when min > max, so floor the upper limits at the lower ones.
         let min_x = bounds.left();
-        let max_x = bounds.right() - width;
+        let max_x = (bounds.right() - width).max(min_x);
         let min_y = bounds.top();
-        let max_y = bounds.bottom() - height;
+        let max_y = (bounds.bottom() - height).max(min_y);
         let x = rect.min.x.clamp(min_x, max_x);
         let y = rect.min.y.clamp(min_y, max_y);
         Rect::from_min_size(Pos2::new(x, y), Vec2::new(width, height))

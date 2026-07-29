@@ -125,6 +125,16 @@ impl AppCore {
                 let clean_text =
                     macro_action.macro_text.trim_end_matches(&['\r', '\n'][..]).to_string();
 
+                // <target_id>/<target_noun> resolve against the interact
+                // focus; a targetless placeholder macro is dropped rather
+                // than sent literally.
+                let Some(clean_text) = self.substitute_interact_placeholders(clean_text) else {
+                    self.add_system_message(
+                        "Macro needs an interact-mode target (focus something first)",
+                    );
+                    return Ok(vec![]);
+                };
+
                 tracing::info!(
                     "[MACRO] Executing macro: '{}' (raw: '{}')",
                     clean_text,
@@ -234,6 +244,9 @@ impl AppCore {
             }
             KeyAction::ToggleSounds => {
                 self.config.sound.enabled = !self.config.sound.enabled;
+                // Reconcile the live player with the flipped flag, otherwise the
+                // toggle only edits config and the running player is unchanged.
+                self.apply_sound_settings();
                 let status = if self.config.sound.enabled {
                     "enabled"
                 } else {
@@ -246,6 +259,37 @@ impl AppCore {
             // Travel
             KeyAction::StopTravel => {
                 self.stop_travel();
+            }
+
+            // Interact mode (pointer-free entity focus cycling)
+            KeyAction::InteractMode => {
+                self.toggle_interact_mode();
+            }
+
+            // interact_select / menu_* are contextual controller-nav
+            // actions resolved by the gamepad layer against the current
+            // mode (activate focus, confirm/cancel/move a menu). Outside
+            // that context they mean nothing, so dispatching them is a
+            // no-op rather than an error.
+            KeyAction::InteractSelect
+            | KeyAction::MenuUp
+            | KeyAction::MenuDown
+            | KeyAction::MenuLeft
+            | KeyAction::MenuRight
+            | KeyAction::MenuCancel => {
+                tracing::debug!("interact/menu nav action is gamepad-context-only; nothing to execute");
+            }
+
+            // Controller shift modifier / wheel: state is read live by the
+            // gamepad layer; the actions do nothing when dispatched.
+            KeyAction::ControllerShift => {
+                tracing::debug!("controller_shift is a hold modifier; nothing to execute");
+            }
+            KeyAction::ControllerWheel => {
+                tracing::debug!("controller_wheel is a hold modifier; nothing to execute");
+            }
+            KeyAction::ControllerOverlay => {
+                tracing::debug!("controller_overlay toggle is handled by the GUI");
             }
 
             // TTS (Text-to-Speech) actions - Accessibility
@@ -329,10 +373,12 @@ impl AppCore {
         // Build window def from template and override geometry from UI config
         let mut window_def = self.build_perf_overlay_def();
         window_def.base_mut().name = OVERLAY_NAME.to_string();
-        window_def.base_mut().row = self.config.ui.perf_stats_y;
-        window_def.base_mut().col = self.config.ui.perf_stats_x;
-        window_def.base_mut().rows = self.config.ui.perf_stats_height.max(1);
-        window_def.base_mut().cols = self.config.ui.perf_stats_width.max(1);
+        window_def.base_mut().row = crate::data::geometry::Row::new(self.config.ui.perf_stats_y);
+        window_def.base_mut().col = crate::data::geometry::Col::new(self.config.ui.perf_stats_x);
+        window_def.base_mut().rows =
+            crate::data::geometry::Height::new(self.config.ui.perf_stats_height.max(1));
+        window_def.base_mut().cols =
+            crate::data::geometry::Width::new(self.config.ui.perf_stats_width.max(1));
 
         // Add to UI state only (does not touch layout)
         self.add_new_window(&window_def, 0, 0);
@@ -374,18 +420,18 @@ impl AppCore {
         {
             let mut base = base;
             // Override position/size with config.ui settings
-            base.row = self.config.ui.perf_stats_y;
-            base.col = self.config.ui.perf_stats_x;
-            base.rows = self.config.ui.perf_stats_height.max(1);
-            base.cols = self.config.ui.perf_stats_width.max(1);
+            base.row = crate::data::geometry::Row::new(self.config.ui.perf_stats_y);
+            base.col = crate::data::geometry::Col::new(self.config.ui.perf_stats_x);
+            base.rows = crate::data::geometry::Height::new(self.config.ui.perf_stats_height.max(1));
+            base.cols = crate::data::geometry::Width::new(self.config.ui.perf_stats_width.max(1));
             base
         } else {
             WindowBase {
                 name: "performance".to_string(),
-                row: self.config.ui.perf_stats_y,
-                col: self.config.ui.perf_stats_x,
-                rows: self.config.ui.perf_stats_height.max(1),
-                cols: self.config.ui.perf_stats_width.max(1),
+                row: crate::data::geometry::Row::new(self.config.ui.perf_stats_y),
+                col: crate::data::geometry::Col::new(self.config.ui.perf_stats_x),
+                rows: crate::data::geometry::Height::new(self.config.ui.perf_stats_height.max(1)),
+                cols: crate::data::geometry::Width::new(self.config.ui.perf_stats_width.max(1)),
                 show_border: true,
                 border_style: "single".to_string(),
                 border_sides: BorderSides::default(),
@@ -403,6 +449,9 @@ impl AppCore {
                 max_cols: None,
                 visible: true,
                 content_align: None,
+                tts_speak: false,
+                text_size: None,
+                font_family: None,
             }
         };
 
@@ -463,6 +512,7 @@ mod tests {
             bars: vec![HotbarDef {
                 name: "combat".to_string(),
                 title: None,
+                icon_size: None,
                 buttons: buttons
                     .into_iter()
                     .map(|(id, command, hotkey)| HotbarButton {
@@ -470,11 +520,7 @@ mod tests {
                         label: id.to_string(),
                         command: command.to_string(),
                         hotkey: hotkey.map(|s| s.to_string()),
-                        tooltip: None,
-                        category: None,
-                        countdown: None,
-                        states: vec![],
-                        default_style: None,
+                        ..Default::default()
                     })
                     .collect(),
             }],

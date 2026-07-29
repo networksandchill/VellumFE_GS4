@@ -36,7 +36,11 @@ fn find_topmost_window_at(app_core: &crate::core::AppCore, x: u16, y: u16) -> St
                 continue;
             }
             let pos = &window.position;
-            if x >= pos.x && x < pos.x + pos.width && y >= pos.y && y < pos.y + pos.height {
+            if x >= pos.x.get()
+                && x < pos.x.get() + pos.width.get()
+                && y >= pos.y.get()
+                && y < pos.y.get() + pos.height.get()
+            {
                 return window_name.clone();
             }
         }
@@ -48,7 +52,11 @@ fn find_topmost_window_at(app_core: &crate::core::AppCore, x: u16, y: u16) -> St
             continue;
         }
         let pos = &window.position;
-        if x >= pos.x && x < pos.x + pos.width && y >= pos.y && y < pos.y + pos.height {
+        if x >= pos.x.get()
+            && x < pos.x.get() + pos.width.get()
+            && y >= pos.y.get()
+            && y < pos.y.get() + pos.height.get()
+        {
             return name.clone();
         }
     }
@@ -59,6 +67,82 @@ fn find_topmost_window_at(app_core: &crate::core::AppCore, x: u16, y: u16) -> St
 
 // TUI-specific methods (not part of Frontend trait)
 impl TuiFrontend {
+    /// Write the in-memory color config to the profile colors.toml, matching
+    /// the GUI colors editor's persist path. Without this, spell-color and UI
+    /// color edits lived only in memory and vanished on restart or
+    /// `.reload colors`.
+    fn persist_colors(app_core: &mut crate::core::AppCore) {
+        let character = app_core.config.character.clone();
+        if let Err(err) = app_core.config.colors.save(character.as_deref()) {
+            tracing::error!("Failed to save colors: {}", err);
+            app_core.add_system_message(&format!("Failed to save colors: {}", err));
+        }
+    }
+
+    /// Apply an inline `.uicolors` edit back onto the color config. Entries
+    /// are addressed the same way the browser builds them: category "UI"
+    /// (named UiColors fields), "PRESETS" (preset map key), or "PROMPT"
+    /// ("Prompt (c)" per prompt character).
+    fn apply_ui_color_edit(
+        app_core: &mut crate::core::AppCore,
+        category: &str,
+        name: &str,
+        fg: Option<String>,
+        bg: Option<String>,
+    ) {
+        let colors = &mut app_core.config.colors;
+        match category {
+            "UI" => {
+                // UiColors fields are plain strings; "-" is the existing
+                // "unset/transparent" sentinel.
+                let value = fg.unwrap_or_else(|| "-".to_string());
+                match name {
+                    "Background" => colors.ui.background_color = value,
+                    "Border" => colors.ui.border_color = value,
+                    "Command Echo" => colors.ui.command_echo_color = value,
+                    "Focused Border" => colors.ui.focused_border_color = value,
+                    "Text" => colors.ui.text_color = value,
+                    "Text Selection" => colors.ui.selection_bg_color = value,
+                    "Textarea Background" => colors.ui.textarea_background = value,
+                    other => {
+                        tracing::warn!("Unknown UI color entry '{}'", other);
+                        return;
+                    }
+                }
+            }
+            "PRESETS" => {
+                if let Some(preset) = colors.presets.get_mut(name) {
+                    preset.fg = fg;
+                    preset.bg = bg;
+                } else {
+                    tracing::warn!("Unknown color preset '{}'", name);
+                    return;
+                }
+            }
+            "PROMPT" => {
+                let ch = name
+                    .strip_prefix("Prompt (")
+                    .and_then(|rest| rest.strip_suffix(')'))
+                    .unwrap_or(name);
+                if let Some(prompt) = colors
+                    .prompt_colors
+                    .iter_mut()
+                    .find(|p| p.character == ch)
+                {
+                    prompt.color = fg;
+                } else {
+                    tracing::warn!("Unknown prompt color '{}'", name);
+                    return;
+                }
+            }
+            other => {
+                tracing::warn!("Unknown UI color category '{}'", other);
+                return;
+            }
+        }
+        Self::persist_colors(app_core);
+    }
+
     pub(super) fn open_quickbar_switcher(
         &mut self,
         app_core: &mut crate::core::AppCore,
@@ -113,11 +197,11 @@ impl TuiFrontend {
         }
 
         let menu_height = items.len() as u16 + 2;
-        let menu_x = window_pos.x;
-        let menu_y = if window_pos.y >= menu_height {
-            window_pos.y - menu_height
+        let menu_x = window_pos.x.get();
+        let menu_y = if window_pos.y.get() >= menu_height {
+            window_pos.y.get() - menu_height
         } else {
-            window_pos.y.saturating_add(1)
+            window_pos.y.get().saturating_add(1)
         };
 
         let mut menu = PopupMenu::new(items, (menu_x, menu_y));
@@ -1378,16 +1462,16 @@ impl TuiFrontend {
                         self.widget_manager.quickbar_widgets.get_mut(&topmost_window)
                     {
                         let window_pos = window_pos.unwrap_or(crate::data::WindowPosition {
-                            x: 0,
-                            y: 0,
-                            width: 0,
-                            height: 0,
+                            x: crate::data::geometry::Col::new(0),
+                            y: crate::data::geometry::Row::new(0),
+                            width: crate::data::geometry::Width::new(0),
+                            height: crate::data::geometry::Height::new(0),
                         });
                         let rect = Rect {
-                            x: window_pos.x,
-                            y: window_pos.y,
-                            width: window_pos.width,
-                            height: window_pos.height,
+                            x: window_pos.x.get(),
+                            y: window_pos.y.get(),
+                            width: window_pos.width.get(),
+                            height: window_pos.height.get(),
                         };
                         if let Some(action) = quickbar_widget.handle_click(*x, *y, rect) {
                             app_core.needs_render = true;
@@ -1425,16 +1509,16 @@ impl TuiFrontend {
                             .get_window(&topmost_window)
                             .map(|w| w.position.clone())
                             .unwrap_or(crate::data::WindowPosition {
-                                x: 0,
-                                y: 0,
-                                width: 0,
-                                height: 0,
+                                x: crate::data::geometry::Col::new(0),
+                                y: crate::data::geometry::Row::new(0),
+                                width: crate::data::geometry::Width::new(0),
+                                height: crate::data::geometry::Height::new(0),
                             });
                         let rect = Rect {
-                            x: window_pos.x,
-                            y: window_pos.y,
-                            width: window_pos.width,
-                            height: window_pos.height,
+                            x: window_pos.x.get(),
+                            y: window_pos.y.get(),
+                            width: window_pos.width.get(),
+                            height: window_pos.height.get(),
                         };
                         if let Some(command) = bar_widget.handle_click(*x, *y, rect) {
                             app_core.needs_render = true;
@@ -1458,7 +1542,7 @@ impl TuiFrontend {
                 if let Some(window) = app_core.ui_state.get_window(&topmost_window) {
                     tracing::debug!(
                         "  Window pos: y={}, height={}, click_y={}, is_top_row={}",
-                        window.position.y, window.position.height, *y, *y == window.position.y
+                        window.position.y.get(), window.position.height.get(), *y, *y == window.position.y.get()
                     );
                     let pos = &window.position;
                     let name = &topmost_window;
@@ -1474,10 +1558,10 @@ impl TuiFrontend {
                     // Handle tabbed text tab switching on click
                     if window.widget_type == WidgetType::TabbedText {
                         let rect = Rect {
-                            x: pos.x,
-                            y: pos.y,
-                            width: pos.width,
-                            height: pos.height,
+                            x: pos.x.get(),
+                            y: pos.y.get(),
+                            width: pos.width.get(),
+                            height: pos.height.get(),
                         };
                         if let Some(new_index) =
                             self.handle_tabbed_click(name, rect, *x, *y)
@@ -1487,15 +1571,15 @@ impl TuiFrontend {
                     }
 
                     if handled_tab_click.is_none() {
-                        let right_col = pos.x + pos.width - 1;
-                        let bottom_row = pos.y + pos.height - 1;
-                        let has_horizontal_space = pos.width > 1;
+                        let right_col = pos.x.get() + pos.width.get() - 1;
+                        let bottom_row = pos.y.get() + pos.height.get() - 1;
+                        let has_horizontal_space = pos.width.get() > 1;
                         // Only use bottom row as resize handle if:
                         // 1. Window is NOT locked (locked windows can't be resized anyway)
                         // 2. Window has enough height (> 2) so there's content area between
                         //    top row (move) and bottom row (resize). For small widgets (height <= 2),
                         //    bottom row IS the content area.
-                        let can_resize_bottom = !is_window_locked && pos.height > 2;
+                        let can_resize_bottom = !is_window_locked && pos.height.get() > 2;
                         let can_resize_right = !is_window_locked;
 
                         if has_horizontal_space
@@ -1511,7 +1595,7 @@ impl TuiFrontend {
                         } else if can_resize_bottom && *y == bottom_row {
                             drag_op = Some(DragOperation::ResizeBottom);
                             found_window = Some(name.clone());
-                        } else if *y == pos.y {
+                        } else if *y == pos.y.get() {
                             drag_op = Some(DragOperation::Move);
                             found_window = Some(name.clone());
                         }
@@ -1557,10 +1641,10 @@ impl TuiFrontend {
                             if let Some(window) = app_core.ui_state.get_window(&window_name) {
                                 let pos = &window.position;
                                 let window_rect = ratatui::layout::Rect {
-                                    x: pos.x,
-                                    y: pos.y,
-                                    width: pos.width,
-                                    height: pos.height,
+                                    x: pos.x.get(),
+                                    y: pos.y.get(),
+                                    width: pos.width.get(),
+                                    height: pos.height.get(),
                                 };
 
                                 if let Some(link_data) =
@@ -1596,7 +1680,7 @@ impl TuiFrontend {
                                 operation,
                                 window_name,
                                 start_pos: (*x, *y),
-                                original_window_pos: (pos.x, pos.y, pos.width, pos.height),
+                                original_window_pos: (pos.x.get(), pos.y.get(), pos.width.get(), pos.height.get()),
                             });
                         }
                     }
@@ -1611,10 +1695,10 @@ impl TuiFrontend {
                     if let Some(window) = app_core.ui_state.get_window(&window_name) {
                         let pos = &window.position;
                         let window_rect = ratatui::layout::Rect {
-                            x: pos.x,
-                            y: pos.y,
-                            width: pos.width,
-                            height: pos.height,
+                            x: pos.x.get(),
+                            y: pos.y.get(),
+                            width: pos.width.get(),
+                            height: pos.height.get(),
                         };
 
                         tracing::debug!(
@@ -1754,75 +1838,26 @@ impl TuiFrontend {
                     if let Some(window) =
                         app_core.ui_state.get_window_mut(&drag_state.window_name)
                     {
-                        let min_width_i32 = min_width_constraint as i32;
-                        let min_height_i32 = min_height_constraint as i32;
-
-                        match drag_state.operation {
-                            DragOperation::Move => {
-                                // Calculate new position
-                                let new_x = (drag_state.original_window_pos.0 as i32
-                                    + dx)
-                                    .max(0)
-                                    as u16;
-                                let new_y = (drag_state.original_window_pos.1 as i32
-                                    + dy)
-                                    .max(0)
-                                    as u16;
-
-                                // Clamp to prevent overflow beyond terminal boundaries
-                                let max_x =
-                                    term_width.saturating_sub(window.position.width);
-                                let max_y =
-                                    term_height.saturating_sub(window.position.height);
-
-                                window.position.x = new_x.min(max_x);
-                                window.position.y = new_y.min(max_y);
-                            }
-                            DragOperation::ResizeRight => {
-                                // Calculate new width
-                                let new_width =
-                                    (drag_state.original_window_pos.2 as i32 + dx)
-                                        .max(min_width_i32)
-                                        as u16;
-
-                                // Clamp to prevent overflow beyond terminal edge
-                                let max_width =
-                                    term_width.saturating_sub(window.position.x);
-                                window.position.width = new_width.min(max_width);
-                            }
-                            DragOperation::ResizeBottom => {
-                                // Calculate new height
-                                let new_height =
-                                    (drag_state.original_window_pos.3 as i32 + dy)
-                                        .max(min_height_i32)
-                                        as u16;
-
-                                // Clamp to prevent overflow beyond terminal edge
-                                let max_height =
-                                    term_height.saturating_sub(window.position.y);
-                                window.position.height = new_height.min(max_height);
-                            }
-                            DragOperation::ResizeBottomRight => {
-                                // Calculate new dimensions
-                                let new_width =
-                                    (drag_state.original_window_pos.2 as i32 + dx)
-                                        .max(min_width_i32)
-                                        as u16;
-                                let new_height =
-                                    (drag_state.original_window_pos.3 as i32 + dy)
-                                        .max(min_height_i32)
-                                        as u16;
-
-                                // Clamp to prevent overflow beyond terminal edges
-                                let max_width =
-                                    term_width.saturating_sub(window.position.x);
-                                let max_height =
-                                    term_height.saturating_sub(window.position.y);
-
-                                window.position.width = new_width.min(max_width);
-                                window.position.height = new_height.min(max_height);
-                            }
-                        }
+                        // Geometry lives in the pure, unit-tested
+                        // apply_window_drag (data/window.rs). The original
+                        // window position at drag-start is `original_window_pos`
+                        // (x, y, width, height).
+                        let (ox, oy, ow, oh) = drag_state.original_window_pos;
+                        window.position = crate::data::window::apply_window_drag(
+                            drag_state.operation,
+                            crate::data::WindowPosition {
+                                x: crate::data::geometry::Col::new(ox),
+                                y: crate::data::geometry::Row::new(oy),
+                                width: crate::data::geometry::Width::new(ow),
+                                height: crate::data::geometry::Height::new(oh),
+                            },
+                            dx,
+                            dy,
+                            min_width_constraint,
+                            min_height_constraint,
+                            term_width,
+                            term_height,
+                        );
                         app_core.needs_render = true;
                     }
                 } else if app_core.ui_state.pending_link_click.is_some() {
@@ -1834,16 +1869,16 @@ impl TuiFrontend {
                         // Find which window we're dragging in
                         for (name, window) in &app_core.ui_state.windows {
                             let pos = &window.position;
-                            if *x >= pos.x
-                                && *x < pos.x + pos.width
-                                && *y >= pos.y
-                                && *y < pos.y + pos.height
+                            if *x >= pos.x.get()
+                                && *x < pos.x.get() + pos.width.get()
+                                && *y >= pos.y.get()
+                                && *y < pos.y.get() + pos.height.get()
                             {
                                 let window_rect = ratatui::layout::Rect {
-                                    x: pos.x,
-                                    y: pos.y,
-                                    width: pos.width,
-                                    height: pos.height,
+                                    x: pos.x.get(),
+                                    y: pos.y.get(),
+                                    width: pos.width.get(),
+                                    height: pos.height.get(),
                                 };
                                 if let Some((line, col)) = self
                                     .mouse_to_text_coords(name, *x, *y, window_rect)
@@ -1903,10 +1938,10 @@ impl TuiFrontend {
 
                         for (name, window) in &app_core.ui_state.windows {
                             let pos = &window.position;
-                            if *x >= pos.x
-                                && *x < pos.x + pos.width
-                                && *y >= pos.y
-                                && *y < pos.y + pos.height
+                            if *x >= pos.x.get()
+                                && *x < pos.x.get() + pos.width.get()
+                                && *y >= pos.y.get()
+                                && *y < pos.y.get() + pos.height.get()
                             {
                                 // First check if this is a hand widget (left or right only)
                                 if name == "left_hand" || name == "left" {
@@ -1918,10 +1953,10 @@ impl TuiFrontend {
                                 }
 
                                 let window_rect = ratatui::layout::Rect {
-                                    x: pos.x,
-                                    y: pos.y,
-                                    width: pos.width,
-                                    height: pos.height,
+                                    x: pos.x.get(),
+                                    y: pos.y.get(),
+                                    width: pos.width.get(),
+                                    height: pos.height.get(),
                                 };
 
                                 // Inventory window: check link first, fallback to wear
@@ -2076,7 +2111,7 @@ impl TuiFrontend {
                             base.cols = window.position.width;
                             base.rows = window.position.height;
                             tracing::info!("Synced mouse resize/move for '{}' to layout: pos=({},{}) size={}x{}",
-                                drag_state.window_name, base.col, base.row, base.cols, base.rows);
+                                drag_state.window_name, base.col.get(), base.row.get(), base.cols.get(), base.rows.get());
                             app_core.layout_modified_since_save = true;
                         }
 
@@ -2084,10 +2119,10 @@ impl TuiFrontend {
                         if app_core.ui_state.ephemeral_windows.contains(&drag_state.window_name) {
                             use crate::config::{Config, DialogPosition};
                             let pos = DialogPosition {
-                                x: window.position.x,
-                                y: window.position.y,
-                                width: Some(window.position.width),
-                                height: Some(window.position.height),
+                                x: window.position.x.get(),
+                                y: window.position.y.get(),
+                                width: Some(window.position.width.get()),
+                                height: Some(window.position.height.get()),
                             };
                             app_core.saved_dialog_positions.containers.insert(
                                 drag_state.window_name.clone(),
@@ -2193,8 +2228,8 @@ impl TuiFrontend {
                 // Right-click on performance overlay: show metrics toggle menu
                 if let Some(window) = app_core.ui_state.windows.get("performance_overlay") {
                     let pos = &window.position;
-                    if *x >= pos.x && *x < pos.x + pos.width
-                       && *y >= pos.y && *y < pos.y + pos.height {
+                    if *x >= pos.x.get() && *x < pos.x.get() + pos.width.get()
+                       && *y >= pos.y.get() && *y < pos.y.get() + pos.height.get() {
                         // Build performance metrics context menu
                         let items = Self::build_perf_metrics_context_menu(&app_core.config.ui);
                         app_core.ui_state.popup_menu =
@@ -2209,7 +2244,7 @@ impl TuiFrontend {
                 for (name, window) in &app_core.ui_state.windows {
                     let pos = &window.position;
                     // Check if click is on the title bar (top row of window)
-                    if *y == pos.y && *x >= pos.x && *x < pos.x + pos.width {
+                    if *y == pos.y.get() && *x >= pos.x.get() && *x < pos.x.get() + pos.width.get() {
                         // Build context menu items
                         let mut items = Vec::new();
 
@@ -2637,6 +2672,39 @@ impl TuiFrontend {
             }
             InputMode::UIColorsBrowser => {
                 if let Some(ref mut browser) = self.uicolors_browser {
+                    // The inline editor owns the keyboard while open.
+                    if browser.editor.is_some() {
+                        let ct_event = crossterm::event::KeyEvent::new(
+                            super::crossterm_bridge::to_crossterm_keycode(code),
+                            super::crossterm_bridge::to_crossterm_modifiers(modifiers),
+                        );
+                        let result = browser
+                            .editor
+                            .as_mut()
+                            .and_then(|editor| editor.handle_key(ct_event));
+                        match result {
+                            Some(super::uicolors_browser::UIColorEditorResult::Save {
+                                fg,
+                                bg,
+                            }) => {
+                                // save_editor closes the editor and reports
+                                // which entry was being edited.
+                                if let Some((category, name, _, _)) = browser.save_editor() {
+                                    Self::apply_ui_color_edit(
+                                        app_core, &category, &name, fg, bg,
+                                    );
+                                    browser.refresh(&app_core.config.colors);
+                                }
+                            }
+                            Some(super::uicolors_browser::UIColorEditorResult::Cancel) => {
+                                browser.close_editor();
+                            }
+                            None => {}
+                        }
+                        app_core.needs_render = true;
+                        return Ok(None);
+                    }
+
                     let key_event = crate::data::input::KeyEvent { code, modifiers };
                     let action = input_router::route_input(
                         &key_event,
@@ -2654,6 +2722,12 @@ impl TuiFrontend {
                         }
                         crate::core::menu_actions::MenuAction::PreviousPage => {
                             browser.previous_page()
+                        }
+                        crate::core::menu_actions::MenuAction::Select
+                        | crate::core::menu_actions::MenuAction::Edit => {
+                            let textarea_bg =
+                                app_core.config.colors.ui.textarea_background.clone();
+                            browser.open_editor(&textarea_bg);
                         }
                         crate::core::menu_actions::MenuAction::Cancel => {
                             self.uicolors_browser = None;
@@ -2712,6 +2786,7 @@ impl TuiFrontend {
                             if let Some(index) = browser.get_selected() {
                                 if index < app_core.config.colors.spell_colors.len() {
                                     app_core.config.colors.spell_colors.remove(index);
+                                    Self::persist_colors(app_core);
                                     browser
                                         .update_items(&app_core.config.colors.spell_colors);
                                     tracing::info!("Deleted spell color range at index {}", index);
@@ -2794,7 +2869,9 @@ impl TuiFrontend {
 
                     if handled {
                         // Check if this was a value change - apply to config immediately
-                        editor.apply_to_config(&mut app_core.config);
+                        for err in editor.apply_to_config(&mut app_core.config) {
+                            app_core.add_system_message(&format!("Setting rejected: {}", err));
+                        }
                         app_core.needs_render = true;
                         return Ok(None);
                     }
@@ -2802,7 +2879,9 @@ impl TuiFrontend {
                     // Check for Ctrl+S to save all settings
                     if modifiers.ctrl && matches!(code, KeyCode::Char('s') | KeyCode::Char('S')) {
                         // Apply and save all settings with their scopes
-                        editor.apply_to_config(&mut app_core.config);
+                        for err in editor.apply_to_config(&mut app_core.config) {
+                            app_core.add_system_message(&format!("Setting rejected: {}", err));
+                        }
 
                         // Get all items and save each with its scope
                         let items_to_save: Vec<_> = editor.all_items()
@@ -2835,7 +2914,9 @@ impl TuiFrontend {
                     // Handle Cancel/Escape to close editor
                     if matches!(code, KeyCode::Esc) {
                         // Apply changes to in-memory config before closing
-                        editor.apply_to_config(&mut app_core.config);
+                        for err in editor.apply_to_config(&mut app_core.config) {
+                            app_core.add_system_message(&format!("Setting rejected: {}", err));
+                        }
                         self.settings_editor = None;
                         app_core.ui_state.input_mode = InputMode::Normal;
                     }
@@ -3625,6 +3706,7 @@ impl TuiFrontend {
                                         }
 
                                         app_core.config.colors.spell_colors.push(spell_color);
+                                        Self::persist_colors(app_core);
                                         self.spell_color_form = None;
                                         app_core.ui_state.input_mode = InputMode::Normal;
                                         tracing::info!("Saved spell color range");
@@ -3634,6 +3716,7 @@ impl TuiFrontend {
                                     ) => {
                                         if index < app_core.config.colors.spell_colors.len() {
                                             app_core.config.colors.spell_colors.remove(index);
+                                            Self::persist_colors(app_core);
                                             tracing::info!("Deleted spell color range");
                                         }
                                         self.spell_color_form = None;
@@ -3669,6 +3752,7 @@ impl TuiFrontend {
                                         }
 
                                         app_core.config.colors.spell_colors.push(spell_color);
+                                        Self::persist_colors(app_core);
                                         self.spell_color_form = None;
                                         app_core.ui_state.input_mode = InputMode::Normal;
                                         tracing::info!("Saved spell color range");
@@ -3678,6 +3762,7 @@ impl TuiFrontend {
                                     ) => {
                                         if index < app_core.config.colors.spell_colors.len() {
                                             app_core.config.colors.spell_colors.remove(index);
+                                            Self::persist_colors(app_core);
                                             tracing::info!("Deleted spell color range");
                                         }
                                         self.spell_color_form = None;

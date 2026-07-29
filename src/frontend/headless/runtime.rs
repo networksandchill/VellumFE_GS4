@@ -872,6 +872,22 @@ fn handle_remote_event(
             }
             true
         }
+        RemoteEvent::WheelPick { key, path } => {
+            match app_core.wheel_pick_command(&key, &path) {
+                Some(command) => {
+                    tracing::debug!("remote wheel pick '{}' {:?}: '{}'", key, path, command);
+                    if dispatch_command(app_core, connection, command) {
+                        session_requests.push(SessionRequest::UserQuit);
+                    }
+                }
+                None => tracing::warn!(
+                    "remote wheel pick '{}' {:?} did not resolve (stale client?)",
+                    key,
+                    path
+                ),
+            }
+            true
+        }
         RemoteEvent::SessionConnect {
             profile,
             account,
@@ -933,6 +949,40 @@ fn handle_remote_event(
             rule,
         } => {
             app_core.handle_remote_highlight_put(client_id, request_id, scope, name, rule);
+            true
+        }
+        RemoteEvent::SettingsGet {
+            client_id,
+            request_id,
+        } => {
+            app_core.handle_remote_settings_get(client_id, request_id);
+            true
+        }
+        RemoteEvent::SettingsPut {
+            client_id,
+            request_id,
+            key,
+            value,
+            scope,
+            clear,
+        } => {
+            app_core.handle_remote_settings_put(client_id, request_id, key, value, scope, clear);
+            true
+        }
+        RemoteEvent::StreamsGet {
+            client_id,
+            request_id,
+        } => {
+            app_core.handle_remote_streams_get(client_id, request_id);
+            true
+        }
+        RemoteEvent::StreamsPut {
+            client_id,
+            request_id,
+            stream,
+            target,
+        } => {
+            app_core.handle_remote_streams_put(client_id, request_id, stream, target);
             true
         }
         RemoteEvent::ColorsGet {

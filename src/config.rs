@@ -22,28 +22,35 @@ mod macros;
 mod paths;
 pub mod profiles;
 pub mod skins;
+mod defaults_refresh;
 mod keybinds;
 mod layout;
+pub mod registry;
 mod settings;
+mod sparse;
 mod templates;
 mod widgets;
 mod window_def;
 
-pub use colors::{ColorConfig, PaletteColor, SpellColorRange, SpellColorStyle};
+pub use colors::{ColorConfig, PaletteColor, SpellColorRange, SpellColorStyle, UiColors};
 pub use highlights::{EventAction, EventPattern, HighlightPattern, RedirectMode};
 pub use hotbars::{
-    EffectCategory, HotbarButton, HotbarButtonState, HotbarCmp, HotbarCondition,
-    HotbarCountdownSource, HotbarDef, HotbarStyle, HotbarsConfig, NameMatch, VitalKind, VitalUnit,
+    EffectCategory, GradientDir, HotbarButton, HotbarButtonState, HotbarCmp, HotbarCondition,
+    HotbarCountdownSource, HotbarDef, HotbarIcon, HotbarStyle, HotbarsConfig, IconMode, NameMatch,
+    VitalKind, VitalUnit,
 };
 pub use keybinds::{
-    parse_key_string, AppKeybinds, KeyAction, KeyBindAction, MacroAction, MenuKeybinds,
+    parse_key_string, validate_wheel_spans, AppKeybinds, KeyAction, KeyBindAction, MacroAction,
+    MenuKeybinds, RumbleConfig, RumblePattern, TuningConfig, WheelMeta, WheelSlice, WheelSpanIssue,
+    WHEEL_MIN_SPAN_DEG,
 };
 pub use layout::{ContentAlign, Layout, LayoutConfig, LayoutMapping};
 pub use macros::{MacroButton, MacroGroup, MacroOption, MacrosConfig};
-pub use paths::{DialogPosition, SavedDialogPositions};
+pub use paths::{write_atomic, DialogPosition, SavedDialogPositions};
 pub use settings::{
     ConnectionConfig, FocusConfig, Go2Config, HighlightsConfig, LoggingConfig, MapConfig,
-    SoundConfig, StreamsConfig, TargetListConfig, TtsConfig, UiConfig, WebConfig,
+    SoundConfig, StreamRoute, StreamsConfig, TargetListConfig, TtsConfig, TtsSubstitution,
+    UiConfig, WebConfig,
 };
 pub use templates::{IndicatorTemplateEntry, IndicatorTemplateStore};
 pub use widgets::{
@@ -222,6 +229,22 @@ pub struct Config {
     pub highlights: HashMap<String, HighlightPattern>,
     #[serde(skip)] // Loaded from separate keybinds.toml file
     pub keybinds: HashMap<String, KeyBindAction>,
+    #[serde(skip)] // Loaded from [controller] section of global keybinds.toml
+    pub controller_binds: HashMap<String, KeyBindAction>,
+    #[serde(skip)] // Loaded from [controller_shift] (bindings while shift button held)
+    pub controller_shift_binds: HashMap<String, KeyBindAction>,
+    #[serde(skip)] // Loaded from [[controller_wheel]] (default radial wheel)
+    pub controller_wheel: Vec<WheelSlice>,
+    #[serde(skip)] // Loaded from [controller_wheels.<name>] (named radial wheels)
+    pub controller_wheels: HashMap<String, Vec<WheelSlice>>,
+    #[serde(skip)] // Loaded from [controller_wheels_meta.<name>] (per-wheel button/stick)
+    pub controller_wheels_meta: HashMap<String, WheelMeta>,
+    #[serde(skip)] // Loaded from [controller_overlay] (curated HUD legend entries)
+    pub controller_overlay: Vec<String>,
+    #[serde(skip)] // Loaded from [controller_rumble] (haptic event map)
+    pub controller_rumble: RumbleConfig,
+    #[serde(skip)] // Loaded from [controller_tuning] (input-feel tuning)
+    pub controller_tuning: TuningConfig,
     #[serde(skip)] // Loaded from separate hotbars.toml file
     pub hotbars: HotbarsConfig,
     #[serde(skip)] // Loaded from [app] section of keybinds.toml
@@ -358,12 +381,12 @@ fn default_true() -> bool {
     true
 }
 
-fn default_rows() -> u16 {
-    1
+fn default_rows() -> crate::data::geometry::Height {
+    crate::data::geometry::Height::new(1)
 }
 
-fn default_cols() -> u16 {
-    1
+fn default_cols() -> crate::data::geometry::Width {
+    crate::data::geometry::Width::new(1)
 }
 
 fn default_show_border() -> bool {
@@ -387,7 +410,7 @@ fn default_port() -> u16 {
 }
 
 fn default_buffer_size() -> usize {
-    1000
+    10_000
 }
 
 fn default_command_echo_color() -> String {

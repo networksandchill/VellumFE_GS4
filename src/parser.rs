@@ -73,6 +73,8 @@ pub enum ParsedElement {
         fg_color: Option<String>,
         bg_color: Option<String>,
         bold: bool,
+        /// Inside an `<output class="mono"/>` region: render monospace.
+        mono: bool,
         span_type: SpanType,
         link_data: Option<LinkData>,
     },
@@ -99,6 +101,13 @@ pub enum ParsedElement {
     },
     CastTime {
         value: u32,
+    },
+    /// `<vellumTimer id='...' value='...'/>` - VellumFE extension for
+    /// script-driven countdowns. `id` names the countdown feed id, `value`
+    /// is the absolute epoch end time in seconds (0 or past clears).
+    VellumTimer {
+        id: String,
+        value: i64,
     },
     ProgressBar {
         id: String,
@@ -315,6 +324,10 @@ pub struct XmlParser {
     pub(crate) preset_stack: Vec<ColorStyle>,
     pub(crate) style_stack: Vec<ColorStyle>,
     pub(crate) bold_stack: Vec<bool>,
+    /// Inside an `<output class="mono"/>` region (game tables/ASCII art);
+    /// cleared by `<output class=""/>`. Stamped onto text so the GUI can
+    /// render these spans in its monospace font.
+    pub(crate) mono_output: bool,
 
     // Semantic type tracking
     pub(crate) link_depth: usize,                   // Track nested links
@@ -378,6 +391,7 @@ impl XmlParser {
             preset_stack: vec![],
             style_stack: vec![],
             bold_stack: vec![],
+            mono_output: false,
             link_depth: 0,
             spell_depth: 0,
             current_link_data: None,
@@ -644,6 +658,8 @@ impl XmlParser {
             self.handle_roundtime(tag, elements);
         } else if tag.starts_with("<castTime ") {
             self.handle_casttime(tag, elements);
+        } else if tag.starts_with("<vellumTimer ") {
+            self.handle_vellum_timer(tag, elements);
         } else if tag.starts_with("<spell") {
             self.handle_spell(tag, text_buffer, elements);
         } else if tag.starts_with("<left") {
@@ -690,6 +706,8 @@ impl XmlParser {
             self.handle_launch_url(tag, elements);
         } else if tag.starts_with("<LichWebUI ") || tag.starts_with("<LichWebUI/") {
             self.handle_lich_webui(tag, elements);
+        } else if tag.starts_with("<output ") || tag.starts_with("<output/") {
+            self.handle_output(tag);
         }
         // Handle paired inv tags: <inv id='X'>content</inv>
         else if tag.starts_with("<inv ") && tag.contains("</inv>") {
@@ -1924,6 +1942,24 @@ impl XmlParser {
         }
     }
 
+    fn handle_vellum_timer(&mut self, tag: &str, elements: &mut Vec<ParsedElement>) {
+        // <vellumTimer id='dark-cataclyst' value='1764904999'/> - script-
+        // facing countdown feed (typically sent to the client by a Lich
+        // script). value is the absolute epoch end time, like roundTime;
+        // 0 clears. The tag never renders as text.
+        if let (Some(id), Some(value_str)) = (
+            Self::extract_attribute(tag, "id"),
+            Self::extract_attribute(tag, "value"),
+        ) {
+            if id.is_empty() {
+                return;
+            }
+            if let Ok(value) = value_str.parse::<i64>() {
+                elements.push(ParsedElement::VellumTimer { id, value });
+            }
+        }
+    }
+
     fn handle_nav(&mut self, tag: &str, elements: &mut Vec<ParsedElement>) {
         // <nav rm='7150105'/>
         // Extract room ID
@@ -2182,6 +2218,14 @@ impl XmlParser {
         }
     }
 
+    fn handle_output(&mut self, tag: &str) {
+        // <output class="mono"/> opens a monospace region (tables, ASCII
+        // art - game XML, also emitted by Lich's respond() for script
+        // output); <output class=""/> closes it. The tag itself renders
+        // nothing.
+        self.mono_output = Self::extract_attribute(tag, "class").as_deref() == Some("mono");
+    }
+
     fn handle_push_bold(&mut self) {
         // <pushBold/> - apply monsterbold preset and set bold
         self.bold_stack.push(true);
@@ -2267,6 +2311,7 @@ impl XmlParser {
             fg_color: fg,
             bg_color: bg,
             bold,
+            mono: self.mono_output,
             span_type,
             link_data: self.current_link_data.clone(),
         }
@@ -2792,6 +2837,28 @@ mod tests {
         assert_eq!(*span_type, SpanType::Normal);
     }
 
+    #[test]
+    fn test_output_mono_region_marks_text() {
+        let mut parser = test_parser();
+
+        // <output class="mono"/> opens a monospace region; text lines that
+        // follow are stamped mono until <output class=""/> closes it.
+        parser.parse_line(r#"<output class="mono"/>"#);
+        let elements = parser.parse_line("| Script/File      | Author          |");
+        let ParsedElement::Text { content, mono, .. } = &elements[0] else {
+            panic!("Expected Text element, got {:?}", elements[0]);
+        };
+        assert_eq!(content, "| Script/File      | Author          |");
+        assert!(*mono, "text inside a mono output region must be mono");
+
+        parser.parse_line(r#"<output class=""/>"#);
+        let elements = parser.parse_line("You are standing in a field.");
+        let ParsedElement::Text { mono, .. } = &elements[0] else {
+            panic!("Expected Text element, got {:?}", elements[0]);
+        };
+        assert!(!*mono, "text after the region closes must not be mono");
+    }
+
     // ==================== GemStone IV Link Parsing (<a> tags) ====================
 
     #[test]
@@ -2933,6 +3000,52 @@ mod tests {
             panic!("Expected RoundTime element, got {:?}", rt_elements[0]);
         };
         assert_eq!(*value, 1764904999);
+    }
+
+    // ==================== VellumTimer Parsing ====================
+
+    #[test]
+    fn test_vellum_timer_parsing() {
+        let mut parser = test_parser();
+        let elements = parser.parse_line("<vellumTimer id='dark-cataclyst' value='1764904999'/>");
+
+        let timers: Vec<_> = elements
+            .iter()
+            .filter(|e| matches!(e, ParsedElement::VellumTimer { .. }))
+            .collect();
+        assert_eq!(timers.len(), 1);
+        let ParsedElement::VellumTimer { id, value } = timers[0] else {
+            panic!("Expected VellumTimer element, got {:?}", timers[0]);
+        };
+        assert_eq!(id, "dark-cataclyst");
+        assert_eq!(*value, 1764904999);
+
+        // Clear form
+        let elements = parser.parse_line("<vellumTimer id='dark-cataclyst' value='0'/>");
+        assert!(elements
+            .iter()
+            .any(|e| matches!(e, ParsedElement::VellumTimer { value: 0, .. })));
+    }
+
+    #[test]
+    fn test_vellum_timer_malformed_ignored() {
+        let mut parser = test_parser();
+        // Missing value, missing id, empty id, junk value: no element, no text.
+        for line in [
+            "<vellumTimer id='x'/>",
+            "<vellumTimer value='123'/>",
+            "<vellumTimer id='' value='123'/>",
+            "<vellumTimer id='x' value='soon'/>",
+        ] {
+            let elements = parser.parse_line(line);
+            assert!(
+                !elements
+                    .iter()
+                    .any(|e| matches!(e, ParsedElement::VellumTimer { .. })),
+                "line {:?} should not produce a timer",
+                line
+            );
+        }
     }
 
     // ==================== Stream Parsing ====================

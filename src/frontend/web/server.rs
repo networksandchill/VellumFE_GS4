@@ -276,6 +276,7 @@ pub async fn serve_listener_with_token(
         .route("/play", get(index_html))
         .route("/sessions", get(sessions_json))
         .route("/app.js", get(app_js))
+        .route("/wheel-core.js", get(wheel_core_js))
         .route("/app.css", get(app_css))
         .route("/manifest.webmanifest", get(manifest))
         .route("/sw.js", get(sw_js))
@@ -376,6 +377,16 @@ async fn app_js() -> impl IntoResponse {
             (header::CACHE_CONTROL, "no-cache"),
         ],
         include_str!("assets/app.js"),
+    )
+}
+
+async fn wheel_core_js() -> impl IntoResponse {
+    (
+        [
+            (header::CONTENT_TYPE, "text/javascript; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
+        include_str!("assets/wheel-core.js"),
     )
 }
 
@@ -695,6 +706,11 @@ async fn handle_client_message(
             .event_tx
             .send(RemoteEvent::Macro { id })
             .is_ok(),
+        ClientMessage::WheelPick { key, path } => state
+            .handles
+            .event_tx
+            .send(RemoteEvent::WheelPick { key, path })
+            .is_ok(),
         ClientMessage::MapLocations { request_id } => state
             .handles
             .event_tx
@@ -819,6 +835,54 @@ async fn handle_client_message(
                 scope,
                 name,
                 rule,
+            })
+            .is_ok(),
+        ClientMessage::SettingsGet { request_id } => state
+            .handles
+            .event_tx
+            .send(RemoteEvent::SettingsGet {
+                client_id,
+                request_id,
+            })
+            .is_ok(),
+        ClientMessage::SettingsPut {
+            request_id,
+            key,
+            value,
+            scope,
+            clear,
+        } => state
+            .handles
+            .event_tx
+            .send(RemoteEvent::SettingsPut {
+                client_id,
+                request_id,
+                key,
+                value,
+                scope,
+                clear,
+            })
+            .is_ok(),
+        ClientMessage::StreamsGet { request_id } => state
+            .handles
+            .event_tx
+            .send(RemoteEvent::StreamsGet {
+                client_id,
+                request_id,
+            })
+            .is_ok(),
+        ClientMessage::StreamsPut {
+            request_id,
+            stream,
+            target,
+        } => state
+            .handles
+            .event_tx
+            .send(RemoteEvent::StreamsPut {
+                client_id,
+                request_id,
+                stream,
+                target,
             })
             .is_ok(),
         ClientMessage::ColorsGet { request_id, scope } => state
@@ -1007,11 +1071,17 @@ async fn handle_client(mut socket: WebSocket, state: Arc<WebState>) {
         }
     }
 
-    // Macro definitions follow the snapshot; updates arrive as deltas.
+    // Macro and wheel definitions follow the snapshot; updates arrive as
+    // deltas.
     {
         let macros = state.handles.macros_rx.borrow().clone();
+        let wheels = state.handles.wheels_rx.borrow().clone();
         let (_, _, last_seq) = gather_snapshot(&state);
         let msg = protocol::macros(&macros, last_seq);
+        if socket.send(Message::Text(msg.into())).await.is_err() {
+            return;
+        }
+        let msg = protocol::wheels(&wheels, last_seq);
         if socket.send(Message::Text(msg.into())).await.is_err() {
             return;
         }
@@ -1027,6 +1097,8 @@ async fn handle_client(mut socket: WebSocket, state: Arc<WebState>) {
                     | RemoteDelta::ConfigFile { client_id: target, .. }
                     | RemoteDelta::Highlights { client_id: target, .. }
                     | RemoteDelta::Colors { client_id: target, .. }
+                    | RemoteDelta::Settings { client_id: target, .. }
+                    | RemoteDelta::Streams { client_id: target, .. }
                     | RemoteDelta::MapLocations { client_id: target, .. }
                     | RemoteDelta::MapBrowse { client_id: target, .. } = &d
                     {

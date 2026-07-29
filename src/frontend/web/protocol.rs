@@ -12,8 +12,8 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use crate::core::remote::{
-    RemoteCharInfo, RemoteDelta, RemoteMacros, RemoteMenuItem, RemoteSessionInfo,
-    RemoteStateSnapshot, RemoteTarget,
+    RemoteCharInfo, RemoteDelta, RemoteMacros, RemoteMenuItem, RemoteRoomEntities,
+    RemoteSessionInfo, RemoteStateSnapshot, RemoteTarget, RemoteWheels,
 };
 use crate::core::state::{StatusInfo, Vitals};
 use crate::data::remote_buffer::RemoteLine;
@@ -115,6 +115,8 @@ struct SnapshotPayload {
     effects: Vec<ActiveEffectsContent>,
     injuries: std::collections::HashMap<String, u8>,
     targets: Vec<RemoteTarget>,
+    entities: RemoteRoomEntities,
+    portals: Vec<String>,
     char_info: RemoteCharInfo,
     session: RemoteSessionInfo,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -171,6 +173,8 @@ pub fn snapshot(
         effects: state.effects.clone(),
         injuries: state.injuries.clone(),
         targets: state.targets.clone(),
+        entities: state.entities.clone(),
+        portals: state.portals.clone(),
         char_info: state.char_info.clone(),
         session: state.session.clone(),
         map_scene: state.map_scene.0.clone(),
@@ -247,10 +251,13 @@ pub fn delta(delta: &RemoteDelta, last_seq: u64) -> String {
             },
         ),
         RemoteDelta::Macros(m) => macros(m, last_seq),
+        RemoteDelta::Wheels(w) => wheels(w, last_seq),
         RemoteDelta::Effects(effects) => encode("effects", last_seq, effects),
         RemoteDelta::Session(info) => encode("session", last_seq, info),
         RemoteDelta::Injuries(injuries) => encode("injuries", last_seq, injuries),
         RemoteDelta::Targets(targets) => encode("targets", last_seq, targets),
+        RemoteDelta::Entities(entities) => encode("entities", last_seq, entities),
+        RemoteDelta::Portals(portals) => encode("portals", last_seq, portals),
         RemoteDelta::CharInfo(info) => encode("charinfo", last_seq, info),
         RemoteDelta::Sound { file, volume } => encode(
             "sound",
@@ -321,6 +328,44 @@ pub fn delta(delta: &RemoteDelta, last_seq: u64) -> String {
                 "error": error,
             }),
         ),
+        RemoteDelta::Settings {
+            request_id,
+            catalog,
+            key,
+            error,
+            saved,
+            ..
+        } => encode(
+            "settings",
+            last_seq,
+            serde_json::json!({
+                "request_id": request_id,
+                "catalog": catalog,
+                "key": key,
+                "error": error,
+                "saved": saved,
+            }),
+        ),
+        // The catalog object's fields (streams/windows/fallback) ride at
+        // the payload top level, per-request fields alongside them.
+        RemoteDelta::Streams {
+            request_id,
+            data,
+            stream,
+            error,
+            saved,
+            ..
+        } => {
+            let mut payload = match data {
+                serde_json::Value::Object(map) => map.clone(),
+                _ => serde_json::Map::new(),
+            };
+            payload.insert("request_id".to_string(), serde_json::json!(request_id));
+            payload.insert("stream".to_string(), serde_json::json!(stream));
+            payload.insert("error".to_string(), serde_json::json!(error));
+            payload.insert("saved".to_string(), serde_json::json!(saved));
+            encode("streams", last_seq, serde_json::Value::Object(payload))
+        }
         // client_id stays server-side: the ws task already filtered on it.
         RemoteDelta::ConfigFile {
             request_id,
@@ -377,6 +422,12 @@ pub fn macros(m: &RemoteMacros, seq: u64) -> String {
     encode("macros", seq, m)
 }
 
+/// Radial-wheel definitions; sent on connect and after the wheel config
+/// changes (keybinds reload, desktop wheel editor).
+pub fn wheels(w: &RemoteWheels, seq: u64) -> String {
+    encode("wheels", seq, w)
+}
+
 /// Sent right before closing an unauthenticated connection, so the client
 /// can show its pairing prompt instead of retry-looping.
 pub fn denied() -> String {
@@ -408,6 +459,11 @@ pub enum ClientMessage {
     /// (`insert`) buttons never arrive here — the client handles them
     /// locally.
     Macro { id: String },
+    /// A radial-wheel slice picked (wheel button released or South on a
+    /// leaf). `key` is "" for the default wheel, else a named wheel;
+    /// `path` indexes down to the leaf. Resolved to its command
+    /// server-side, like macros.
+    WheelPick { key: String, path: Vec<usize> },
     /// Create/edit a phone-authored macro button (macros-local.toml).
     MacroSave {
         group: Option<String>,
@@ -470,6 +526,29 @@ pub enum ClientMessage {
         request_id: u64,
         scope: String,
         name: String,
+    },
+    /// The full settings catalog (registry dump + live values).
+    SettingsGet { request_id: u64 },
+    /// Set one registered setting: JSON value typed by the setting's kind,
+    /// scope "character" or "global". `clear` resets a sensitive
+    /// optional-text setting to None (its redacted value never crossed the
+    /// wire, so the client can't send it back emptied).
+    SettingsPut {
+        request_id: u64,
+        key: String,
+        value: serde_json::Value,
+        scope: String,
+        clear: bool,
+    },
+    /// The streams catalog (every known stream + where it goes).
+    StreamsGet { request_id: u64 },
+    /// Set one stream's orphan route: target "discard" | "main" |
+    /// "window:<name>" | "clear" (reset to fallback). Route editing only —
+    /// window subscriptions are read-only from the phone.
+    StreamsPut {
+        request_id: u64,
+        stream: String,
+        target: String,
     },
     /// Structured color config for the editor UI.
     ColorsGet { request_id: u64, scope: String },
@@ -549,6 +628,25 @@ pub fn parse_client_message(raw: &str) -> Option<ClientMessage> {
         "macro" => {
             let id = msg.d.get("id")?.as_str()?.to_string();
             Some(ClientMessage::Macro { id })
+        }
+        "wheel_pick" => {
+            let key = msg
+                .d
+                .get("key")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let path: Vec<usize> = msg
+                .d
+                .get("path")?
+                .as_array()?
+                .iter()
+                .map(|v| v.as_u64().map(|i| i as usize))
+                .collect::<Option<_>>()?;
+            if path.is_empty() {
+                return None;
+            }
+            Some(ClientMessage::WheelPick { key, path })
         }
         "macro_save" => {
             let label = msg.d.get("label")?.as_str()?.trim().to_string();
@@ -701,6 +799,40 @@ pub fn parse_client_message(raw: &str) -> Option<ClientMessage> {
                 scope,
                 name,
                 rule,
+            })
+        }
+        "settings_get" => {
+            let request_id = msg.d.get("request_id")?.as_u64()?;
+            Some(ClientMessage::SettingsGet { request_id })
+        }
+        "settings_put" => {
+            let request_id = msg.d.get("request_id")?.as_u64()?;
+            let key = msg.d.get("key")?.as_str()?.to_string();
+            let value = msg.d.get("value")?.clone();
+            let scope = msg.d.get("scope")?.as_str()?.to_string();
+            if !matches!(scope.as_str(), "character" | "global") {
+                return None;
+            }
+            Some(ClientMessage::SettingsPut {
+                request_id,
+                key,
+                value,
+                scope,
+                clear: msg.d.get("clear").and_then(|v| v.as_bool()).unwrap_or(false),
+            })
+        }
+        "streams_get" => {
+            let request_id = msg.d.get("request_id")?.as_u64()?;
+            Some(ClientMessage::StreamsGet { request_id })
+        }
+        "streams_put" => {
+            let request_id = msg.d.get("request_id")?.as_u64()?;
+            let stream = msg.d.get("stream")?.as_str()?.to_string();
+            let target = msg.d.get("target")?.as_str()?.to_string();
+            Some(ClientMessage::StreamsPut {
+                request_id,
+                stream,
+                target,
             })
         }
         "colors_get" => {
@@ -892,6 +1024,112 @@ mod tests {
     }
 
     #[test]
+    fn parse_wheel_pick_messages() {
+        assert_eq!(
+            parse_client_message(r#"{"t":"wheel_pick","d":{"key":"","path":[2]}}"#),
+            Some(ClientMessage::WheelPick {
+                key: String::new(),
+                path: vec![2]
+            })
+        );
+        // Named wheel, folder descent; a missing key means the default.
+        assert_eq!(
+            parse_client_message(r#"{"t":"wheel_pick","d":{"key":"spells","path":[1,0]}}"#),
+            Some(ClientMessage::WheelPick {
+                key: "spells".to_string(),
+                path: vec![1, 0]
+            })
+        );
+        assert_eq!(
+            parse_client_message(r#"{"t":"wheel_pick","d":{"path":[0]}}"#),
+            Some(ClientMessage::WheelPick {
+                key: String::new(),
+                path: vec![0]
+            })
+        );
+        // Empty, missing or non-numeric paths → rejected.
+        assert_eq!(
+            parse_client_message(r#"{"t":"wheel_pick","d":{"key":"","path":[]}}"#),
+            None
+        );
+        assert_eq!(parse_client_message(r#"{"t":"wheel_pick","d":{}}"#), None);
+        assert_eq!(
+            parse_client_message(r#"{"t":"wheel_pick","d":{"path":["x"]}}"#),
+            None
+        );
+    }
+
+    #[test]
+    fn wheels_delta_ships_structure_without_commands() {
+        use crate::core::remote::RemoteWheelSlice;
+        let w = RemoteWheels {
+            default: vec![
+                RemoteWheelSlice {
+                    label: "look".to_string(),
+                    color: None,
+                    span: None,
+                    inner: Some(65),
+                    back: false,
+                    slices: vec![],
+                },
+                RemoteWheelSlice {
+                    label: "stance".to_string(),
+                    color: Some("#2e8b57".to_string()),
+                    span: Some(120.0),
+                    inner: None,
+                    back: false,
+                    slices: vec![RemoteWheelSlice {
+                        label: "defensive".to_string(),
+                        color: None,
+                        span: None,
+                        inner: None,
+                        back: false,
+                        slices: vec![],
+                    }],
+                },
+            ],
+            named: Default::default(),
+            tuning: crate::core::remote::RemoteWheelTuning {
+                movement_stick: "left".to_string(),
+                back_slice: "down".to_string(),
+                deadzone: 50,
+                aim_dwell_ms: 150,
+                nav_dwell_ms: 150,
+                fire_debounce_ms: 300,
+                release_grace_ms: 40,
+                fire_mode: "retract".to_string(),
+                edge_threshold: 90,
+                retract_delta: 10,
+            },
+            wheel_stick: std::iter::once(("exits".to_string(), "right".to_string())).collect(),
+            wheel_start: std::iter::once(("combat".to_string(), -30.0_f32)).collect(),
+        };
+        let json: serde_json::Value =
+            serde_json::from_str(&delta(&RemoteDelta::Wheels(Arc::new(w)), 5)).unwrap();
+        assert_eq!(json["t"], "wheels");
+        assert_eq!(json["d"]["default"][0]["label"], "look");
+        assert_eq!(json["d"]["default"][1]["color"], "#2e8b57");
+        assert_eq!(json["d"]["default"][1]["slices"][0]["label"], "defensive");
+        // Commands are resolved server-side on pick; they never ship.
+        assert!(json["d"]["default"][0].get("command").is_none());
+        // Tuning + per-wheel stick ride along so the phone matches feel.
+        assert_eq!(json["d"]["tuning"]["aim_dwell_ms"], 150);
+        assert_eq!(json["d"]["tuning"]["back_slice"], "down");
+        // Fire mode + thresholds ship so the phone controller honors them.
+        assert_eq!(json["d"]["tuning"]["fire_mode"], "retract");
+        assert_eq!(json["d"]["tuning"]["edge_threshold"], 90);
+        assert_eq!(json["d"]["tuning"]["retract_delta"], 10);
+        assert_eq!(json["d"]["wheel_stick"]["exits"], "right");
+        // Variable-width fields ship: explicit spans/inners per slice
+        // (absent = even share / global deadzone) and per-wheel start.
+        assert_eq!(json["d"]["default"][1]["span"], 120.0);
+        assert_eq!(json["d"]["default"][0]["inner"], 65);
+        assert!(json["d"]["default"][0].get("span").is_none());
+        assert!(json["d"]["default"][1].get("inner").is_none());
+        assert_eq!(json["d"]["wheel_start"]["combat"], -30.0);
+    }
+
+    #[test]
     fn parse_config_editor_messages() {
         assert_eq!(
             parse_client_message(r#"{"t":"config_get","d":{"request_id":7,"file":"highlights"}}"#),
@@ -915,6 +1153,139 @@ mod tests {
             parse_client_message(r#"{"t":"config_put","d":{"request_id":8,"file":"colors"}}"#),
             None
         );
+    }
+
+    #[test]
+    fn parse_settings_messages() {
+        assert_eq!(
+            parse_client_message(r#"{"t":"settings_get","d":{"request_id":11}}"#),
+            Some(ClientMessage::SettingsGet { request_id: 11 })
+        );
+        assert_eq!(
+            parse_client_message(
+                r#"{"t":"settings_put","d":{"request_id":12,"key":"ui.buffer_size","value":5000,"scope":"character"}}"#
+            ),
+            Some(ClientMessage::SettingsPut {
+                request_id: 12,
+                key: "ui.buffer_size".to_string(),
+                value: serde_json::json!(5000),
+                scope: "character".to_string(),
+                clear: false,
+            })
+        );
+        // Optional clear flag (sensitive optional-text reset).
+        assert_eq!(
+            parse_client_message(
+                r#"{"t":"settings_put","d":{"request_id":14,"key":"connection.password","value":"","scope":"character","clear":true}}"#
+            ),
+            Some(ClientMessage::SettingsPut {
+                request_id: 14,
+                key: "connection.password".to_string(),
+                value: serde_json::json!(""),
+                scope: "character".to_string(),
+                clear: true,
+            })
+        );
+        // Non-scalar values (lists) pass through as JSON for the handler.
+        assert!(matches!(
+            parse_client_message(
+                r#"{"t":"settings_put","d":{"request_id":13,"key":"tts.gags","value":["a","b"],"scope":"global"}}"#
+            ),
+            Some(ClientMessage::SettingsPut { scope, .. }) if scope == "global"
+        ));
+        // Unknown scope or missing fields → rejected.
+        assert_eq!(
+            parse_client_message(
+                r#"{"t":"settings_put","d":{"request_id":12,"key":"k","value":1,"scope":"profile"}}"#
+            ),
+            None
+        );
+        assert_eq!(
+            parse_client_message(r#"{"t":"settings_put","d":{"request_id":12,"key":"k"}}"#),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_streams_messages() {
+        assert_eq!(
+            parse_client_message(r#"{"t":"streams_get","d":{"request_id":31}}"#),
+            Some(ClientMessage::StreamsGet { request_id: 31 })
+        );
+        assert_eq!(
+            parse_client_message(
+                r#"{"t":"streams_put","d":{"request_id":32,"stream":"bounty","target":"window:bounty_win"}}"#
+            ),
+            Some(ClientMessage::StreamsPut {
+                request_id: 32,
+                stream: "bounty".to_string(),
+                target: "window:bounty_win".to_string(),
+            })
+        );
+        // Missing target → rejected.
+        assert_eq!(
+            parse_client_message(r#"{"t":"streams_put","d":{"request_id":32,"stream":"bounty"}}"#),
+            None
+        );
+    }
+
+    #[test]
+    fn streams_delta_shapes() {
+        // Get reply: catalog fields ride at the payload top level.
+        let d = RemoteDelta::Streams {
+            client_id: 4,
+            request_id: 33,
+            data: serde_json::json!({
+                "streams": [{ "id": "bounty", "destination": "Main" }],
+                "windows": ["main", "thoughts"],
+                "fallback": "main",
+            }),
+            stream: None,
+            error: None,
+            saved: false,
+        };
+        let json: serde_json::Value = serde_json::from_str(&delta(&d, 2)).unwrap();
+        assert_eq!(json["t"], "streams");
+        assert_eq!(json["d"]["request_id"], 33);
+        assert_eq!(json["d"]["streams"][0]["id"], "bounty");
+        assert_eq!(json["d"]["windows"][1], "thoughts");
+        assert_eq!(json["d"]["fallback"], "main");
+        assert!(json["d"].get("client_id").is_none(), "client_id stays server-side");
+
+        // Put reply: no catalog, echoes the stream, carries saved/error.
+        let d = RemoteDelta::Streams {
+            client_id: 4,
+            request_id: 34,
+            data: serde_json::Value::Null,
+            stream: Some("bounty".to_string()),
+            error: None,
+            saved: true,
+        };
+        let json: serde_json::Value = serde_json::from_str(&delta(&d, 2)).unwrap();
+        assert_eq!(json["d"]["request_id"], 34);
+        assert_eq!(json["d"]["stream"], "bounty");
+        assert_eq!(json["d"]["saved"], true);
+        assert!(json["d"].get("streams").is_none());
+    }
+
+    #[test]
+    fn settings_delta_shape() {
+        let d = RemoteDelta::Settings {
+            client_id: 4,
+            request_id: 21,
+            catalog: serde_json::Value::Null,
+            key: Some("ui.buffer_size".to_string()),
+            error: None,
+            saved: true,
+        };
+        let json: serde_json::Value = serde_json::from_str(&delta(&d, 3)).unwrap();
+        assert_eq!(json["t"], "settings");
+        assert_eq!(json["d"]["request_id"], 21);
+        assert_eq!(json["d"]["key"], "ui.buffer_size");
+        assert_eq!(json["d"]["saved"], true);
+        assert!(json["d"]["error"].is_null());
+        // client_id stays server-side.
+        assert!(json["d"].get("client_id").is_none());
     }
 
     #[test]

@@ -66,10 +66,10 @@ fn init_state() -> (UiState, MessageProcessor, GameState, XmlParser) {
 
 fn position() -> WindowPosition {
     WindowPosition {
-        x: 0,
-        y: 0,
-        width: 80,
-        height: 5,
+        x: vellum_fe::data::geometry::Col::new(0),
+        y: vellum_fe::data::geometry::Row::new(0),
+        width: vellum_fe::data::geometry::Width::new(80),
+        height: vellum_fe::data::geometry::Height::new(5),
     }
 }
 
@@ -769,10 +769,10 @@ fn spells_stream_buffers_without_window() {
             widget_type: vellum_fe::data::WidgetType::Spells,
             content: vellum_fe::data::WindowContent::Spells(content),
             position: vellum_fe::data::WindowPosition {
-                x: 0,
-                y: 0,
-                width: 40,
-                height: 10,
+                x: vellum_fe::data::geometry::Col::new(0),
+                y: vellum_fe::data::geometry::Row::new(0),
+                width: vellum_fe::data::geometry::Width::new(40),
+                height: vellum_fe::data::geometry::Height::new(10),
             },
             visible: true,
             content_align: None,
@@ -2512,6 +2512,7 @@ fn make_highlight_pattern(
         fast_parse,
         sound: None,
         sound_volume: None,
+        rumble: None,
         category: None,
         squelch: false,
         silent_prompt: false,

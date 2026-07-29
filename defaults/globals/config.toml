@@ -25,7 +25,7 @@
 
 [connection]
 host = "127.0.0.1"
-port = 8001
+port = 8000
 # character = "YourName"  # Character for Lich proxy and direct connect login
 
 # --- Direct Connection (all optional) ---
@@ -72,7 +72,7 @@ enabled = false
 # These values apply to windows that don't specify their own settings.
 
 # Default text buffer size (lines kept in memory per window)
-buffer_size = 1000
+buffer_size = 10000
 
 # Default window border style: "single", "double", "rounded", "thick", "none"
 border_style = "single"
@@ -116,23 +116,23 @@ command_echo = true
 betrayer_active_color = "#ff4040"
 
 # Prevent these openDialog windows from auto-opening (still parse their data).
+# (This list mirrors the built-in default; edit to taste.)
 open_dialog_blocklist = [
-  "bank",
   "combat",
   "injuries",
+  "stance",
+  "befriend",
   "espMasterDialog",
   "espMasterData",
+  "Buffs",
+  "Debuffs",
+  "Cooldowns",
   "mapMaster",
+  "encum",
+  "minivitals",
+  "expr",
+  "Active Spells",
 ]
-
-# --- Focus Navigation ---
-# Configure which windows are focusable via Tab and the optional cycle order.
-# If order is empty, VellumFE uses layout order filtered by focusable types.
-#
-# [ui.focus]
-types = ["text", "tabbedtext"]
-exclude = ["bounty", "society"]
-order = []
 
 # --- Performance Overlay (Debug) ---
 # Press F3 or use .perf command to toggle
@@ -141,6 +141,15 @@ perf_stats_x = 0
 perf_stats_y = 0
 perf_stats_width = 35
 perf_stats_height = 23
+
+# --- Focus Navigation ---
+# Configure which windows are focusable via Tab and the optional cycle order.
+# If order is empty, VellumFE uses layout order filtered by focusable types.
+# (Sub-table: must stay below the bare [ui] keys above.)
+[ui.focus]
+types = ["text", "tabbedtext"]
+exclude = ["bounty", "society"]
+order = []
 
 
 # ------------------------------------------------------------
@@ -236,16 +245,22 @@ startup_music_delay_ms = 0  # Delay before startup music (0 = immediate)
 # ------------------------------------------------------------
 # Screen reader support via native TTS engines.
 # TTS operates independently of the sound system above.
-# Controls: Ctrl+Shift+N (next), Ctrl+Shift+P (previous),
-#           Ctrl+Shift+M (mute toggle)
+# Prefer the editors: Settings > Speech (GUI) or .tts (any frontend).
+# Queue controls: Ctrl+Alt+Left/Right (prev/next), Ctrl+Alt+Up (next unread),
+#                 Ctrl+Alt+Down (stop), F11 (mute) - see keybinds.toml
+# Per-window speech lives in each window's editor (tts_speak in layout.toml);
+# the three toggles below are the classic shortcuts for main/thoughts/speech.
 
 [tts]
 enabled = false        # Set to true to enable TTS
-rate = 1.0             # Speech rate: 0.5 (slow) to 2.0 (fast)
+rate = 1.0             # Speech rate: 0.5 (slow), 1.0 (normal) to 3.0 (engine max)
 volume = 1.0           # Volume: 0.0 (silent) to 1.0 (full)
 speak_thoughts = true  # Speak focused thoughts
 speak_speech = true    # Speak speech window
 speak_main = false     # Speak main window (can be overwhelming)
+# voice = "Microsoft Zira"   # Voice by name (.tts voices lists them)
+# gags = ["^You feel fully rested"]              # shown but never spoken
+# substitutions = [{ pattern = "Wehnimer's", replacement = "Wenimers" }]
 
 
 # ------------------------------------------------------------
@@ -299,11 +314,14 @@ room_in_main = true
 # EVENT PATTERNS
 # ------------------------------------------------------------
 # Regex patterns to detect game events for countdown timers.
-# Each pattern can trigger stun/RT/CT timer updates.
+# Each pattern can trigger stun/RT/CT timer updates - or feed a custom
+# countdown window: any other event_type drives the countdown whose id
+# matches it (case-sensitive), e.g. a "tremors" pattern feeds a custom
+# countdown with id "tremors".
 #
 # Fields:
 #   pattern           - Regex to match game text
-#   event_type        - Timer type: "stun", "rt", "ct"
+#   event_type        - Countdown to feed: "stun", "rt", "ct", or a custom id
 #   action            - "set" (start timer) or "clear" (cancel timer)
 #   duration          - Fixed duration in seconds (if not captured)
 #   duration_capture  - Regex capture group for dynamic duration
@@ -395,3 +413,17 @@ enabled = false
 port = 8040
 bind = "127.0.0.1"
 pinned = false
+
+# --- Map & Travel -----------------------------------------------------------
+# The in-client map and native go2 travel. Both are best configured from the
+# GUI (Settings > Map, Settings > Travel); the sections exist here so the
+# file documents every config surface.
+#
+# [map]
+# mapdb_repo = "Nisugi/mapdb"      # GitHub repo for map database downloads
+# lich_dir = ""                    # Lich install dir (auto-detected if empty)
+# mapdb_path = ""                  # Explicit mapdb file (overrides downloads)
+# mapping_mode = false             # Capture session evidence for mapping
+#
+# [go2]
+# native_map_clicks = true         # Map clicks walk via native go2

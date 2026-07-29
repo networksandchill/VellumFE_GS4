@@ -20,6 +20,13 @@ pub fn run(
     login_key: Option<String>,
     console_size_profile: Option<String>,
 ) -> Result<()> {
+    // Lich on Windows runs under rubyw (no console) and starts the frontend
+    // with a plain spawn, so we get a brand-new console window while our
+    // inherited standard handles point somewhere else entirely. crossterm
+    // then draws into the void: the console sits blank while the session
+    // runs fine underneath. Rebind stdio to the real console first.
+    #[cfg(windows)]
+    reattach_console_stdio();
     if let Some(profile) = console_size_profile.as_deref() {
         restore_console_size(profile);
     }
@@ -37,6 +44,64 @@ pub fn run(
         login_key,
         console_size_profile,
     ))
+}
+
+/// If this process owns a console window but a standard handle doesn't
+/// actually point at it (a GUI-subsystem parent like Lich's rubyw spawned us
+/// with dead or redirected handles), reopen CONIN$/CONOUT$ and reinstall
+/// them. Both Rust's std stdio and crossterm resolve handles through
+/// GetStdHandle at use time, so rebinding here fixes everything downstream.
+/// No-op when the handles are already console handles (a normal manual run).
+#[cfg(windows)]
+fn reattach_console_stdio() {
+    use windows::core::w;
+    use windows::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE, HANDLE};
+    use windows::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+    use windows::Win32::System::Console::{
+        GetConsoleMode, GetConsoleWindow, GetStdHandle, SetStdHandle, CONSOLE_MODE,
+        STD_ERROR_HANDLE, STD_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+    };
+
+    let is_console = |slot: STD_HANDLE| unsafe {
+        let mut mode = CONSOLE_MODE::default();
+        GetStdHandle(slot)
+            .is_ok_and(|handle| !handle.is_invalid() && GetConsoleMode(handle, &mut mode).is_ok())
+    };
+    let open_console = |name: windows::core::PCWSTR| unsafe {
+        CreateFileW(
+            name,
+            GENERIC_READ.0 | GENERIC_WRITE.0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAGS_AND_ATTRIBUTES(0),
+            HANDLE::default(),
+        )
+    };
+
+    unsafe {
+        // No console at all (e.g. piped headless run): nothing to attach to.
+        if GetConsoleWindow().is_invalid() {
+            return;
+        }
+        if !is_console(STD_INPUT_HANDLE) {
+            if let Ok(conin) = open_console(w!("CONIN$")) {
+                let _ = SetStdHandle(STD_INPUT_HANDLE, conin);
+            }
+        }
+        if !is_console(STD_OUTPUT_HANDLE) || !is_console(STD_ERROR_HANDLE) {
+            if let Ok(conout) = open_console(w!("CONOUT$")) {
+                if !is_console(STD_OUTPUT_HANDLE) {
+                    let _ = SetStdHandle(STD_OUTPUT_HANDLE, conout);
+                }
+                if !is_console(STD_ERROR_HANDLE) {
+                    let _ = SetStdHandle(STD_ERROR_HANDLE, conout);
+                }
+            }
+        }
+    }
 }
 
 /// Saved console geometry for launcher-spawned sessions, in character cells
@@ -658,6 +723,38 @@ async fn async_run(
                         app_core
                             .handle_remote_highlight_put(client_id, request_id, scope, name, rule);
                     }
+                    crate::core::remote::RemoteEvent::SettingsGet {
+                        client_id,
+                        request_id,
+                    } => {
+                        app_core.handle_remote_settings_get(client_id, request_id);
+                    }
+                    crate::core::remote::RemoteEvent::SettingsPut {
+                        client_id,
+                        request_id,
+                        key,
+                        value,
+                        scope,
+                        clear,
+                    } => {
+                        app_core.handle_remote_settings_put(
+                            client_id, request_id, key, value, scope, clear,
+                        );
+                    }
+                    crate::core::remote::RemoteEvent::StreamsGet {
+                        client_id,
+                        request_id,
+                    } => {
+                        app_core.handle_remote_streams_get(client_id, request_id);
+                    }
+                    crate::core::remote::RemoteEvent::StreamsPut {
+                        client_id,
+                        request_id,
+                        stream,
+                        target,
+                    } => {
+                        app_core.handle_remote_streams_put(client_id, request_id, stream, target);
+                    }
                     crate::core::remote::RemoteEvent::ColorsGet {
                         client_id,
                         request_id,
@@ -715,6 +812,26 @@ async fn async_run(
                             continue;
                         };
                         tracing::debug!("remote macro '{}': '{}'", id, command);
+                        if let Some(cmd) = frontend.handle_command_submission(command, &mut app_core)? {
+                            app_core
+                                .perf_stats
+                                .record_bytes_sent((cmd.len() + 1) as u64);
+                            let _ = command_tx.send(cmd);
+                        }
+                    }
+                    crate::core::remote::RemoteEvent::WheelPick { key, path } => {
+                        // Resolved against config like macros; same dispatch
+                        // as typed input, skipping history.
+                        let Some(command) = app_core.wheel_pick_command(&key, &path)
+                        else {
+                            tracing::warn!(
+                                "remote wheel pick '{}' {:?} did not resolve (stale client?)",
+                                key,
+                                path
+                            );
+                            continue;
+                        };
+                        tracing::debug!("remote wheel pick '{}' {:?}: '{}'", key, path, command);
                         if let Some(cmd) = frontend.handle_command_submission(command, &mut app_core)? {
                             app_core
                                 .perf_stats

@@ -6,6 +6,7 @@
 
 pub mod app_core;
 pub mod bounty_parser;
+pub mod emoji;
 pub mod evidence;
 pub mod ghost_rooms;
 pub mod highlight_engine;
@@ -19,8 +20,11 @@ pub mod menu_actions;
 pub mod messages;
 pub mod pathing;
 pub mod remote;
+pub mod spell_table;
 pub mod travel;
 pub mod state;
+pub mod uipack;
+pub mod window_style;
 
 pub use app_core::AppCore;
 pub use highlight_engine::{

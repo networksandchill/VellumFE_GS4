@@ -17,6 +17,25 @@ pub(super) fn resolve_color(input: &str) -> Option<Color32> {
     parse_color_flexible(input).and_then(|hex| super::widgets::parse_hex_color(&hex))
 }
 
+/// Click-to-pick swatch for a config color string: shows the current color
+/// (name or hex) and opens egui's color picker on click, writing `#rrggbb`
+/// back into `value`. Pair with a text field for those who want to type a
+/// name; nobody is required to know color codes. Returns true when the
+/// picker changed the value.
+pub(super) fn color_picker_swatch(ui: &mut egui::Ui, value: &mut String) -> bool {
+    let current = resolve_color(value).unwrap_or(Color32::GRAY);
+    let mut rgb = [current.r(), current.g(), current.b()];
+    let response = ui
+        .color_edit_button_srgb(&mut rgb)
+        .on_hover_text("Pick a color");
+    if response.changed() {
+        *value = format!("#{:02x}{:02x}{:02x}", rgb[0], rgb[1], rgb[2]);
+        true
+    } else {
+        false
+    }
+}
+
 /// Build egui visuals from the shared application theme.
 pub(super) fn visuals_from_theme(theme: &AppTheme) -> egui::Visuals {
     let mut visuals = egui::Visuals::dark();
@@ -35,13 +54,10 @@ pub(super) fn visuals_from_theme(theme: &AppTheme) -> egui::Visuals {
 
     visuals.widgets.noninteractive.bg_stroke.color = color32(theme.window_border);
     visuals.widgets.noninteractive.fg_stroke.color = color32(theme.text_primary);
-    visuals.widgets.inactive.bg_fill = color32(theme.button_normal);
-    visuals.widgets.inactive.weak_bg_fill = color32(theme.button_normal);
+    // Button fills deliberately keep egui's neutral dark defaults: the
+    // theme's button_* colors are TUI accent colors, and using them as
+    // fills turns every button into a bright solid chip.
     visuals.widgets.inactive.fg_stroke.color = color32(theme.text_primary);
-    visuals.widgets.hovered.bg_fill = color32(theme.button_hover);
-    visuals.widgets.hovered.weak_bg_fill = color32(theme.button_hover);
-    visuals.widgets.active.bg_fill = color32(theme.button_active);
-    visuals.widgets.active.weak_bg_fill = color32(theme.button_active);
     visuals.widgets.open.bg_fill = color32(theme.menu_background);
     visuals.widgets.open.weak_bg_fill = color32(theme.menu_background);
 
@@ -108,17 +124,70 @@ fn font_data_from_ref(
                     }
                 },
             };
+            if let Err(err) = validate_font_bytes(&bytes, index) {
+                tracing::warn!("Font '{}' is not usable ({}); keeping default", name, err);
+                return None;
+            }
             let mut data = egui::FontData::from_owned(bytes);
             data.index = index;
             Some(data)
         }
         FontRef::Custom(path) => match std::fs::read(path) {
-            Ok(bytes) => Some(egui::FontData::from_owned(bytes)),
+            Ok(bytes) => {
+                if let Err(err) = validate_font_bytes(&bytes, 0) {
+                    tracing::warn!("Font file '{}' is not usable ({}); keeping default", path, err);
+                    return None;
+                }
+                Some(egui::FontData::from_owned(bytes))
+            }
             Err(err) => {
                 tracing::warn!("Failed to load font file '{}': {}", path, err);
                 None
             }
         },
+    }
+}
+
+/// Reject font data egui cannot render. epaint parses fonts with skrifa and
+/// panics the frame on failure, so anything skrifa refuses here must never
+/// reach `FontDefinitions`. fontdb enumerates with ttf-parser, which accepts
+/// faces skrifa does not — the picker can list fonts that would crash us.
+fn validate_font_bytes(bytes: &[u8], index: u32) -> Result<(), skrifa::raw::ReadError> {
+    skrifa::FontRef::from_index(bytes, index).map(|_| ())
+}
+
+/// Bundled fallback fonts (name, bytes) appended to the end of every font
+/// family. NotoSansSymbols2 covers arrows/geometric shapes/misc symbols;
+/// NotoEmoji (monochrome) covers emoji. Both are OFL-licensed — see
+/// assets/fonts/OFL.txt. Order matters: symbols before emoji.
+const BUILTIN_FALLBACK_FONTS: &[(&str, &[u8])] = &[
+    (
+        "vellum-fallback-symbols",
+        include_bytes!("../../../../assets/fonts/NotoSansSymbols2-Regular.ttf"),
+    ),
+    (
+        "vellum-fallback-emoji",
+        include_bytes!("../../../../assets/fonts/NotoEmoji-VariableFont_wght.ttf"),
+    ),
+];
+
+/// Append the bundled symbol/emoji fallback fonts to the END of every font
+/// family (default and custom alike), registering their data once. Call this
+/// after any code that builds or adds font families so no font selection can
+/// produce tofu for arrows/symbols/emoji. Append-only and idempotent: it
+/// never replaces or reorders the fonts already in a family.
+pub(super) fn append_builtin_fallbacks(fonts: &mut egui::FontDefinitions) {
+    for (name, bytes) in BUILTIN_FALLBACK_FONTS {
+        fonts
+            .font_data
+            .entry((*name).to_string())
+            .or_insert_with(|| std::sync::Arc::new(egui::FontData::from_static(bytes)));
+    }
+    for list in fonts.families.values_mut() {
+        for (name, _) in BUILTIN_FALLBACK_FONTS {
+            list.retain(|font| font != name);
+            list.push((*name).to_string());
+        }
     }
 }
 
@@ -175,6 +244,10 @@ pub(super) fn build_font_definitions(
         }
         fonts.families.insert(family, list);
     }
+
+    // Last step so the bundled symbol/emoji fallbacks land at the end of
+    // every family built above (defaults, ui font, and per-window families).
+    append_builtin_fallbacks(&mut fonts);
 
     fonts
 }
@@ -249,6 +322,104 @@ mod tests {
     }
 
     #[test]
+    fn bundled_fallback_fonts_parse_with_skrifa() {
+        // epaint panics the frame on unparseable font data; make sure the
+        // bundled fallbacks pass the same skrifa validation gate.
+        for (name, bytes) in BUILTIN_FALLBACK_FONTS {
+            assert!(
+                validate_font_bytes(bytes, 0).is_ok(),
+                "bundled fallback font '{}' failed skrifa validation",
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn builtin_fallbacks_appended_to_end_of_every_family() {
+        let mut fonts = egui::FontDefinitions::default();
+        // A custom family like the per-window ones built from font refs.
+        fonts.families.insert(
+            egui::FontFamily::Name("vellum-named:Test Font".into()),
+            vec!["some-user-font".to_string()],
+        );
+
+        append_builtin_fallbacks(&mut fonts);
+        // Idempotent: a second run must not duplicate names or data.
+        append_builtin_fallbacks(&mut fonts);
+
+        // Font data registered exactly once per fallback (font_data is a map,
+        // so presence means exactly one entry under that name).
+        for (name, _) in BUILTIN_FALLBACK_FONTS {
+            assert!(
+                fonts.font_data.contains_key(*name),
+                "fallback '{}' missing from font_data",
+                name
+            );
+        }
+
+        for (family, list) in &fonts.families {
+            assert!(
+                list.len() >= 2,
+                "family {:?} has too few fonts: {:?}",
+                family,
+                list
+            );
+            // Both fallbacks present exactly once, as the last two entries,
+            // symbols before emoji.
+            for (name, _) in BUILTIN_FALLBACK_FONTS {
+                assert_eq!(
+                    list.iter().filter(|font| font == name).count(),
+                    1,
+                    "family {:?} should list '{}' exactly once: {:?}",
+                    family,
+                    name,
+                    list
+                );
+            }
+            assert_eq!(
+                &list[list.len() - 2..],
+                &[
+                    "vellum-fallback-symbols".to_string(),
+                    "vellum-fallback-emoji".to_string()
+                ],
+                "family {:?} must end with the bundled fallbacks: {:?}",
+                family,
+                list
+            );
+        }
+
+        // The custom family's own font is still first — append-only.
+        let custom = fonts
+            .families
+            .get(&egui::FontFamily::Name("vellum-named:Test Font".into()))
+            .unwrap();
+        assert_eq!(custom[0], "some-user-font");
+    }
+
+    #[test]
+    fn build_font_definitions_ends_every_family_with_fallbacks() {
+        use crate::frontend::gui::persistence::FontRef;
+        // SystemDefault avoids touching the system font database in tests.
+        let fonts = build_font_definitions(&FontRef::SystemDefault, &[]);
+        for (family, list) in &fonts.families {
+            assert_eq!(
+                list.last().map(String::as_str),
+                Some("vellum-fallback-emoji"),
+                "family {:?} does not end with the emoji fallback: {:?}",
+                family,
+                list
+            );
+            assert_eq!(
+                list.get(list.len() - 2).map(String::as_str),
+                Some("vellum-fallback-symbols"),
+                "family {:?} missing the symbols fallback before emoji: {:?}",
+                family,
+                list
+            );
+        }
+    }
+
+    #[test]
     fn visuals_reflect_theme_colors() {
         let theme = AppTheme::default();
         let visuals = visuals_from_theme(&theme);
@@ -257,6 +428,24 @@ mod tests {
         assert_eq!(
             visuals.override_text_color,
             Some(color32(theme.text_primary))
+        );
+        // Button fills must stay at egui's neutral defaults, not theme accents.
+        let defaults = egui::Visuals::dark();
+        assert_eq!(
+            visuals.widgets.inactive.bg_fill,
+            defaults.widgets.inactive.bg_fill
+        );
+        assert_eq!(
+            visuals.widgets.inactive.weak_bg_fill,
+            defaults.widgets.inactive.weak_bg_fill
+        );
+        assert_eq!(
+            visuals.widgets.hovered.bg_fill,
+            defaults.widgets.hovered.bg_fill
+        );
+        assert_eq!(
+            visuals.widgets.active.bg_fill,
+            defaults.widgets.active.bg_fill
         );
     }
 }

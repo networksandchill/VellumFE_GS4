@@ -91,6 +91,13 @@ pub struct AppCore {
     /// Text-to-Speech manager for accessibility
     pub tts_manager: crate::tts::TtsManager,
 
+    /// Queued haptic (rumble) events for frontends to drain (haptics.rs)
+    pub pending_haptics: Vec<super::HapticEvent>,
+    /// Last-seen state for haptic transition detection
+    pub(crate) haptic_prev: super::HapticSnapshot,
+    /// Cooldown clock for highlight-driven rumble (haptics.rs)
+    pub(crate) last_highlight_rumble: Option<std::time::Instant>,
+
     // === Navigation State ===
     /// Navigation room ID from <nav rm='...'/>
     /// Live map state: mapdb, generated layouts, current-room tracking.
@@ -99,6 +106,10 @@ pub struct AppCore {
     pub map_updater: crate::core::mapdb_update::MapDbUpdater,
     /// Native go2: the walk executor and its outbound command queue.
     pub travel: crate::core::travel::TravelService,
+    /// Macro sleep segments (`look\rs2\rhide`): commands waiting out
+    /// their pause, drained by take_outbound once due (insertion order
+    /// preserved among same-tick due commands).
+    timed_commands: Vec<(std::time::Instant, String)>,
     /// Cache for the wire-format map scene sent to web clients, keyed by
     /// (scene Arc pointer, sheet, building cluster) so a rebuild only
     /// happens when the drawn view actually changes.
@@ -179,6 +190,82 @@ pub struct AppCore {
 
 impl AppCore {
     /// Create a new AppCore instance
+    /// Disk-free constructor for unit tests: default config, empty layout,
+    /// no cmdlist/sound, TTS disabled. Never touches VELLUM_FE_DIR.
+    #[cfg(test)]
+    pub(crate) fn new_for_test() -> Self {
+        let config = Config::default();
+        let layout = Layout {
+            windows: Vec::new(),
+            terminal_width: None,
+            terminal_height: None,
+            base_layout: None,
+            theme: None,
+            unknown_windows: Vec::new(),
+        };
+        let saved_dialog_positions: crate::config::SavedDialogPositions = Default::default();
+        let message_processor =
+            MessageProcessor::new(config.clone(), saved_dialog_positions.clone());
+        let parser = XmlParser::with_presets(Vec::new(), config.event_patterns.clone());
+        let tts_manager = crate::tts::TtsManager::new(false, 1.0, 1.0);
+        let keybind_map = Self::build_keybind_map(&config);
+        let temp = std::env::temp_dir().join("vellum-fe-test");
+
+        Self {
+            config,
+            map: crate::core::map_service::MapService::new(
+                temp.join("cache"),
+                temp.join("map_overrides.json"),
+            ),
+            map_updater: crate::core::mapdb_update::MapDbUpdater::new(temp.join("mapdb")),
+            travel: Default::default(),
+            timed_commands: Vec::new(),
+            remote_map_cache: None,
+            last_remote_map_revision: 0,
+            pending_map_views: Vec::new(),
+            layout: layout.clone(),
+            baseline_layout: Some(layout),
+            game_state: GameState::new(),
+            ui_state: UiState::new(),
+            parser,
+            message_processor,
+            current_stream: String::from("main"),
+            discard_current_stream: false,
+            stream_buffer: String::new(),
+            server_time_offset: 0,
+            cmdlist: None,
+            menu_request_counter: 0,
+            pending_menu_requests: HashMap::new(),
+            menu_categories: HashMap::new(),
+            last_link_click_pos: None,
+            perf_stats: PerformanceStats::new(),
+            show_perf_stats: false,
+            sound_player: None,
+            tts_manager,
+            pending_haptics: Vec::new(),
+            haptic_prev: Default::default(),
+            last_highlight_rumble: None,
+            evidence: crate::core::evidence::EvidenceStore::default(),
+            nav_room_id: None,
+            lich_room_id: None,
+            room_subtitle: None,
+            room_components: HashMap::new(),
+            current_room_component: None,
+            room_window_dirty: false,
+            running: true,
+            reconnect_requested: false,
+            needs_render: true,
+            chunk_has_main_text: false,
+            chunk_has_silent_updates: false,
+            layout_modified_since_save: false,
+            save_reminder_shown: false,
+            base_layout_name: None,
+            keybind_map,
+            hotbar_key_conflicts: Vec::new(),
+            saved_dialog_positions,
+        }
+    }
+
     pub fn new(config: Config) -> Result<Self> {
         // Load layout from file system
         let layout = Layout::load(config.character.as_deref())?;
@@ -259,6 +346,7 @@ impl AppCore {
                 crate::core::mapdb_update::download_dir(&map_base),
             ),
             travel: Default::default(),
+            timed_commands: Vec::new(),
             remote_map_cache: None,
             last_remote_map_revision: 0,
             pending_map_views: Vec::new(),
@@ -281,6 +369,9 @@ impl AppCore {
             show_perf_stats: false,
             sound_player,
             tts_manager,
+            pending_haptics: Vec::new(),
+            haptic_prev: Default::default(),
+            last_highlight_rumble: None,
             evidence: crate::core::evidence::EvidenceStore::default(),
             nav_room_id: None,
             lich_room_id: None,
@@ -322,6 +413,8 @@ impl AppCore {
 
         app.apply_session_cache();
         app.apply_custom_quickbars();
+        app.refresh_tts_windows();
+        app.apply_tts_settings();
 
         if let Some((theme_id, _)) = app.apply_layout_theme(layout_theme.as_deref()) {
             app.add_system_message(&format!("Theme switched to: {}", theme_id));
@@ -332,6 +425,90 @@ impl AppCore {
         app.refresh_map_source();
 
         Ok(app)
+    }
+
+    /// Rebuild the message processor's set of TTS-opted windows from the
+    /// layout. Call after layout load and whenever a window's tts_speak
+    /// flag or name changes.
+    pub fn refresh_tts_windows(&mut self) {
+        let windows: std::collections::HashSet<String> = self
+            .layout
+            .windows
+            .iter()
+            .filter(|def| def.base().tts_speak)
+            .map(|def| def.name().to_string())
+            .collect();
+        self.message_processor.set_tts_windows(windows);
+    }
+
+    /// Push the config's TTS settings (enabled, rate, volume, voice,
+    /// filters) into the live manager. Call at startup and after the
+    /// settings editor saves.
+    pub fn apply_tts_settings(&mut self) {
+        // The message processor gates enqueue on its own config copy;
+        // keep it in sync or runtime changes wait for a restart.
+        self.message_processor
+            .set_tts_config(self.config.tts.clone());
+        let tts = &self.config.tts;
+        self.tts_manager.set_enabled(tts.enabled);
+        let _ = self.tts_manager.set_rate(tts.rate);
+        let _ = self.tts_manager.set_volume(tts.volume);
+        self.tts_manager.set_voice_by_name(tts.voice.clone());
+        let substitutions: Vec<(String, String)> = tts
+            .substitutions
+            .iter()
+            .map(|sub| (sub.pattern.clone(), sub.replacement.clone()))
+            .collect();
+        self.tts_manager.set_filters(&tts.gags, &substitutions);
+    }
+
+    /// Reconcile the live `SoundPlayer` with `config.sound`.
+    ///
+    /// Without this the sound config was write-only: the keybind toggle and the
+    /// settings editor mutated `config.sound` and saved to disk, but the running
+    /// player kept its construction-time fields, so changes did nothing until a
+    /// restart. Because `SoundPlayer::new(enabled = false, ..)` returns `Err`
+    /// (audio device init is skipped when disabled), a player that started
+    /// disabled is `None` and cannot be re-enabled by a setter — it must be
+    /// reconstructed. Call this after any change to `config.sound`.
+    pub fn apply_sound_settings(&mut self) {
+        let sound = self.config.sound.clone();
+        match self.sound_player.as_mut() {
+            Some(player) => {
+                if sound.enabled {
+                    // Live player exists and stays enabled: push the new knobs.
+                    player.set_enabled(true);
+                    player.set_volume(sound.volume);
+                    player.set_cooldown_ms(sound.cooldown_ms);
+                } else {
+                    // Drop the player so the audio device is released; a later
+                    // enable reconstructs it.
+                    self.sound_player = None;
+                    tracing::debug!("Sound player disabled and released");
+                }
+            }
+            None if sound.enabled => {
+                // Enabling from a disabled/None state: build a fresh player.
+                match crate::sound::SoundPlayer::new(true, sound.volume, sound.cooldown_ms) {
+                    Ok(player) => {
+                        self.sound_player = Some(player);
+                        tracing::debug!("Sound player initialized on enable");
+                        if let Err(e) = crate::sound::ensure_sounds_directory() {
+                            tracing::warn!("Failed to create sounds directory: {}", e);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to initialize sound player on enable: {}", e);
+                        self.add_system_message(
+                            "Could not enable sound: no audio device available",
+                        );
+                    }
+                }
+            }
+            None => {
+                // Already disabled and no player — nothing to do.
+            }
+        }
     }
 
     /// Resolve the mapdb source from config and (re)start the load when it
@@ -441,9 +618,26 @@ impl AppCore {
     }
 
     /// Commands automation wants sent to the game; frontends drain this
-    /// through the same path as typed commands.
+    /// through the same path as typed commands. Includes macro sleep
+    /// segments whose pause has elapsed.
     pub fn take_outbound(&mut self) -> Vec<String> {
-        self.travel.take_outbound()
+        let mut commands = self.travel.take_outbound();
+        let now = std::time::Instant::now();
+        let mut i = 0;
+        while i < self.timed_commands.len() {
+            if self.timed_commands[i].0 <= now {
+                commands.push(self.timed_commands.remove(i).1);
+            } else {
+                i += 1;
+            }
+        }
+        commands
+    }
+
+    /// Queue a command to go out after a pause (macro sleep segments).
+    pub fn queue_timed_command(&mut self, delay: std::time::Duration, command: String) {
+        self.timed_commands
+            .push((std::time::Instant::now() + delay, command));
     }
 
     /// Plan and begin a trip to a mapdb room id.
@@ -1023,7 +1217,154 @@ impl AppCore {
     /// Called by the runtime after it spawns the web server task.
     pub fn enable_remote(&mut self, mut sink: crate::core::remote::RemoteSink) {
         sink.set_macros(&self.config.macros);
+        sink.set_wheels(&self.config);
         self.message_processor.remote = Some(sink);
+    }
+
+    /// Re-publish radial-wheel definitions to remote clients after the
+    /// wheel config changed (keybinds reload, desktop wheel editor).
+    /// No-op when web is disabled.
+    pub fn push_remote_wheels(&mut self) {
+        if let Some(remote) = self.message_processor.remote.as_mut() {
+            remote.set_wheels(&self.config);
+        }
+    }
+
+    /// Surface per-wheel `button` conflicts against the `[controller]`
+    /// table (the runtime binding authority). Two classes are reported:
+    ///   - a wheel's `button` disagrees with the button actually bound to
+    ///     its `controller_wheel[:name]` action — `[controller]` wins, so
+    ///     the note tells the user which button really opens the wheel;
+    ///   - two wheels claim the same `button` — only one can win.
+    /// Called after controller config (re)loads. Silent when clean.
+    pub fn warn_wheel_binding_conflicts(&mut self) {
+        use crate::config::KeyBindAction;
+        // button -> wheel key ("" = default) from [controller].
+        let mut bound: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        for (button, action) in &self.config.controller_binds {
+            if let KeyBindAction::Action(name) = action {
+                let key = if name == "controller_wheel" {
+                    Some(String::new())
+                } else {
+                    name.strip_prefix("controller_wheel:").map(str::to_string)
+                };
+                if let Some(key) = key {
+                    bound.insert(button.clone(), key);
+                }
+            }
+        }
+
+        let mut warnings: Vec<String> = Vec::new();
+        // Meta button vs [controller] authority.
+        let mut claimed: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        for (name, meta) in &self.config.controller_wheels_meta {
+            let Some(button) = meta.button.as_deref() else {
+                continue;
+            };
+            // Wheel key as [controller] would encode it ("default" wheel
+            // binds the bare controller_wheel action = key "").
+            let wheel_key = if name == "default" { "" } else { name.as_str() };
+            match bound.get(button) {
+                Some(k) if k == wheel_key => {} // agrees
+                Some(other) => {
+                    let other_label = if other.is_empty() { "default" } else { other };
+                    warnings.push(format!(
+                        "Wheel '{}' lists button '{}', but [controller] binds '{}' to the '{}' wheel — [controller] wins.",
+                        name, button, button, other_label
+                    ));
+                }
+                None => warnings.push(format!(
+                    "Wheel '{}' lists button '{}', but nothing in [controller] opens it — bind '{}' to 'controller_wheel:{}'.",
+                    name, button, button, name
+                )),
+            }
+            if let Some(prev) = claimed.insert(button.to_string(), name.clone()) {
+                warnings.push(format!(
+                    "Wheels '{}' and '{}' both claim button '{}' — only one can open on it.",
+                    prev, name, button
+                ));
+            }
+        }
+
+        for w in warnings {
+            self.add_system_message(&w);
+        }
+    }
+
+    /// Surface `span` problems across every configured wheel (default +
+    /// named, recursing into folders): spans that sum over 360°, resolve
+    /// below the minimum width, or leave a ring unable to close. Advisory
+    /// only — the runtime resolver always produces a usable ring by
+    /// clamping and scaling; these tell the user their numbers were
+    /// adjusted. Called alongside `warn_wheel_binding_conflicts` on load
+    /// and editor save. The dynamic portals wheel carries no spans, so it
+    /// is skipped.
+    pub fn warn_wheel_span_conflicts(&mut self) {
+        use crate::config::validate_wheel_spans;
+        let mut issues = validate_wheel_spans("default", &self.config.controller_wheel);
+        for (name, slices) in &self.config.controller_wheels {
+            if name == Self::PORTAL_WHEEL_KEY {
+                continue;
+            }
+            issues.extend(validate_wheel_spans(name, slices));
+        }
+        for issue in issues {
+            self.add_system_message(&issue.message());
+        }
+    }
+
+    /// Reserved dynamic wheel name: slices are built from the current
+    /// room's portal list at open time instead of TOML.
+    pub const PORTAL_WHEEL_KEY: &str = "portals";
+
+    /// Slices for a wheel key: the dynamic portals wheel first
+    /// (shadowing any static wheel of that name), else the static
+    /// config lookup. Owned — dynamic slices have no home in config.
+    pub fn wheel_slices(&self, key: &str, path: &[usize]) -> Option<Vec<crate::config::WheelSlice>> {
+        if key == Self::PORTAL_WHEEL_KEY {
+            if !path.is_empty() {
+                return None; // flat wheel: portals have no folders
+            }
+            let slices: Vec<crate::config::WheelSlice> = self
+                .portal_commands()
+                .into_iter()
+                .map(|command| crate::config::WheelSlice {
+                    // "go gate" reads as "gate" on the wedge; the full
+                    // command still shows in the hub.
+                    label: command
+                        .split_once(' ')
+                        .map(|(_, rest)| rest.to_string())
+                        .unwrap_or_else(|| command.clone()),
+                    command,
+                    // Dynamic slices carry no span/inner/color: the portals
+                    // ring stays evenly spaced with the global dead zone.
+                    ..Default::default()
+                })
+                .collect();
+            return (!slices.is_empty()).then_some(slices);
+        }
+        self.config.wheel_level_slices(key, path).cloned()
+    }
+
+    /// Resolve a wheel pick (remote clients): the dynamic portals wheel by
+    /// index, else static config. `<target_id>`/`<target_noun>` resolve
+    /// against the host's interact focus so a phone combat wheel casts at
+    /// the selected creature; a placeholder with nothing focused yields
+    /// None (the pick is dropped, never sent literally) — mirroring the
+    /// GUI wheel and bound interact macros. The GUI's own release-fire
+    /// substitutes in wheel_fire, so it doesn't route through here.
+    pub fn wheel_pick_command(&self, key: &str, path: &[usize]) -> Option<String> {
+        let raw = if key == Self::PORTAL_WHEEL_KEY {
+            let (&leaf, folders) = path.split_last()?;
+            if !folders.is_empty() {
+                return None;
+            }
+            self.portal_commands().into_iter().nth(leaf)?
+        } else {
+            self.config.wheel_pick_command(key, path)?
+        };
+        self.substitute_interact_placeholders(raw)
     }
 
     /// Declare that this runtime accepts session control (Connect /
@@ -1133,6 +1474,8 @@ impl AppCore {
                 .clone()
                 .or_else(|| self.lich_room_id.clone());
         }
+        // Portal resolution needs the map service, which lives here.
+        snap.portals = self.portal_commands();
         // Real sessions rarely set game_state.room_name/exits; fall back
         // the same way the room widget does (see gui sync_room_windows):
         // subtitle from <streamWindow> for the name, compass for exits.
@@ -1340,13 +1683,14 @@ impl AppCore {
                 Ok(event) => {
                     match event {
                         crate::tts::TtsEvent::UtteranceEnded => {
-                            tracing::debug!("Utterance ended");
+                            // Chains the next unread queue entry (auto-play).
+                            self.tts_manager.handle_utterance_ended();
                         }
                         crate::tts::TtsEvent::UtteranceStarted => {
                             tracing::debug!("Utterance started");
                         }
                         crate::tts::TtsEvent::UtteranceStopped => {
-                            tracing::debug!("Utterance stopped");
+                            self.tts_manager.handle_utterance_stopped();
                         }
                     }
                 }
@@ -1360,6 +1704,9 @@ impl AppCore {
                 }
             }
         }
+        // Watchdog: drains the queue even when the platform never delivers
+        // utterance-end callbacks (observed on Windows).
+        self.tts_manager.pump();
     }
 
     /// Initialize windows based on current layout
@@ -1398,10 +1745,10 @@ impl AppCore {
                 .get(window_def.name())
                 .cloned()
                 .unwrap_or(WindowPosition {
-                    x: 0,
-                    y: 0,
-                    width: 80,
-                    height: 24,
+                    x: crate::data::geometry::Col::new(0),
+                    y: crate::data::geometry::Row::new(0),
+                    width: crate::data::geometry::Width::new(80),
+                    height: crate::data::geometry::Height::new(24),
                 });
 
             let widget_type = WidgetType::from_str(window_def.widget_type());
@@ -1751,10 +2098,10 @@ impl AppCore {
         tracing::debug!(
             "Window '{}' will be created at exact pos=({},{}) size={}x{}",
             window_def.name(),
-            position.x,
-            position.y,
-            position.width,
-            position.height
+            position.x.get(),
+            position.y.get(),
+            position.width.get(),
+            position.height.get()
         );
 
         let is_room_window = window_def.widget_type() == "room";
@@ -2060,10 +2407,10 @@ impl AppCore {
         tracing::info!(
             "Created new window '{}' at ({}, {}) size {}x{}",
             window_def.name(),
-            position.x,
-            position.y,
-            position.width,
-            position.height
+            position.x.get(),
+            position.y.get(),
+            position.width.get(),
+            position.height.get()
         );
 
         // Update text stream subscriber map (new window may have stream subscriptions)
@@ -2096,10 +2443,10 @@ impl AppCore {
             tracing::info!(
                 "Updated window '{}' to EXACT position ({}, {}) size {}x{}",
                 window_def.name(),
-                position.x,
-                position.y,
-                position.width,
-                position.height
+                position.x.get(),
+                position.y.get(),
+                position.width.get(),
+                position.height.get()
             );
         }
     }
@@ -2175,6 +2522,8 @@ impl AppCore {
             for sound in self.message_processor.pending_sounds.drain(..) {
                 self.game_state.queue_sound(sound);
             }
+            // Highlight-driven rumble joins the haptic queue (cooldown inside).
+            self.queue_highlight_rumbles();
 
             // Attribute mapping observations to the current room uid
             if !self.message_processor.pending_evidence.is_empty() {
@@ -2253,6 +2602,8 @@ impl AppCore {
             for sound in self.message_processor.pending_sounds.drain(..) {
                 self.game_state.queue_sound(sound);
             }
+            // Highlight-driven rumble joins the haptic queue (cooldown inside).
+            self.queue_highlight_rumbles();
 
             // Attribute mapping observations to the current room uid
             if !self.message_processor.pending_evidence.is_empty() {
@@ -2399,6 +2750,9 @@ impl AppCore {
             ".loadlayout".to_string(),
             ".layouts".to_string(),
             ".resize".to_string(),
+            // UI pack sharing
+            ".uiexport".to_string(),
+            ".uiimport".to_string(),
             // Window management
             ".windows".to_string(),
             ".deletewindow".to_string(),
@@ -2706,6 +3060,12 @@ impl AppCore {
         self.add_system_message("  .reloadskin             - Reload the active skin's images");
         self.add_system_message("");
 
+        // Sharing
+        self.add_system_message("SHARING:");
+        self.add_system_message("  .uiexport <name> [parts]- Export layout/highlights/keybinds/hotbars/colors/macros/skin as a shareable pack");
+        self.add_system_message("  .uiimport <name|file>   - Preview a shared UI pack; add 'apply' to install (with backups)");
+        self.add_system_message("");
+
         // Tab navigation
         self.add_system_message("TAB NAVIGATION:");
         self.add_system_message("  .nexttab                - Switch to next tab");
@@ -2754,10 +3114,10 @@ impl AppCore {
             tracing::debug!(
                 "Window '{}' BEFORE capture: pos=({},{}) size={}x{}",
                 window_name,
-                base.col,
-                base.row,
-                base.cols,
-                base.rows
+                base.col.get(),
+                base.row.get(),
+                base.cols.get(),
+                base.rows.get()
             );
 
             if let Some(window_state) = self.ui_state.windows.get(&window_name) {
@@ -2765,40 +3125,40 @@ impl AppCore {
                 tracing::info!(
                     "Window '{}' - Capturing from UI state: pos=({},{}) size={}x{}",
                     window_name,
-                    ui_pos.x,
-                    ui_pos.y,
-                    ui_pos.width,
-                    ui_pos.height
+                    ui_pos.x.get(),
+                    ui_pos.y.get(),
+                    ui_pos.width.get(),
+                    ui_pos.height.get()
                 );
 
                 // Clamp window position and size to terminal boundaries before saving
-                let clamped_x = ui_pos.x.min(terminal_width.saturating_sub(1));
-                let clamped_y = ui_pos.y.min(terminal_height.saturating_sub(1));
+                let clamped_x = ui_pos.x.get().min(terminal_width.saturating_sub(1));
+                let clamped_y = ui_pos.y.get().min(terminal_height.saturating_sub(1));
 
                 // Ensure width doesn't exceed available space
                 // Use window's min_cols constraint (default 1) instead of hardcoded 10
                 let max_width = terminal_width.saturating_sub(clamped_x);
                 let min_width = base.min_cols.unwrap_or(1);
-                let clamped_width = ui_pos.width.min(max_width).max(min_width);
+                let clamped_width = ui_pos.width.get().min(max_width).max(min_width);
 
                 // Ensure height doesn't exceed available space
                 // Use window's min_rows constraint (default 1)
                 let max_height = terminal_height.saturating_sub(clamped_y);
                 let min_height = base.min_rows.unwrap_or(1);
-                let clamped_height = ui_pos.height.min(max_height).max(min_height);
+                let clamped_height = ui_pos.height.get().min(max_height).max(min_height);
 
-                if clamped_x != ui_pos.x
-                    || clamped_y != ui_pos.y
-                    || clamped_width != ui_pos.width
-                    || clamped_height != ui_pos.height
+                if clamped_x != ui_pos.x.get()
+                    || clamped_y != ui_pos.y.get()
+                    || clamped_width != ui_pos.width.get()
+                    || clamped_height != ui_pos.height.get()
                 {
                     tracing::warn!(
                         "Window '{}' clamped: ({},{} {}x{}) -> ({},{} {}x{}) to fit terminal {}x{}",
                         window_name,
-                        ui_pos.x,
-                        ui_pos.y,
-                        ui_pos.width,
-                        ui_pos.height,
+                        ui_pos.x.get(),
+                        ui_pos.y.get(),
+                        ui_pos.width.get(),
+                        ui_pos.height.get(),
                         clamped_x,
                         clamped_y,
                         clamped_width,
@@ -2809,18 +3169,18 @@ impl AppCore {
                 }
 
                 let base = window_def.base_mut();
-                base.row = clamped_y;
-                base.col = clamped_x;
-                base.rows = clamped_height;
-                base.cols = clamped_width;
+                base.row = crate::data::geometry::Row::new(clamped_y);
+                base.col = crate::data::geometry::Col::new(clamped_x);
+                base.rows = crate::data::geometry::Height::new(clamped_height);
+                base.cols = crate::data::geometry::Width::new(clamped_width);
 
                 tracing::debug!(
                     "Window '{}' AFTER capture: pos=({},{}) size={}x{}",
                     window_name,
-                    base.col,
-                    base.row,
-                    base.cols,
-                    base.rows
+                    base.col.get(),
+                    base.row.get(),
+                    base.cols.get(),
+                    base.rows.get()
                 );
             } else {
                 tracing::warn!(
@@ -2913,10 +3273,10 @@ impl AppCore {
             window_info.push(format!(
                 "  {} - {}x{} at ({},{}) - {} - {}",
                 name,
-                pos.width,
-                pos.height,
-                pos.x,
-                pos.y,
+                pos.width.get(),
+                pos.height.get(),
+                pos.x.get(),
+                pos.y.get(),
                 visible,
                 format!("{:?}", window.widget_type)
             ));
@@ -3033,8 +3393,16 @@ impl AppCore {
                 continue;
             }
 
-            // Get the window definition and create UI state
-            if let Some(window_def) = self.layout.windows.iter().find(|w| w.name() == name) {
+            // Get the window definition and create UI state. Templates with
+            // auto-generated names (spacers, `*_custom` blanks) don't match
+            // the template name; the window just added is the last entry.
+            let window_def = self
+                .layout
+                .windows
+                .iter()
+                .find(|w| w.name() == name)
+                .or_else(|| self.layout.windows.last());
+            if let Some(window_def) = window_def {
                 let window_def_clone = window_def.clone();
                 self.add_new_window(&window_def_clone, terminal_width, terminal_height);
                 tracing::info!("Auto-added window '{}' from openDialog", name);
@@ -3095,10 +3463,10 @@ impl AppCore {
                 container_title: container_title.to_string(),
             },
             position: WindowPosition {
-                x,
-                y,
-                width: w,
-                height: h,
+                x: crate::data::geometry::Col::new(x),
+                y: crate::data::geometry::Row::new(y),
+                width: crate::data::geometry::Width::new(w),
+                height: crate::data::geometry::Height::new(h),
             },
             visible: true,
             focused: false,
@@ -3321,10 +3689,10 @@ impl AppCore {
             widget_type: widget_type.clone(),
             content,
             position: WindowPosition {
-                x,
-                y,
-                width,
-                height,
+                x: crate::data::geometry::Col::new(x),
+                y: crate::data::geometry::Row::new(y),
+                width: crate::data::geometry::Width::new(width),
+                height: crate::data::geometry::Height::new(height),
             },
             visible: true,
             content_align: None,
@@ -3336,16 +3704,14 @@ impl AppCore {
         self.ui_state.set_window(name.to_string(), window);
 
         // Create window definition for layout
-        use crate::config::{
-            BorderSides, CommandInputWidgetData, RoomWidgetData, TextWidgetData, WindowBase,
-        };
+        use crate::config::{BorderSides, TextWidgetData, WindowBase};
 
         let base = WindowBase {
             name: name.to_string(),
-            row: y,
-            col: x,
-            rows: height,
-            cols: width,
+            row: crate::data::geometry::Row::new(y),
+            col: crate::data::geometry::Col::new(x),
+            rows: crate::data::geometry::Height::new(height),
+            cols: crate::data::geometry::Width::new(width),
             show_border: true,
             border_style: "single".to_string(),
             border_sides: BorderSides::default(),
@@ -3363,56 +3729,34 @@ impl AppCore {
             max_cols: None,
             visible: true,
             content_align: None,
+            tts_speak: false,
+            text_size: None,
+            font_family: None,
         };
 
-        let window_def = match widget_type_str.to_lowercase().as_str() {
-            "text" => WindowDef::Text {
-                base,
+        // Persist the window with its REAL widget type. Previously only
+        // text/room/command_input/webui were handled and every other type fell
+        // back to WindowDef::Text, so progress/countdown/compass/indicator/hand
+        // windows reloaded as empty text boxes (and landed in the wrong resize
+        // bucket). WindowDef::blank builds the correct variant for each type.
+        //
+        // `widget_type_str` was already validated by WidgetType::try_from_str
+        // near the top of this function, so blank() cannot return None here;
+        // fall back to a plain text def defensively rather than panicking.
+        let fallback_base = base.clone();
+        let window_def = WindowDef::blank(widget_type_str, base).unwrap_or_else(|| {
+            WindowDef::Text {
+                base: fallback_base,
                 data: TextWidgetData {
                     streams: vec![],
-                    buffer_size: 1000,
+                    buffer_size: 10_000,
                     wordwrap: true,
                     show_timestamps: false,
                     timestamp_position: None,
                     compact: false,
                 },
-            },
-            "room" => WindowDef::Room {
-                base,
-                data: RoomWidgetData {
-                    buffer_size: 0,
-                    show_desc: true,
-                    show_objs: true,
-                    show_players: true,
-                    show_exits: true,
-                    show_name: false,
-                },
-            },
-            "command_input" | "commandinput" => WindowDef::CommandInput {
-                base,
-                data: CommandInputWidgetData::default(),
-            },
-            "webui" | "lichui" => WindowDef::WebUi {
-                base,
-                data: crate::config::WebUiWidgetData {
-                    page: name.to_string(),
-                },
-            },
-            _ => {
-                // Default to text window for unknown types
-                WindowDef::Text {
-                    base,
-                    data: TextWidgetData {
-                        streams: vec![],
-                        buffer_size: 1000,
-                        wordwrap: true,
-                        show_timestamps: false,
-                        timestamp_position: None,
-                    compact: false,
-                    },
-                }
             }
-        };
+        });
 
         // Add to layout at the front (so new windows appear on top)
         self.layout.windows.insert(0, window_def);
@@ -3451,6 +3795,7 @@ impl AppCore {
         page_id: &str,
         title: &str,
         size_hint: Option<[f32; 2]>,
+        kind: Option<String>,
     ) -> String {
         use crate::data::{WidgetType, WindowContent, WindowPosition, WindowState};
 
@@ -3469,17 +3814,17 @@ impl AppCore {
             None => (40, 12),
         };
 
+        let mut content = crate::data::webui::WebUiPanelContent::new(page_id, title);
+        content.kind = kind;
         let window = WindowState {
             name: name.clone(),
             widget_type: WidgetType::WebUi,
-            content: WindowContent::WebUi(crate::data::webui::WebUiPanelContent::new(
-                page_id, title,
-            )),
+            content: WindowContent::WebUi(content),
             position: WindowPosition {
-                x: 0,
-                y: 0,
-                width,
-                height,
+                x: crate::data::geometry::Col::new(0),
+                y: crate::data::geometry::Row::new(0),
+                width: crate::data::geometry::Width::new(width),
+                height: crate::data::geometry::Height::new(height),
             },
             visible: true,
             content_align: None,
@@ -3490,10 +3835,10 @@ impl AppCore {
 
         let base = crate::config::WindowBase {
             name: name.clone(),
-            row: 0,
-            col: 0,
-            rows: height,
-            cols: width,
+            row: crate::data::geometry::Row::new(0),
+            col: crate::data::geometry::Col::new(0),
+            rows: crate::data::geometry::Height::new(height),
+            cols: crate::data::geometry::Width::new(width),
             show_border: true,
             border_style: "single".to_string(),
             border_sides: crate::config::BorderSides::default(),
@@ -3511,6 +3856,9 @@ impl AppCore {
             max_cols: None,
             visible: true,
             content_align: None,
+            tts_speak: false,
+            text_size: None,
+            font_family: None,
         };
         self.layout.windows.insert(
             0,
@@ -3688,57 +4036,57 @@ impl AppCore {
 
             // Apply min/max constraints from window settings
             if let Some(min_cols) = window_def.base().min_cols {
-                if window_width < min_cols {
+                if window_width.get() < min_cols {
                     tracing::debug!(
                         "Window '{}': enforcing min_cols={} (was {})",
                         window_def.name(),
                         min_cols,
-                        window_width
+                        window_width.get()
                     );
-                    window_width = min_cols;
+                    window_width = crate::data::geometry::Width::new(min_cols);
                 }
             }
             if let Some(max_cols) = window_def.base().max_cols {
-                if window_width > max_cols {
+                if window_width.get() > max_cols {
                     tracing::debug!(
                         "Window '{}': enforcing max_cols={} (was {})",
                         window_def.name(),
                         max_cols,
-                        window_width
+                        window_width.get()
                     );
-                    window_width = max_cols;
+                    window_width = crate::data::geometry::Width::new(max_cols);
                 }
             }
             if let Some(min_rows) = window_def.base().min_rows {
-                if window_height < min_rows {
+                if window_height.get() < min_rows {
                     tracing::debug!(
                         "Window '{}': enforcing min_rows={} (was {})",
                         window_def.name(),
                         min_rows,
-                        window_height
+                        window_height.get()
                     );
-                    window_height = min_rows;
+                    window_height = crate::data::geometry::Height::new(min_rows);
                 }
             }
             if let Some(max_rows) = window_def.base().max_rows {
-                if window_height > max_rows {
+                if window_height.get() > max_rows {
                     tracing::debug!(
                         "Window '{}': enforcing max_rows={} (was {})",
                         window_def.name(),
                         max_rows,
-                        window_height
+                        window_height.get()
                     );
-                    window_height = max_rows;
+                    window_height = crate::data::geometry::Height::new(max_rows);
                 }
             }
 
             tracing::debug!(
                 "Window '{}': pos=({},{}) size={}x{}",
                 window_def.name(),
-                window_def.base().col,
-                window_def.base().row,
-                window_width,
-                window_height
+                window_def.base().col.get(),
+                window_def.base().row.get(),
+                window_width.get(),
+                window_height.get()
             );
 
             positions.insert(
@@ -3781,6 +4129,11 @@ impl AppCore {
             crate::data::ui_state::PopupMenuItem {
                 text: "Settings".to_string(),
                 command: ".settings".to_string(),
+                disabled: false,
+            },
+            crate::data::ui_state::PopupMenuItem {
+                text: "Streams".to_string(),
+                command: ".streams".to_string(),
                 disabled: false,
             },
             crate::data::ui_state::PopupMenuItem {
@@ -4324,7 +4677,7 @@ impl AppCore {
                     .max(base.min_rows.unwrap_or(1))
                     .min(base.max_rows.unwrap_or(u16::MAX));
 
-                if base.rows != new_rows {
+                if base.rows.get() != new_rows {
                     changes.push((base.name.clone(), new_rows));
                 }
             }
@@ -4336,7 +4689,7 @@ impl AppCore {
             for window_def in &mut self.layout.windows {
                 if window_def.name() == name {
                     if let crate::config::WindowDef::Betrayer { base, .. } = window_def {
-                        base.rows = new_rows;
+                        base.rows = crate::data::geometry::Height::new(new_rows);
                     }
                     break;
                 }
@@ -4344,7 +4697,7 @@ impl AppCore {
 
             // Update ui_state window position height
             if let Some(window) = self.ui_state.windows.get_mut(&name) {
-                window.position.height = new_rows;
+                window.position.height = crate::data::geometry::Height::new(new_rows);
             }
 
             // Mark modified but don't show the save reminder for auto-resizes
@@ -4535,8 +4888,28 @@ impl AppCore {
         match crate::config::Config::load_keybinds(self.config.character.as_deref()) {
             Ok(keybinds) => {
                 self.config.keybinds = keybinds;
+                self.config.controller_binds =
+                    crate::config::Config::load_controller_binds().unwrap_or_default();
+                self.config.controller_shift_binds =
+                    crate::config::Config::load_controller_binds_layer(true).unwrap_or_default();
+                self.config.controller_wheel =
+                    crate::config::Config::load_controller_wheel().unwrap_or_default();
+                self.config.controller_wheels =
+                    crate::config::Config::load_controller_wheels().unwrap_or_default();
+                self.config.controller_wheels_meta =
+                    crate::config::Config::load_controller_wheels_meta().unwrap_or_default();
+                self.config.controller_overlay =
+                    crate::config::Config::load_controller_overlay().unwrap_or_default();
+                self.config.controller_rumble =
+                    crate::config::Config::load_controller_rumble().unwrap_or_default();
+                self.config.controller_tuning =
+                    crate::config::Config::load_controller_tuning().unwrap_or_default();
                 // Rebuild keybind map for O(1) lookups (re-merges hotbar keys)
                 self.rebuild_keybind_map();
+                // Web clients render the wheel from a shipped copy.
+                self.push_remote_wheels();
+                self.warn_wheel_binding_conflicts();
+                self.warn_wheel_span_conflicts();
                 self.add_system_message("Keybinds reloaded");
             }
             Err(e) => {
@@ -5246,10 +5619,10 @@ mod tests {
     fn test_window_base(name: &str) -> WindowBase {
         WindowBase {
             name: name.to_string(),
-            row: 0,
-            col: 0,
-            rows: 2,
-            cols: 5,
+            row: crate::data::geometry::Row::new(0),
+            col: crate::data::geometry::Col::new(0),
+            rows: crate::data::geometry::Height::new(2),
+            cols: crate::data::geometry::Width::new(5),
             show_border: false,
             border_style: "single".to_string(),
             border_sides: BorderSides::default(),
@@ -5266,6 +5639,9 @@ mod tests {
             max_cols: None,
             visible: true,
             content_align: None,
+            tts_speak: false,
+            text_size: None,
+            font_family: None,
             title_position: "top-left".to_string(),
         }
     }
@@ -5507,6 +5883,88 @@ mod tests {
 
         let name = AppCore::generate_spacer_name(&layout);
         assert_eq!(name, "spacer_100");
+    }
+
+    // ========== calculate_window_positions characterization ==========
+    // This is the load/init positioning pass: it copies each window's EXACT
+    // col/row (no scaling — deliberately, so windows may sit offscreen) and
+    // clamps width/height to any min/max constraints. Pin that contract before
+    // a geometry newtype touches it.
+
+    fn positioned_text_def(
+        name: &str,
+        col: u16,
+        row: u16,
+        cols: u16,
+        rows: u16,
+    ) -> WindowDef {
+        let mut base = test_window_base(name);
+        base.col = crate::data::geometry::Col::new(col);
+        base.row = crate::data::geometry::Row::new(row);
+        base.cols = crate::data::geometry::Width::new(cols);
+        base.rows = crate::data::geometry::Height::new(rows);
+        WindowDef::Text {
+            base,
+            data: crate::config::TextWidgetData {
+                streams: vec![],
+                buffer_size: 1000,
+                wordwrap: true,
+                show_timestamps: false,
+                timestamp_position: None,
+                compact: false,
+            },
+        }
+    }
+
+    fn core_with_layout(windows: Vec<WindowDef>) -> AppCore {
+        let mut core = AppCore::new_for_test();
+        core.layout = Layout {
+            windows,
+            terminal_width: Some(80),
+            terminal_height: Some(24),
+            base_layout: None,
+            theme: None,
+            unknown_windows: Vec::new(),
+        };
+        core
+    }
+
+    /// Positions and sizes pass through exactly (no scaling), even when the
+    /// window extends beyond the given terminal size.
+    #[test]
+    fn calculate_window_positions_uses_exact_values() {
+        let core = core_with_layout(vec![
+            positioned_text_def("a", 3, 5, 40, 10),
+            positioned_text_def("offscreen", 100, 50, 20, 8), // beyond 80x24
+        ]);
+        let positions = core.calculate_window_positions(80, 24);
+
+        let a = &positions["a"];
+        assert_eq!(
+            (a.x.get(), a.y.get(), a.width.get(), a.height.get()),
+            (3, 5, 40, 10)
+        );
+        // Deliberately NOT clamped to the terminal — offscreen is allowed.
+        let off = &positions["offscreen"];
+        assert_eq!(
+            (off.x.get(), off.y.get(), off.width.get(), off.height.get()),
+            (100, 50, 20, 8)
+        );
+    }
+
+    /// min/max constraints clamp the size (never the position).
+    #[test]
+    fn calculate_window_positions_applies_min_max_constraints() {
+        let mut narrow = positioned_text_def("narrow", 0, 0, 4, 30);
+        narrow.base_mut().min_cols = Some(10); // widen up to min
+        narrow.base_mut().max_rows = Some(20); // cap height
+        let core = core_with_layout(vec![narrow]);
+
+        let p = &core.calculate_window_positions(80, 24)["narrow"];
+        assert_eq!(p.x.get(), 0); // position untouched
+        assert_eq!(p.y.get(), 0);
+        assert_eq!(p.width.get(), 10); // 4 raised to min_cols
+        assert_eq!(p.height.get(), 20); // 30 capped at max_rows
     }
 }
 

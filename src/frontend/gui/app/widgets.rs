@@ -207,7 +207,65 @@ impl VellumGuiApp {
             return;
         }
         let job = std::mem::take(job);
-        ui.add(egui::Label::new(job));
+        if super::color_emoji::should_overlay(&job.text) {
+            Self::add_label_with_color_emoji(ui, egui::Label::new(job), false, None);
+        } else {
+            ui.add(egui::Label::new(job));
+        }
+    }
+
+    /// Add a label whose text contains emoji, then paint color emoji
+    /// textures over the monochrome glyphs.
+    ///
+    /// `Label::ui` never exposes its galley, so this path uses the public
+    /// `Label::layout_in_ui` (identical layout, allocation, and response)
+    /// and mirrors the paint block of `impl Widget for Label` from the egui
+    /// fork (rev 426ef99, crates/egui/src/widgets/label.rs), minus the
+    /// elided-text hover tooltip: our jobs never elide (no
+    /// max_rows/truncate). Callers pass `interactive` = whether the label
+    /// was given a non-hover sense, and the explicit `selectable` override
+    /// if one was set on the label, matching what `Label::ui` derives.
+    fn add_label_with_color_emoji(
+        ui: &mut egui::Ui,
+        label: egui::Label,
+        interactive: bool,
+        selectable: Option<bool>,
+    ) -> egui::Response {
+        let (galley_pos, galley, response) = label.layout_in_ui(ui);
+        response.widget_info(|| {
+            egui::WidgetInfo::labeled(egui::WidgetType::Label, ui.is_enabled(), galley.text())
+        });
+        if ui.is_rect_visible(response.rect) {
+            let response_color = if interactive {
+                ui.style().interact(&response).text_color()
+            } else {
+                ui.style().visuals.text_color()
+            };
+            let underline = if response.has_focus() || response.highlighted() {
+                egui::Stroke::new(1.0, response_color)
+            } else {
+                egui::Stroke::NONE
+            };
+            let selectable =
+                selectable.unwrap_or_else(|| ui.style().interaction.selectable_labels);
+            if selectable {
+                egui::text_selection::LabelSelectionState::label_text_selection(
+                    ui,
+                    &response,
+                    galley_pos,
+                    galley.clone(),
+                    response_color,
+                    underline,
+                );
+            } else {
+                ui.painter().add(
+                    egui::epaint::TextShape::new(galley_pos, galley.clone(), response_color)
+                        .with_underline(underline),
+                );
+            }
+            super::color_emoji::paint_color_emoji(ui.ctx(), ui.painter(), &galley, galley_pos);
+        }
+        response
     }
 
     /// Format a line's arrival time for display, matching the TUI's style
@@ -289,13 +347,16 @@ impl VellumGuiApp {
                             search_match,
                             font_id,
                         );
-                        let response = ui
-                            .add(
-                                egui::Label::new(rich)
-                                    .sense(egui::Sense::click_and_drag())
-                                    .selectable(!Self::link_drag_blocks_selection(ui)),
-                            )
-                            .on_hover_cursor(egui::CursorIcon::PointingHand);
+                        let selectable = !Self::link_drag_blocks_selection(ui);
+                        let label = egui::Label::new(rich)
+                            .sense(egui::Sense::click_and_drag())
+                            .selectable(selectable);
+                        let response = if super::color_emoji::should_overlay(&segment.text) {
+                            Self::add_label_with_color_emoji(ui, label, true, Some(selectable))
+                        } else {
+                            ui.add(label)
+                        }
+                        .on_hover_cursor(egui::CursorIcon::PointingHand);
                         if let Some(link_data) = &segment.link_data {
                             if let Some(drop) = Self::handle_link_dnd(ui, &response, link_data) {
                                 clicked_link.get_or_insert(drop);
@@ -2454,6 +2515,7 @@ impl VellumGuiApp {
         ui: &mut egui::Ui,
         window_name: &str,
         bar_name: &str,
+        skin_art: Option<&crate::frontend::gui::skin::SkinWidgetArt>,
     ) -> Option<GuiLinkClick> {
         let Some(bar_def) = app_core.config.hotbars.find_bar(bar_name) else {
             ui.weak(format!(
@@ -2490,26 +2552,68 @@ impl VellumGuiApp {
         let mut clicked = None;
         let mut render_buttons = |ui: &mut egui::Ui| {
             for button in &buttons {
-                let text = match button.countdown_secs {
-                    Some(secs) if secs > 0 => format!("{}  {}s", button.label, secs),
-                    _ => button.label.clone(),
-                };
-                let mut rich = RichText::new(text);
-                if button.dim {
-                    rich = rich.color(ui.visuals().weak_text_color());
-                } else if let Some(fg) = button.fg.as_deref().and_then(parse_hex_color) {
-                    rich = rich.color(fg);
-                }
+                use crate::config::IconMode;
 
-                let mut widget = egui::Button::new(rich);
-                if !button.dim {
-                    if let Some(bg) = button.bg.as_deref().and_then(parse_hex_color) {
-                        widget = widget.fill(bg);
+                // Icon face: only when the mode asks for one AND the active
+                // skin resolves the sheet cell. Otherwise fall back to text
+                // (also the no-skin and TUI-authored-config behavior).
+                let sprite = match button.icon_mode {
+                    IconMode::Text => None,
+                    IconMode::Icon | IconMode::IconAndLabel => {
+                        button.icon.as_ref().and_then(|icon| {
+                            skin_art.and_then(|art| {
+                                // Dim states reuse the grayscale twin, barbar-style.
+                                art.sheet_cell(
+                                    &icon.sheet,
+                                    icon.cell,
+                                    icon.grayscale || button.dim,
+                                )
+                            })
+                        })
                     }
-                }
+                };
 
-                let mut response = ui.add(widget);
+                let mut response = if let Some((texture, uv)) = sprite {
+                    let edge = Self::icon_edge(ui, bar_def.icon_size);
+                    Self::draw_icon_button(ui, button, texture, uv, edge)
+                } else {
+                    let text = match button.countdown_secs {
+                        Some(secs) if secs > 0 => {
+                            format!("{}  {}s", button.label, secs)
+                        }
+                        _ => button.label.clone(),
+                    };
+                    let mut rich = RichText::new(text);
+                    if button.dim {
+                        rich = rich.color(ui.visuals().weak_text_color());
+                    } else if let Some(fg) =
+                        button.fg.as_deref().and_then(parse_hex_color)
+                    {
+                        rich = rich.color(fg);
+                    }
+
+                    let mut widget = egui::Button::new(rich);
+                    if !button.dim {
+                        if let Some(bg) = button.bg.as_deref().and_then(parse_hex_color)
+                        {
+                            widget = widget.fill(bg);
+                        }
+                    }
+                    ui.add(widget)
+                };
+
                 let mut hover = button.tooltip.clone().unwrap_or_default();
+                // Icon-only faces lose their text; surface the label on hover.
+                if matches!(button.icon_mode, IconMode::Icon)
+                    && sprite.is_some()
+                    && !button.label.is_empty()
+                {
+                    hover = if hover.is_empty() {
+                        button.label.clone()
+                    } else {
+                        format!("{}\n{}", button.label, hover)
+                    };
+                }
                 if let Some(hotkey) = &button.hotkey {
                     if !hover.is_empty() {
                         hover.push('\n');
@@ -2536,6 +2640,223 @@ impl VellumGuiApp {
             ui.horizontal_wrapped(render_buttons);
         }
         clicked
+    }
+
+    /// Icon face edge for a bar: its configured size (clamped sane) or the
+    /// text-button height so mixed icon/text bars line up by default.
+    pub(super) fn icon_edge(ui: &egui::Ui, configured: Option<u32>) -> f32 {
+        match configured {
+            Some(px) => px.clamp(16, 128) as f32,
+            None => ui.spacing().interact_size.y.max(24.0),
+        }
+    }
+
+    /// Paint one icon-faced hotbar button: allocated click rect + painter
+    /// image (the codebase's sprite idiom — no egui Image widget), with
+    /// optional label, solid border, dim tint, and countdown overlay.
+    /// Also used by the hotbar editor's live preview.
+    pub(super) fn draw_icon_button(
+        ui: &mut egui::Ui,
+        button: &crate::core::hotbar::ResolvedHotbarButton,
+        texture: crate::frontend::gui::skin::SkinTexture,
+        uv: egui::Rect,
+        edge: f32,
+    ) -> egui::Response {
+        use crate::config::IconMode;
+
+        let with_label = matches!(button.icon_mode, IconMode::IconAndLabel);
+
+        // Label galley first so the allocation can fit icon + text.
+        let label_galley = with_label.then(|| {
+            let color = if button.dim {
+                ui.visuals().weak_text_color()
+            } else {
+                button
+                    .fg
+                    .as_deref()
+                    .and_then(parse_hex_color)
+                    .unwrap_or_else(|| ui.visuals().text_color())
+            };
+            ui.painter().layout_no_wrap(
+                button.label.clone(),
+                egui::TextStyle::Button.resolve(ui.style()),
+                color,
+            )
+        });
+        let gap = 4.0;
+        let width = edge
+            + label_galley
+                .as_ref()
+                .map(|g| gap + g.size().x + gap)
+                .unwrap_or(0.0);
+
+        let (rect, response) =
+            ui.allocate_exact_size(egui::vec2(width, edge), egui::Sense::click());
+        if !ui.is_rect_visible(rect) {
+            return response;
+        }
+        let painter = ui.painter();
+
+        // Button chrome: fill + hover highlight, matching egui's button feel.
+        let visuals = ui.style().interact(&response);
+        let fill = if button.dim {
+            visuals.bg_fill
+        } else {
+            button
+                .bg
+                .as_deref()
+                .and_then(parse_hex_color)
+                .unwrap_or(visuals.bg_fill)
+        };
+        painter.rect_filled(rect, visuals.corner_radius, fill);
+
+        // The icon cell, letterboxed square at the left edge.
+        let icon_rect = egui::Rect::from_min_size(rect.min, egui::vec2(edge, edge));
+        let tint = if button.dim {
+            // Grayscale twin already applied; also fade it.
+            egui::Color32::from_white_alpha(140)
+        } else {
+            egui::Color32::WHITE
+        };
+        painter.image(texture.texture, icon_rect.shrink(1.0), uv, tint);
+
+        if let Some(galley) = label_galley {
+            let pos = egui::pos2(
+                rect.min.x + edge + gap,
+                rect.center().y - galley.size().y / 2.0,
+            );
+            painter.galley(pos, galley, ui.visuals().text_color());
+        }
+
+        // Border variant (barbar's c_HEX / cg_.. / bw_N, drawn not baked).
+        if let Some(icon) = button.icon.as_ref() {
+            if let Some(color) = icon.border.as_deref().and_then(parse_hex_color) {
+                let bw = icon.border_width.unwrap_or(2).clamp(1, 10) as f32;
+                match icon.border_end.as_deref().and_then(parse_hex_color) {
+                    Some(end) => Self::paint_gradient_border(
+                        painter,
+                        icon_rect,
+                        bw,
+                        color,
+                        end,
+                        icon.border_dir,
+                    ),
+                    None => {
+                        painter.rect_stroke(
+                            icon_rect.shrink(bw / 2.0),
+                            visuals.corner_radius,
+                            egui::Stroke::new(bw, color),
+                            egui::StrokeKind::Inside,
+                        );
+                    }
+                }
+            }
+        }
+
+        // Countdown overlay: bottom-center of the icon, barbar-style.
+        if let Some(secs) = button.countdown_secs.filter(|s| *s > 0) {
+            let text = format!("{}s", secs);
+            let font = egui::TextStyle::Small.resolve(ui.style());
+            let galley =
+                painter.layout_no_wrap(text, font, egui::Color32::WHITE);
+            let pos = egui::pos2(
+                icon_rect.center().x - galley.size().x / 2.0,
+                icon_rect.max.y - galley.size().y - 1.0,
+            );
+            // Scrim behind the digits so they read over any art.
+            painter.rect_filled(
+                egui::Rect::from_min_size(pos, galley.size()).expand(1.0),
+                2.0,
+                egui::Color32::from_black_alpha(160),
+            );
+            painter.galley(pos, galley, egui::Color32::WHITE);
+        }
+
+        response.on_hover_cursor(egui::CursorIcon::PointingHand)
+    }
+
+    /// Gradient position 0..1 at `pos` within `rect`, per barbar's cg
+    /// direction formulas (horizontal px/w, diagonal averages, radial
+    /// center distance, square Chebyshev distance).
+    fn gradient_t(dir: crate::config::GradientDir, pos: egui::Pos2, rect: egui::Rect) -> f32 {
+        use crate::config::GradientDir;
+        let w = rect.width().max(1.0);
+        let h = rect.height().max(1.0);
+        let px = pos.x - rect.min.x;
+        let py = pos.y - rect.min.y;
+        let t = match dir {
+            GradientDir::Horizontal => px / w,
+            GradientDir::Vertical => py / h,
+            GradientDir::DiagonalDown => (px / w + py / h) / 2.0,
+            GradientDir::DiagonalUp => ((w - px) / w + py / h) / 2.0,
+            GradientDir::Radial => {
+                let c = rect.center();
+                let max = (w * w + h * h).sqrt() / 2.0;
+                pos.distance(c) / max.max(1.0)
+            }
+            GradientDir::Square => {
+                let c = rect.center();
+                ((pos.x - c.x).abs() / (w / 2.0)).max((pos.y - c.y).abs() / (h / 2.0))
+            }
+        };
+        t.clamp(0.0, 1.0)
+    }
+
+    /// Two-color border drawn as short filled strips along the rect's four
+    /// edges, each tinted by the gradient at its midpoint. Segments give
+    /// uniform handling of all six directions (a mesh can't express the
+    /// radial/square ones per-vertex).
+    fn paint_gradient_border(
+        painter: &egui::Painter,
+        rect: egui::Rect,
+        bw: f32,
+        start: egui::Color32,
+        end: egui::Color32,
+        dir: crate::config::GradientDir,
+    ) {
+        const SEGMENTS: u32 = 16;
+        let lerp = |t: f32| -> egui::Color32 {
+            let a = egui::Rgba::from(start);
+            let b = egui::Rgba::from(end);
+            egui::Color32::from(a * (1.0 - t) + b * t)
+        };
+        let mut strip = |seg: egui::Rect| {
+            painter.rect_filled(seg, 0.0, lerp(Self::gradient_t(dir, seg.center(), rect)));
+        };
+        let step = rect.width() / SEGMENTS as f32;
+        for i in 0..SEGMENTS {
+            let x0 = rect.min.x + i as f32 * step;
+            let x1 = if i + 1 == SEGMENTS { rect.max.x } else { x0 + step };
+            strip(egui::Rect::from_min_max(
+                egui::pos2(x0, rect.min.y),
+                egui::pos2(x1, rect.min.y + bw),
+            ));
+            strip(egui::Rect::from_min_max(
+                egui::pos2(x0, rect.max.y - bw),
+                egui::pos2(x1, rect.max.y),
+            ));
+        }
+        // Side strips skip the corner rows the top/bottom already painted.
+        let inner_h = (rect.height() - 2.0 * bw).max(0.0);
+        let step = inner_h / SEGMENTS as f32;
+        if step > 0.0 {
+            for i in 0..SEGMENTS {
+                let y0 = rect.min.y + bw + i as f32 * step;
+                let y1 = if i + 1 == SEGMENTS {
+                    rect.max.y - bw
+                } else {
+                    y0 + step
+                };
+                strip(egui::Rect::from_min_max(
+                    egui::pos2(rect.min.x, y0),
+                    egui::pos2(rect.min.x + bw, y1),
+                ));
+                strip(egui::Rect::from_min_max(
+                    egui::pos2(rect.max.x - bw, y0),
+                    egui::pos2(rect.max.x, y1),
+                ));
+            }
+        }
     }
 
     pub(super) fn render_performance_content(app_core: &AppCore, ui: &mut egui::Ui) {
@@ -2703,42 +3024,101 @@ impl VellumGuiApp {
         });
     }
 
-    pub(super) fn render_room_entities(ui: &mut egui::Ui, label: &str, values: &[String]) {
-        if values.is_empty() {
-            return;
-        }
-        ui.separator();
-        ui.horizontal_wrapped(|ui| {
-            ui.label(RichText::new(format!("{}:", label)).strong());
-            ui.label(values.join(", "));
-        });
-    }
-
-    pub(super) fn render_room_exits(ui: &mut egui::Ui, exits: &[String]) -> Option<GuiLinkClick> {
-        if exits.is_empty() {
-            return None;
-        }
-
+    /// Wrayth-style room window: one flowing block inside a single scroll
+    /// area — the description runs straight into "You also see ...", then
+    /// the players and exits lines follow, links clickable throughout.
+    /// Every section takes its natural height, so a tall enough window
+    /// shows everything without scrolling.
+    pub(super) fn render_room_content(
+        ui: &mut egui::Ui,
+        room: &crate::data::RoomContent,
+        show: (bool, bool, bool, bool), // desc, objs, players, exits
+        scroll_id: &str,
+        text_size: f32,
+        font_id: &egui::FontId,
+        interact_focus: Option<&str>, // exist id to draw the focus ring on
+    ) -> Option<GuiLinkClick> {
+        // Cheap Arc clone; deep-cloning Visuals per window per frame is not.
+        let style = ui.style().clone();
+        let visuals = &style.visuals;
         let mut clicked_link = None;
-        ui.separator();
-        ui.horizontal_wrapped(|ui| {
-            ui.label(RichText::new("Exits:").strong());
-            for (index, exit) in exits.iter().enumerate() {
-                let response = ui
-                    .add(egui::Label::new(exit.as_str()).sense(egui::Sense::click()))
-                    .on_hover_cursor(egui::CursorIcon::PointingHand);
-                if response.clicked() && clicked_link.is_none() {
-                    clicked_link = Some(Self::gui_link_click_from_response(
-                        &response,
-                        ui,
-                        Self::direct_command_link(exit.to_string()),
-                    ));
+        let max_height = ui.available_height().max(1.0);
+        let (show_desc, show_objs, show_players, show_exits) = show;
+
+        let mut body: Vec<StyledLine> = Vec::new();
+        if show_desc {
+            body.extend(room.description.iter().cloned());
+        }
+        // Objects continue the description paragraph, as in Wrayth:
+        // "...coats them.  You also see some cuirbouilli leather, ..."
+        if show_objs {
+            let mut objs = room.objects.iter().cloned();
+            if let Some(first) = objs.next() {
+                if let Some(last) = body.last_mut() {
+                    last.segments.push(TextSegment {
+                        text: "  ".to_string(),
+                        ..Default::default()
+                    });
+                    last.segments.extend(first.segments);
+                } else {
+                    body.push(first);
                 }
-                if index + 1 < exits.len() {
-                    ui.label(",");
+                body.extend(objs);
+            }
+        }
+        if show_players {
+            body.extend(room.players.iter().cloned());
+        }
+        if show_exits {
+            body.extend(room.exits.iter().cloned());
+        }
+
+        // Interact-mode focus ring: paint the focused entity's link with the
+        // selection background so keyboard focus is visible in the room text.
+        if let Some(focus) = interact_focus {
+            let sel = visuals.selection.bg_fill;
+            let sel_hex = format!("#{:02x}{:02x}{:02x}", sel.r(), sel.g(), sel.b());
+            for line in &mut body {
+                for segment in &mut line.segments {
+                    if segment
+                        .link_data
+                        .as_ref()
+                        .is_some_and(|l| l.exist_id.trim_start_matches('#') == focus)
+                    {
+                        segment.bg = Some(sel_hex.clone());
+                    }
                 }
             }
-        });
+        }
+
+        egui::ScrollArea::vertical()
+            .id_salt(format!("room_scroll_{}", scroll_id))
+            .auto_shrink([false, false])
+            .min_scrolled_height(max_height)
+            .max_height(max_height)
+            .show(ui, |ui| {
+                if !room.name.is_empty() {
+                    // Explicit size: room names track the window's text size,
+                    // not the Heading style (the title-bar size setting owns
+                    // that).
+                    ui.label(
+                        RichText::new(&room.name)
+                            .font(egui::FontId {
+                                size: text_size + 2.0,
+                                family: font_id.family.clone(),
+                            })
+                            .strong(),
+                    );
+                }
+                for line in &body {
+                    if let Some(link) =
+                        Self::render_styled_line(ui, line, visuals, None, font_id, true, None)
+                    {
+                        clicked_link = Some(link);
+                    }
+                }
+            });
+
         clicked_link
     }
 
@@ -3119,6 +3499,9 @@ impl VellumGuiApp {
     /// Bring the height cache in sync with the rendered slice
     /// `content.lines[start..start + rendered_count]`. Appends measure only
     /// the new lines; width changes or non-monotonic generations rebuild.
+    ///
+    /// The scroll-anchoring pre-pass in `render_text_content` reads the
+    /// heights this update is about to drain, so it must run before this.
     fn update_row_height_cache(
         cache: &mut RowHeightCache,
         ctx: &egui::Context,
@@ -3181,12 +3564,125 @@ impl VellumGuiApp {
         let max_height = ui.available_height().max(1.0);
         let cache_id = egui::Id::new(("text_row_heights", scroll_id));
 
-        let scroll_area = if wrap {
+        // ---- Same-frame scroll anchoring ---------------------------------
+        // Once the ring buffer is full, each appended line drops one off the
+        // front and every remaining row shifts up, while the persisted
+        // scroll offset stays a raw pixel value. Nudge the stored offset by
+        // the outgoing rows' strides (known from LAST frame's height cache)
+        // BEFORE the ScrollArea reads it, so an up-scrolled reader keeps
+        // their exact place with no one-frame flicker. At the bottom this is
+        // a no-op: the area's stuck-to-end flag re-pins the offset to the
+        // end regardless of the stored value. The area id comes from last
+        // frame's ScrollAreaOutput (stashed below) rather than re-deriving
+        // egui's salt hashing.
+        let outer_ctx = ui.ctx().clone();
+        let outer_spacing_y = ui.spacing().item_spacing.y;
+        let area_id_key = egui::Id::new(("text_scroll_area_id", scroll_id));
+        let cache_handle = outer_ctx.data_mut(|data| {
+            data.get_temp_mut_or_insert_with::<std::sync::Arc<
+                std::sync::Mutex<RowHeightCache>,
+            >>(cache_id, Default::default)
+                .clone()
+        });
+        {
+            let cache = cache_handle.lock().expect("row height cache poisoned");
+            let delta = content.generation.wrapping_sub(cache.generation) as usize;
+            // Mirrors update_row_height_cache's incremental test, minus the
+            // wrap-width check (unknown until layout runs); a width change
+            // means a reflow that scrambles positions anyway.
+            let incremental = content.generation >= cache.generation
+                && delta <= rendered_count
+                && cache.heights.len() + delta >= rendered_count;
+            if incremental && delta > 0 {
+                let drop_front = (cache.heights.len() + delta)
+                    .saturating_sub(rendered_count)
+                    .min(cache.heights.len());
+                if drop_front > 0 {
+                    let dropped_px: f32 = cache.heights[..drop_front]
+                        .iter()
+                        .map(|h| h + outer_spacing_y)
+                        .sum();
+                    let area_id =
+                        outer_ctx.data_mut(|data| data.get_temp::<egui::Id>(area_id_key));
+                    if let Some(area_id) = area_id {
+                        if let Some(mut state) =
+                            egui::scroll_area::State::load(&outer_ctx, area_id)
+                        {
+                            state.offset.y = (state.offset.y - dropped_px).max(0.0);
+                            state.store(&outer_ctx, area_id);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Viewport height for keyboard/controller paging (see
+        // try_gui_scroll_action) — refreshed every frame.
+        outer_ctx.data_mut(|data| {
+            data.insert_temp(
+                egui::Id::new(("text_scroll_view_h", scroll_id)),
+                max_height,
+            );
+        });
+
+        let mut scroll_area = if wrap {
             egui::ScrollArea::vertical()
         } else {
             egui::ScrollArea::both()
         };
-        scroll_area
+
+        // Programmatic scroll (page keys / controller). egui's private
+        // stuck-to-end flag only clears on USER input — a one-frame
+        // explicit offset snaps back to the bottom next frame. So while a
+        // key/pad scroll has us paged up, we HOLD the offset by
+        // re-applying it every frame, and release the hold when the user
+        // touches the wheel/drag, reaches the bottom, or presses End.
+        let pending_key = egui::Id::new(("text_scroll_pending", scroll_id));
+        let hold_key = egui::Id::new(("text_scroll_hold", scroll_id));
+        let pending: Option<(u8, f32)> = outer_ctx.data_mut(|data| {
+            let value = data.get_temp(pending_key);
+            if value.is_some() {
+                data.remove::<(u8, f32)>(pending_key);
+            }
+            value
+        });
+        let mut hold: Option<f32> = outer_ctx.data_mut(|data| data.get_temp(hold_key));
+
+        // The user's own scroll input takes over instantly.
+        let user_scrolled = ui.input(|input| {
+            input.raw.events.iter().any(|event| {
+                matches!(
+                    event,
+                    egui::Event::MouseWheel { .. } | egui::Event::PointerButton { pressed: true, .. }
+                )
+            })
+        });
+        if user_scrolled {
+            hold = None;
+        }
+
+        if let Some((kind, value)) = pending {
+            let current = hold.or_else(|| {
+                outer_ctx
+                    .data_mut(|data| data.get_temp::<egui::Id>(area_id_key))
+                    .and_then(|area_id| egui::scroll_area::State::load(&outer_ctx, area_id))
+                    .map(|state| state.offset.y)
+            });
+            hold = match kind {
+                1 => Some(0.0),      // home
+                2 => None,           // end: drop the hold, stickiness resumes
+                _ => Some((current.unwrap_or(0.0) + value).max(0.0)),
+            };
+            if hold.is_none() {
+                // Nudge to the bottom so stick_to_bottom re-engages.
+                scroll_area = scroll_area.vertical_scroll_offset(f32::MAX / 4.0);
+            }
+        }
+        if let Some(target) = hold {
+            scroll_area = scroll_area.vertical_scroll_offset(target);
+        }
+
+        let output = scroll_area
             .id_salt(format!("text_scroll_{}", scroll_id))
             .stick_to_bottom(true)
             .auto_shrink([false, false])
@@ -3224,16 +3720,11 @@ impl VellumGuiApp {
                 let content_left = ui.max_rect().left();
                 let content_top = ui.cursor().min.y;
 
-                // The cache lives in egui temp data so renderers stay
-                // stateless; the Arc dance keeps ctx.fonts_mut() callable
-                // while the cache is borrowed (calling it inside ctx.data_mut
-                // would deadlock on the context lock).
-                let cache_handle = ctx.data_mut(|data| {
-                    data.get_temp_mut_or_insert_with::<std::sync::Arc<
-                        std::sync::Mutex<RowHeightCache>,
-                    >>(cache_id, Default::default)
-                        .clone()
-                });
+                // The cache lives in egui temp data (fetched before the
+                // scroll area) so renderers stay stateless; the Arc dance
+                // keeps ctx.fonts_mut() callable while the cache is borrowed
+                // (calling it inside ctx.data_mut would deadlock on the
+                // context lock).
                 let mut cache = cache_handle.lock().expect("row height cache poisoned");
                 Self::update_row_height_cache(
                     &mut cache,
@@ -3576,7 +4067,13 @@ impl VellumGuiApp {
                             }
                         }
                         ui.painter()
-                            .galley(galley_pos, galley, visuals.text_color());
+                            .galley(galley_pos, galley.clone(), visuals.text_color());
+                        super::color_emoji::paint_color_emoji(
+                            &ctx,
+                            ui.painter(),
+                            &galley,
+                            galley_pos,
+                        );
                     }
                 }
                 // A press on the blank area below the last line clears the
@@ -3599,35 +4096,53 @@ impl VellumGuiApp {
                     ui.allocate_space(Vec2::new(1.0, bottom_space - spacing_y));
                 }
             });
-        clicked_link
-    }
+        // Next frame's anchoring pre-pass targets this area's real id.
+        outer_ctx.data_mut(|data| data.insert_temp(area_id_key, output.id));
 
-    pub(super) fn render_room_description(
-        ui: &mut egui::Ui,
-        lines: &[StyledLine],
-        scroll_id: &str,
-        font_id: &egui::FontId,
-    ) -> Option<GuiLinkClick> {
-        // Cheap Arc clone; deep-cloning Visuals per window per frame is not.
-        let style = ui.style().clone();
-        let visuals = &style.visuals;
-        let mut clicked_link = None;
-        let max_height = ui.available_height().max(1.0);
+        // Settle the programmatic hold against the real layout: clamp to
+        // the actual max offset, and release it once we're at the bottom
+        // so stick-to-bottom auto-scroll resumes.
+        let max_offset = (output.content_size.y - output.inner_rect.height()).max(0.0);
+        let settled = hold.map(|h| h.min(max_offset)).filter(|h| *h < max_offset - 4.0);
+        outer_ctx.data_mut(|data| match settled {
+            Some(value) => {
+                data.insert_temp(hold_key, value);
+            }
+            None => {
+                data.remove::<f32>(hold_key);
+            }
+        });
 
-        egui::ScrollArea::vertical()
-            .id_salt(format!("room_scroll_{}", scroll_id))
-            .auto_shrink([false, false])
-            .min_scrolled_height(max_height)
-            .max_height(max_height)
-            .show(ui, |ui| {
-                for line in lines {
-                    if let Some(link) =
-                        Self::render_styled_line(ui, line, &visuals, None, font_id, true, None)
-                    {
-                        clicked_link = Some(link);
-                    }
-                }
-            });
+        // Re-arm stick-to-bottom when a user scroll settles just shy of the
+        // end. egui only re-sticks on EXACT offset equality, and scrollbar
+        // drags / kinetic flicks routinely stop a fraction of a row short —
+        // visually "at the bottom" but unstuck, so incoming text left the
+        // view trailing slightly. When the scroll is at rest (no button
+        // held, not moving up, no programmatic hold) within one row of the
+        // end, snap to it; egui's equality check then re-sticks next frame.
+        let prev_offset_key = egui::Id::new(("text_scroll_prev_offset", scroll_id));
+        let prev_offset = outer_ctx.data_mut(|data| {
+            let prev = data.get_temp::<f32>(prev_offset_key);
+            data.insert_temp(prev_offset_key, output.state.offset.y);
+            prev
+        });
+        let snap_tolerance =
+            outer_ctx.fonts_mut(|fonts| fonts.row_height(font_id)) + outer_spacing_y;
+        let shy_of_bottom = max_offset - output.state.offset.y;
+        let moving_up = prev_offset.is_some_and(|prev| output.state.offset.y < prev - 0.1);
+        let pointer_down = outer_ctx.input(|i| i.pointer.any_down());
+        if settled.is_none()
+            && shy_of_bottom > 0.0
+            && shy_of_bottom <= snap_tolerance
+            && !moving_up
+            && !pointer_down
+        {
+            if let Some(mut state) = egui::scroll_area::State::load(&outer_ctx, output.id) {
+                state.offset.y = max_offset;
+                state.store(&outer_ctx, output.id);
+                outer_ctx.request_repaint();
+            }
+        }
 
         clicked_link
     }
@@ -3746,7 +4261,7 @@ impl VellumGuiApp {
                 // window editor, shared with the TUI). The room-name heading
                 // is always shown: the def's show_name flag drives the TUI
                 // border title, which has no GUI equivalent.
-                let (show_desc, show_objs, show_players, show_exits) = match app_core
+                let show = match app_core
                     .layout
                     .windows
                     .iter()
@@ -3760,41 +4275,16 @@ impl VellumGuiApp {
                     ),
                     _ => (true, true, true, true),
                 };
-                // Explicit size: room names track the window's text size, not
-                // the Heading style (which the title-bar size setting owns).
-                ui.label(
-                    RichText::new(&room.name)
-                        .font(egui::FontId {
-                            size: text_size + 2.0,
-                            family: font_id.family.clone(),
-                        })
-                        .strong(),
-                );
-                ui.separator();
-                let mut clicked_link = if show_desc {
-                    Self::render_room_description(
-                        ui,
-                        &room.description,
-                        &tab.window_name,
-                        &font_id,
-                    )
-                } else {
-                    None
-                };
-                if show_exits {
-                    if let Some(exit_click) = Self::render_room_exits(ui, &room.exits) {
-                        if clicked_link.is_none() {
-                            clicked_link = Some(exit_click);
-                        }
-                    }
-                }
-                if show_players {
-                    Self::render_room_entities(ui, "Players", &room.players);
-                }
-                if show_objs {
-                    Self::render_room_entities(ui, "Objects", &room.objects);
-                }
-                clicked_link
+                let interact_focus = app_core.interact_focus_exist_id();
+                Self::render_room_content(
+                    ui,
+                    room,
+                    show,
+                    &tab.window_name,
+                    text_size,
+                    &font_id,
+                    interact_focus.as_deref(),
+                )
             }
             WindowContent::ActiveEffects(content) => {
                 Self::render_active_effects_content(ui, content, settings);
@@ -3854,9 +4344,13 @@ impl VellumGuiApp {
                 None
             }
             WindowContent::Quickbar => Self::render_quickbar_content(app_core, ui),
-            WindowContent::Hotkeybar { bar } => {
-                Self::render_hotkeybar_content(app_core, ui, &window.name, bar)
-            }
+            WindowContent::Hotkeybar { bar } => Self::render_hotkeybar_content(
+                app_core,
+                ui,
+                &window.name,
+                bar,
+                settings.skin_art.as_deref(),
+            ),
             WindowContent::Performance => {
                 Self::render_performance_content(app_core, ui);
                 None

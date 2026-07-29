@@ -189,8 +189,11 @@ document.getElementById("pair-form").addEventListener("submit", (ev) => {
 const buffers = new Map(); // stream -> { lines: [], unread: 0, chip, badge }
 let activeStream = "main";
 
-// Chip order is user-arrangeable (long-press a chip) and persists per
-// device; streams the user hasn't placed keep their first-text arrival
+// Chip order is user-arrangeable (long-press a chip). It's a roaming
+// pref: localStorage is the offline fallback, but a server-side value
+// (web.chip_order in the character profile) wins on connect and edits
+// are pushed back, so the arrangement follows the character across
+// phones. Streams the user hasn't placed keep their first-text arrival
 // order after the placed ones.
 const CHIP_ORDER_KEY = "vellum-chip-order";
 let chipOrder = [];
@@ -227,6 +230,7 @@ function moveChip(stream, delta) {
     localStorage.setItem(CHIP_ORDER_KEY, JSON.stringify(chipOrder));
   } catch { /* fine, just won't persist */ }
   applyChipOrder();
+  roamPut("web.chip_order", chipOrder.slice());
 }
 
 function openChipArrange(stream) {
@@ -378,6 +382,10 @@ function appendText(seq, stream, line) {
   if (seq <= state.lastSeq) return; // duplicate (snapshot/delta overlap)
   state.lastSeq = seq;
   if (HIDDEN_STREAMS.has(stream)) return;
+  // Speak before display routing: enabled streams speak even while
+  // another stream is active (thoughts read out mid-hunt).
+  speakLine(stream, line);
+  gpRumbleLine(stream);
   const buf = ensureStream(stream);
   buf.lines.push(line);
   if (buf.lines.length > MAX_BUFFER_LINES) buf.lines.shift();
@@ -425,6 +433,11 @@ function setRoom(room) {
   roomExits = room.exits || [];
   renderTitle();
   renderCompass();
+  // Exits are an interact category; keep its focus in sync.
+  if (interact) {
+    syncInteractFocus();
+    renderInteract();
+  }
 }
 
 // ---- Compass ----------------------------------------------------------------
@@ -701,6 +714,8 @@ function handleSnapshot(d) {
   setEffects(d.effects || []);
   setInjuries(d.injuries || {});
   setTargets(d.targets || []);
+  setRoomEntities(d.entities || {});
+  setPortals(d.portals || []);
   setCharInfo(d.char_info || {});
   setRt(d.rt);
   if (d.map_scene) setMapScene(d.map_scene);
@@ -723,8 +738,10 @@ function handleMessage(msg) {
       // Answer with our resume cursor; the server replies with a
       // full/resume/gap snapshot accordingly.
       state.ws.send(JSON.stringify({ t: "resume", d: { seq: state.lastSeq } }));
-      // Authenticated: pick up the skin's injury doll art (if any).
+      // Authenticated: pick up the skin's injury doll art (if any) and
+      // any roaming prefs the character profile carries.
       fetchDollSkin();
+      fetchRoamingPrefs();
       break;
     case "snapshot": handleSnapshot(msg.d); break;
     case "text": appendText(msg.seq, msg.d.stream, msg.d.line); break;
@@ -736,14 +753,27 @@ function handleMessage(msg) {
     case "rt": setRt(msg.d); break;
     case "menu": handleMenu(msg.d); break;
     case "macros": macros = msg.d; renderMacros(); break;
+    case "wheels":
+      wheels = { default: [], named: {}, ...(msg.d || {}) };
+      // Input feel + per-wheel aim stick ride along so the phone matches
+      // the desktop wheel (one source of truth: host keybinds.toml).
+      wheelTuning = { ...WHEEL_TUNING_DEFAULTS, ...(wheels.tuning || {}) };
+      wheelStick = wheels.wheel_stick || {};
+      wheelStart = wheels.wheel_start || {};
+      if (gpWheel) renderWheel();
+      break;
     case "session": setSession(msg.d); break;
     case "profiles": renderProfiles(msg.d.list || []); break;
     case "config_file": handleConfigReply(msg.d); break;
     case "sound": playRemoteSound(msg.d); break;
     case "highlights": handleHighlightsReply(msg.d); break;
     case "colors": handleColorsReply(msg.d); break;
+    case "settings": handleSettingsReply(msg.d); break;
+    case "streams": handleStreamsReply(msg.d); break;
     case "injuries": setInjuries(msg.d); break;
     case "targets": setTargets(msg.d); break;
+    case "entities": setRoomEntities(msg.d); break;
+    case "portals": setPortals(msg.d); break;
     case "charinfo": setCharInfo(msg.d); break;
     case "map_scene": setMapScene(msg.d); break;
     case "map_state": setMapState(msg.d); break;
@@ -878,6 +908,9 @@ function updateSessionUi(prevState) {
     // screen appearing.
     if (LOGIN_FLOW_STATES.includes(prevState)) {
       maybePlayLoginMusic();
+      // A headless login just loaded the character's profile config
+      // server-side — the hello-time fetch predates it, so re-fetch.
+      fetchRoamingPrefs();
     }
     return;
   }
@@ -1145,6 +1178,1477 @@ sessionBanner.addEventListener("click", () => {
   sheetNote("Or close this to keep trying.", true);
 });
 
+// ---- Speech (text-to-speech) ----------------------------------------------
+// Browser speechSynthesis reads incoming lines aloud — the phone's
+// accessibility story until native TTS bridges exist. Chronological and
+// non-interrupting by design: the browser queues utterances natively.
+// Prefs are per-device (localStorage), mirroring the desktop defaults
+// (thoughts on, main off).
+
+const SPEECH_PREFS_KEY = "vellum-speech";
+let speechPrefs = { enabled: false, rate: 1.0, voice: "", streams: {} };
+try {
+  const stored = JSON.parse(localStorage.getItem(SPEECH_PREFS_KEY) || "{}");
+  speechPrefs = { ...speechPrefs, ...stored };
+  speechPrefs.streams = { thoughts: true, ...(stored.streams || {}) };
+} catch { /* corrupted storage — defaults */ }
+
+function saveSpeechPrefs() {
+  try {
+    localStorage.setItem(SPEECH_PREFS_KEY, JSON.stringify(speechPrefs));
+  } catch { /* private mode */ }
+}
+
+function speechAvailable() {
+  return "speechSynthesis" in window;
+}
+
+// Utterances in flight/queued. Under a firehose we drop new lines past a
+// cap instead of drifting minutes behind the game.
+let speechQueued = 0;
+const SPEECH_QUEUE_CAP = 40;
+
+function speechVoiceByName(name) {
+  if (!name || !speechAvailable()) return null;
+  return speechSynthesis.getVoices().find((v) => v.name === name) || null;
+}
+
+function speakLine(stream, line) {
+  if (!speechPrefs.enabled || !speechAvailable()) return;
+  if (!speechPrefs.streams[stream]) return;
+  const text = (line.segments || [])
+    .map((seg) => seg.text || "")
+    .join("")
+    .trim();
+  if (text.length <= 1) return; // prompts and blanks
+  if (speechQueued >= SPEECH_QUEUE_CAP) return;
+  const utterance = new SpeechSynthesisUtterance(text);
+  utterance.rate = Math.min(Math.max(speechPrefs.rate || 1.0, 0.5), 3.0);
+  const voice = speechVoiceByName(speechPrefs.voice);
+  if (voice) utterance.voice = voice;
+  speechQueued += 1;
+  const done = () => {
+    speechQueued = Math.max(0, speechQueued - 1);
+  };
+  utterance.onend = done;
+  utterance.onerror = done;
+  speechSynthesis.speak(utterance);
+}
+
+function stopSpeaking() {
+  if (!speechAvailable()) return;
+  speechSynthesis.cancel();
+  speechQueued = 0;
+}
+
+// Streams offered in the speech sheet: every visible chip stream seen this
+// session plus the well-known ones, so thoughts can be enabled before the
+// first thought arrives.
+function speechStreamChoices() {
+  const known = new Set(["main", "thoughts", "familiar", "death", "logons"]);
+  for (const stream of buffers.keys()) known.add(stream);
+  return [...known].filter((stream) => !HIDDEN_STREAMS.has(stream));
+}
+
+// ---- Controller (browser Gamepad API) --------------------------------------
+// Bluetooth/USB pads (Backbone, Kishi, Xbox, PlayStation, MFi) with the
+// standard mapping. Buttons map to commands — defaults mirror the desktop
+// [controller] table — and while any bottom sheet is open the d-pad
+// navigates it: up/down move focus, South taps, East closes. There is no
+// mapper software on phones, so this is the only controller path here.
+// Prefs are per-device (localStorage): pads travel with the phone.
+//
+// Beyond plain commands, a bind can be a reserved word: "shift" (hold
+// modifier), "wheel" / "wheel:<name>" (hold-open radial command wheel —
+// definitions come from the host's keybinds.toml via the `wheels`
+// message; picks resolve server-side like macro taps), or a client-side
+// UI action from GP_UI_ACTIONS (left_panel, right_panel, map, ...).
+
+const CONTROLLER_PREFS_KEY = "vellum-controller";
+const GP_BUTTON_NAMES = {
+  0: "south", 1: "east", 2: "west", 3: "north",
+  4: "l1", 5: "r1", 6: "l2", 7: "r2",
+  8: "select", 9: "start", 10: "l3", 11: "r3",
+  12: "dpad_up", 13: "dpad_down", 14: "dpad_left", 15: "dpad_right",
+  16: "guide",
+};
+const GP_BUTTON_ORDER = [
+  "dpad_up", "dpad_down", "dpad_left", "dpad_right",
+  "south", "east", "west", "north",
+  "l1", "r1", "l2", "r2", "l3", "r3",
+  "select", "start", "guide",
+];
+// The left stick walks the 8 compass directions; the d-pad covers the
+// vertical axis and portals (.portal resolves go door / climb stair on
+// the host). Binding a button to the reserved word "shift" makes it a
+// hold-modifier: while held, buttons resolve against shiftBinds.
+const GP_SHIFT = "shift";
+const GP_DEFAULT_BINDS = {
+  dpad_up: "up", dpad_down: "down", dpad_right: "out", dpad_left: ".portal",
+  south: "look", l2: GP_SHIFT, r2: "wheel",
+  // r3, not l3: wheels aim with the LEFT stick, and clicking that same
+  // stick deflects it into a stray compass move before the hold lands.
+  r3: "wheel:portals",
+  start: "interact",
+};
+const GP_DEFAULT_SHIFT_BINDS = { south: "stand" };
+
+let controllerPrefs = {
+  enabled: true,
+  binds: { ...GP_DEFAULT_BINDS },
+  shiftBinds: { ...GP_DEFAULT_SHIFT_BINDS },
+};
+try {
+  const stored = JSON.parse(localStorage.getItem(CONTROLLER_PREFS_KEY) || "{}");
+  controllerPrefs = { ...controllerPrefs, ...stored };
+  if (!stored.binds) controllerPrefs.binds = { ...GP_DEFAULT_BINDS };
+  if (!stored.shiftBinds) controllerPrefs.shiftBinds = { ...GP_DEFAULT_SHIFT_BINDS };
+} catch { /* corrupted storage — defaults */ }
+
+function saveControllerPrefs() {
+  try {
+    localStorage.setItem(CONTROLLER_PREFS_KEY, JSON.stringify(controllerPrefs));
+  } catch { /* private mode */ }
+}
+
+let gpLoop = 0;
+const gpPrev = new Map(); // pad.index -> [pressed]
+let gpFocusIndex = -1; // d-pad focus among sheet items
+let gpEditButton = null; // button row expanded in the controller sheet
+
+function gamepadPads() {
+  try {
+    return [...(navigator.getGamepads?.() || [])].filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+function startGamepadLoop() {
+  if (!gpLoop) gpLoop = setInterval(pollGamepads, 33);
+}
+
+function stopGamepadLoop() {
+  clearInterval(gpLoop);
+  gpLoop = 0;
+  gpPrev.clear();
+}
+
+window.addEventListener("gamepadconnected", () => {
+  startGamepadLoop();
+  if (controllerSheetActive()) renderControllerSheet();
+});
+window.addEventListener("gamepaddisconnected", () => {
+  if (!gamepadPads().length) stopGamepadLoop();
+  if (controllerSheetActive()) renderControllerSheet();
+});
+
+// Left stick: 8-way compass movement. One command per deflection into a
+// 45-degree sector (clockwise from north), re-armed by returning toward
+// center — hysteresis keeps a wobbling stick from spamming moves.
+const GP_STICK_DIRS = ["n", "ne", "e", "se", "s", "sw", "w", "nw"];
+let gpStickSector = null;
+
+function gpStickSectorFor(x, yUp, previous) {
+  const magnitude = Math.hypot(x, yUp);
+  if (magnitude < (previous !== null ? 0.35 : 0.6)) return null;
+  const angle = (Math.atan2(x, yUp) * 180) / Math.PI; // 0 = north, cw
+  return Math.floor(((angle + 382.5) % 360) / 45) % 8;
+}
+
+// ---- Radial command wheel (hold a wheel-bound button, aim, release) --------
+// The phone counterpart of the desktop wheel: definitions arrive from the
+// host in the `wheels` message (labels/colors/folders only — commands
+// stay server-side and picks resolve there, like macro taps). While the
+// wheel is up it owns the pad: the left stick aims, South opens a folder
+// (or fires a leaf), East backs up a level, release fires the aimed leaf.
+
+let wheels = { default: [], named: {} };
+// Input-feel tuning + per-wheel aim stick, pushed by the host in the
+// `wheels` message (mirrors [controller_tuning] / per-wheel stick). The
+// defaults reproduce the historical feel until the host pushes real
+// values.
+const WHEEL_TUNING_DEFAULTS = {
+  movement_stick: "left",
+  back_slice: "down",
+  deadzone: 50,
+  aim_dwell_ms: 150,
+  nav_dwell_ms: 150,
+  fire_debounce_ms: 300,
+  release_grace_ms: 40,
+  fire_mode: "release",
+  edge_threshold: 90,
+  retract_delta: 10,
+};
+let wheelTuning = { ...WHEEL_TUNING_DEFAULTS };
+let wheelStick = {}; // wheel name ("default" = default wheel) -> "left"|"right"
+let wheelStart = {}; // wheel name -> ring rotation in degrees (0 = up)
+// Dwell wheel state. `aimed` is the committed display slice (release
+// fires it); `candidate`/`candidateSince` track the slice the stick is
+// over but hasn't dwelt on yet; `rearmUntilCenter` blocks a new dwell
+// until the stick re-neutralizes after an auto descend/ascend (so a
+// still-deflected stick can't chain through folders). Indices are into
+// the DISPLAYED ring (Back slice injected inside folders).
+let gpWheel = null; // { key, path, aimed, candidate, candidateSince, rearmUntilCenter }
+// A leaf already fired during this hold of the wheel button; the wheel
+// stays closed (and the stick stays quiet) until a fresh hold, so one
+// hold never fires twice or walks on release.
+let gpWheelFired = false;
+// After a wheel closes with the aim stick still deflected, its normal
+// function (scroll / interact cycle) stays suppressed until it recenters.
+let gpAimRecenterNeeded = false;
+// Sentinel command/marker for the injected Back slice (wheel-core.js).
+const WHEEL_BACK = WheelCore.WHEEL_BACK;
+
+// The wheel key of a bind value: "" for "wheel", the name for
+// "wheel:<name>", null for anything that is not a wheel bind.
+function gpWheelKeyOf(bind) {
+  if (bind === "wheel") return "";
+  if (typeof bind === "string" && bind.startsWith("wheel:")) return bind.slice(6);
+  return null;
+}
+
+// The wheel key of the wheel-bound button currently held, if any — read
+// from live pad state like the shift modifier (base layer only).
+function gpHeldWheelKey() {
+  for (const [index, name] of Object.entries(GP_BUTTON_NAMES)) {
+    const key = gpWheelKeyOf(controllerPrefs.binds[name]);
+    if (key === null) continue;
+    const i = Number(index);
+    if (gamepadPads().some((pad) => !!(pad.buttons[i] && pad.buttons[i].pressed))) {
+      return key;
+    }
+  }
+  return null;
+}
+
+// The room's portal commands ("go arch"), pushed by the host for the
+// dynamic "portals" wheel; picks resolve server-side by index.
+let portalCommands = [];
+
+function setPortals(portals) {
+  portalCommands = portals || [];
+  if (gpWheel && gpWheel.key === "portals") renderWheel();
+}
+
+// The slice list at a folder path within a wheel; null when the key or
+// path no longer resolves (stale after a host-side wheel edit). The
+// reserved "portals" wheel is built from the live portal list — flat,
+// label = the command minus its verb ("go gate" reads as "gate").
+function wheelLevelSlices(key, path) {
+  if (key === "portals") {
+    if (path.length) return null;
+    return portalCommands.map((command) => ({
+      label: command.includes(" ")
+        ? command.slice(command.indexOf(" ") + 1)
+        : command,
+    }));
+  }
+  let level = key ? (wheels.named || {})[key] : wheels.default;
+  if (!Array.isArray(level)) return null;
+  for (const index of path) {
+    level = (level[index] || {}).slices;
+    if (!Array.isArray(level)) return null;
+  }
+  return level;
+}
+
+// Wheel dead zone as a 0..1 stick magnitude (percent in tuning).
+function wheelDeadzone() {
+  return Math.min(0.99, Math.max(0, (wheelTuning.deadzone || 0) / 100));
+}
+
+// The displayed ring for a wheel level: gathers this level's slices from
+// state and delegates the geometry (Back injection + anchor rotation) to
+// WheelCore.buildWheelView — the shared, node-tested core.
+function wheelView(key, path) {
+  const real = wheelLevelSlices(key, path);
+  if (!Array.isArray(real)) return null;
+  const start = wheelStart[key === "" ? "default" : key] || 0;
+  return WheelCore.buildWheelView(real, path.length > 0, wheelTuning.back_slice, start);
+}
+
+function sendWheelPick(key, path) {
+  if (!state.ws || state.ws.readyState !== WebSocket.OPEN) return;
+  state.ws.send(JSON.stringify({ t: "wheel_pick", d: { key, path } }));
+}
+
+const wheelOverlay = document.getElementById("wheel-overlay");
+const WHEEL_SVG_NS = "http://www.w3.org/2000/svg";
+
+function wheelSvgEl(tag, attrs, style) {
+  const el = document.createElementNS(WHEEL_SVG_NS, tag);
+  for (const [k, v] of Object.entries(attrs)) el.setAttribute(k, v);
+  // Fills/strokes go through style so CSS variables resolve.
+  for (const [k, v] of Object.entries(style || {})) el.style[k] = v;
+  return el;
+}
+
+function hideWheel() {
+  wheelOverlay.hidden = true;
+  wheelOverlay.replaceChildren();
+}
+
+// Draw the current wheel level: a ring of wedges around the screen
+// center, the aimed slice highlighted; tinted wedges dim at rest and
+// brighten while aimed (matches the desktop wheel).
+function renderWheel() {
+  const view = gpWheel && wheelView(gpWheel.key, gpWheel.path);
+  const slices = view && view.slices;
+  if (!slices || !slices.length) {
+    hideWheel();
+    return;
+  }
+  const { aimed } = gpWheel;
+  const inFolder = gpWheel.path.length > 0;
+  const outer = 104;
+  const hub = 34;
+  const labelR = 70;
+  // Per-seat angles from the resolved layout (aim degrees, 0 = up cw);
+  // screen radians = deg*pi/180 - pi/2 (up is -90 in screen space).
+  const seats = view.layout.seats;
+  const seatCenter = (i) => (seats[i].startDeg + seats[i].spanDeg / 2) * (Math.PI / 180) - Math.PI / 2;
+  const seatSpan = (i) => seats[i].spanDeg * (Math.PI / 180);
+  const globalDz = wheelDeadzone();
+
+  const svg = wheelSvgEl("svg", { viewBox: "-110 -110 220 220" });
+  svg.appendChild(
+    wheelSvgEl("circle", { cx: 0, cy: 0, r: outer, "fill-opacity": 0.92 }, {
+      fill: "var(--bg-panel)",
+      stroke: "var(--border)",
+    }),
+  );
+
+  const point = (angle, radius) =>
+    `${(Math.cos(angle) * radius).toFixed(2)} ${(Math.sin(angle) * radius).toFixed(2)}`;
+
+  slices.forEach((slice, i) => {
+    const centerAngle = seatCenter(i);
+    const step = seatSpan(i);
+    const isAimed = aimed === i;
+    // Wedge fill: the slice's tint (dim at rest, bright while aimed);
+    // colorless slices highlight with the accent color.
+    const fill = slice.color || (isAimed ? "var(--accent, #6a9fb5)" : null);
+    if (fill) {
+      const opacity = slice.color ? (isAimed ? 0.85 : 0.22) : 0.5;
+      const wedge =
+        slices.length === 1
+          ? wheelSvgEl("circle", { cx: 0, cy: 0, r: outer, "fill-opacity": opacity }, { fill })
+          : wheelSvgEl(
+              "path",
+              {
+                d:
+                  `M 0 0 L ${point(centerAngle - step / 2, outer)} ` +
+                  `A ${outer} ${outer} 0 0 1 ${point(centerAngle + step / 2, outer)} Z`,
+                "fill-opacity": opacity,
+              },
+              { fill },
+            );
+      svg.appendChild(wedge);
+    }
+    if (slices.length > 1) {
+      const boundary = centerAngle - step / 2;
+      svg.appendChild(
+        wheelSvgEl(
+          "line",
+          {
+            x1: Math.cos(boundary) * hub,
+            y1: Math.sin(boundary) * hub,
+            x2: Math.cos(boundary) * outer,
+            y2: Math.sin(boundary) * outer,
+          },
+          { stroke: "var(--border)" },
+        ),
+      );
+    }
+    const isFolder = !!(slice.slices || []).length;
+    let label = `${slice.label || ""}${isFolder ? " ▸" : ""}`;
+    if (label.length > 16) label = `${label.slice(0, 15)}…`;
+    const text = wheelSvgEl(
+      "text",
+      {
+        x: Math.cos(centerAngle) * labelR,
+        y: Math.sin(centerAngle) * labelR,
+        "text-anchor": "middle",
+        "dominant-baseline": "middle",
+        "font-size": isAimed ? 13 : 10,
+        "font-weight": isAimed ? "bold" : "normal",
+      },
+      { fill: isAimed ? "var(--fg)" : "var(--fg-dim)" },
+    );
+    text.textContent = label;
+    svg.appendChild(text);
+
+    // Per-slice inner floor: a slice whose own `inner` sits above the
+    // global dead zone needs a deeper throw — draw a faint arc across its
+    // wedge at that floor radius (mirrors the desktop cue).
+    if (slice.inner != null) {
+      const frac = Math.min(1, Math.max(0, slice.inner / 100));
+      if (frac > globalDz + 1e-3) {
+        const r = hub + (outer - hub) * frac;
+        const a0 = centerAngle - step / 2;
+        const a1 = centerAngle + step / 2;
+        svg.appendChild(
+          wheelSvgEl(
+            "path",
+            {
+              d: `M ${point(a0, r)} A ${r} ${r} 0 0 1 ${point(a1, r)}`,
+              fill: "none",
+            },
+            { stroke: "var(--warn, #d0a020)", "stroke-width": 1.5, opacity: 0.8 },
+          ),
+        );
+      }
+    }
+  });
+
+  // Center hub hosts the hint text.
+  svg.appendChild(
+    wheelSvgEl("circle", { cx: 0, cy: 0, r: hub }, {
+      fill: "var(--bg-panel)",
+      stroke: "var(--border)",
+    }),
+  );
+  const aimedSlice = aimed !== null ? slices[aimed] : null;
+  const hint = aimedSlice
+    ? WheelCore.isBackSlice(aimedSlice)
+      ? "dwell to go back"
+      : (aimedSlice.slices || []).length
+        ? "dwell to open"
+        : "release to fire"
+    : inFolder
+      ? "dwell · release fires · center to cancel"
+      : "aim, dwell, release to fire";
+  const hintText = wheelSvgEl(
+    "text",
+    {
+      x: 0,
+      y: 0,
+      "text-anchor": "middle",
+      "dominant-baseline": "middle",
+      "font-size": 8,
+    },
+    { fill: "var(--fg-dim)" },
+  );
+  hintText.textContent = hint;
+  svg.appendChild(hintText);
+
+  wheelOverlay.replaceChildren(svg);
+  wheelOverlay.hidden = false;
+}
+
+// ---- Controller UI actions -------------------------------------------------
+// Client-side panel toggles bindable to buttons alongside game commands:
+// the phone UI tucks everything into drawers/sheets/overlays, and a pad
+// user needs buttons to reach them. Sheets opened this way inherit the
+// d-pad navigation (up/down move, A taps, B closes).
+const GP_UI_ACTIONS = {
+  left_panel: () => {
+    if (drawerLeft.classList.contains("open")) closeDrawers();
+    else openDrawer("left");
+  },
+  right_panel: () => {
+    if (drawerRight.classList.contains("open")) closeDrawers();
+    else openDrawer("right");
+  },
+  map: () => (mapOverlay.hidden ? openMapOverlay() : closeMapOverlay()),
+  interact: () => toggleInteract(),
+  effects: () => openEffectsSheet(),
+  settings: () => openSettingsSheet(),
+  appearance: () => openAppearanceSheet(),
+  speech: () => openSpeechSheet(),
+  controller: () => openControllerSheet(),
+};
+
+// Dispatch a bind value: reserved words stay local (shift/wheel are
+// hold-modifiers handled elsewhere), UI actions run client-side, and
+// anything else is a game command (or dot-command) for the host —
+// with <target_id>/<target_noun> filled from the interact focus, so a
+// bound "target #<target_id>\rincant 611" attacks whatever the focus
+// ring is on.
+function gpDispatchBind(bind) {
+  if (!bind || bind === GP_SHIFT || gpWheelKeyOf(bind) !== null) return;
+  const action = GP_UI_ACTIONS[bind];
+  if (action) return action();
+  const resolved = substituteInteractPlaceholders(bind);
+  if (resolved === null) {
+    flashInteractNote("macro needs an interact target");
+    return;
+  }
+  sendCommand(resolved);
+}
+
+// Fill <target_id>/<target_noun> from the focused interact entity; text
+// without placeholders passes through untouched. Null = the macro needs
+// a target but none is focused (mode off, empty category, or an exit) —
+// drop it rather than send the literal placeholder.
+function substituteInteractPlaceholders(text) {
+  if (!text.includes("<target_id>") && !text.includes("<target_noun>")) {
+    return text;
+  }
+  const current = interactCurrent();
+  const entity = current && current.entity;
+  if (!entity || entity.command) return null; // exits have no exist id
+  return text
+    .replaceAll("<target_id>", entity.existId)
+    .replaceAll("<target_noun>", entity.noun || "");
+}
+
+// ---- Interact mode ---------------------------------------------------------
+// The phone port of the desktop focus cycle (core/app_core/interact.rs):
+// walk the room's Creatures / Objects / Players / Exits without touching
+// the screen or rendering a room window. Entity lists arrive in the
+// snapshot and `entities` deltas (exits ride the room payload);
+// activation is the ordinary link-tap round-trip, so the server menu
+// opens as the usual bottom sheet — which the d-pad already navigates.
+// Toggle by the ◎ button (touch) or a button bound to "interact" (pad,
+// Start by default); up/down cycle entities, left/right categories.
+// Focus is remembered by exist id so room churn can't steal it.
+
+const INTERACT_ORDER = ["creatures", "objects", "players", "exits"];
+const INTERACT_LABELS = {
+  creatures: "Creatures", objects: "Objects", players: "Players", exits: "Exits",
+};
+// Compass short code -> movement command word (full words pass through).
+const EXIT_COMMANDS = {
+  n: "north", ne: "northeast", e: "east", se: "southeast",
+  s: "south", sw: "southwest", w: "west", nw: "northwest",
+};
+
+let roomEntities = { creatures: [], objects: [], players: [] };
+let interact = null; // { category, index, focusKey }
+
+function setRoomEntities(entities) {
+  roomEntities = {
+    creatures: entities.creatures || [],
+    objects: entities.objects || [],
+    players: entities.players || [],
+  };
+  if (interact) {
+    syncInteractFocus();
+    renderInteract();
+  }
+}
+
+/// Entities for one category, in display order: { key, label } plus
+/// either { existId, noun } (menu entities) or { command } (exits).
+function interactEntities(category) {
+  if (category === "exits") {
+    return roomExits.map((dir) => {
+      const command = EXIT_COMMANDS[dir] || dir;
+      return { key: dir, label: command, command };
+    });
+  }
+  return (roomEntities[category] || []).map((e) => ({
+    key: e.id, label: e.label, existId: e.id, noun: e.noun,
+  }));
+}
+
+function toggleInteract() {
+  if (interact) exitInteract();
+  else enterInteract();
+}
+
+function enterInteract() {
+  const category = INTERACT_ORDER.find((c) => interactEntities(c).length);
+  if (!category) {
+    flashInteractNote("nothing here to interact with");
+    return;
+  }
+  interact = { category, index: 0, focusKey: null };
+  syncInteractFocus();
+  renderInteract();
+  announceInteractFocus();
+}
+
+function exitInteract() {
+  interact = null;
+  interactBar.hidden = true;
+}
+
+// Re-resolve the stored focus against current lists: find the remembered
+// key, else clamp the index — room churn between deltas can't leave a
+// stale index.
+function syncInteractFocus() {
+  if (!interact) return;
+  const entities = interactEntities(interact.category);
+  if (!entities.length) {
+    interact.index = 0;
+    interact.focusKey = null;
+    return;
+  }
+  const found = interact.focusKey === null
+    ? -1
+    : entities.findIndex((e) => e.key === interact.focusKey);
+  if (found >= 0) {
+    interact.index = found;
+  } else {
+    interact.index = Math.min(interact.index, entities.length - 1);
+    interact.focusKey = entities[interact.index].key;
+  }
+}
+
+function interactCurrent() {
+  if (!interact) return null;
+  const entities = interactEntities(interact.category);
+  const entity = entities[interact.index];
+  return entity ? { category: interact.category, index: interact.index, count: entities.length, entity } : null;
+}
+
+/// Move focus within the category (+1 / -1), wrapping.
+function interactMove(delta) {
+  if (!interact) return;
+  syncInteractFocus();
+  const entities = interactEntities(interact.category);
+  if (!entities.length) return renderInteract();
+  interact.index = (interact.index + delta + entities.length) % entities.length;
+  interact.focusKey = entities[interact.index].key;
+  renderInteract();
+  announceInteractFocus();
+}
+
+/// Switch category (+1 / -1), skipping empty ones, wrapping.
+function interactCategoryMove(delta) {
+  if (!interact) return;
+  const start = INTERACT_ORDER.indexOf(interact.category);
+  const len = INTERACT_ORDER.length;
+  for (let step = 1; step <= len; step++) {
+    const candidate = INTERACT_ORDER[(start + delta * step + len * len) % len];
+    if (candidate === interact.category) continue;
+    if (interactEntities(candidate).length) {
+      interact.category = candidate;
+      interact.index = 0;
+      interact.focusKey = null;
+      syncInteractFocus();
+      renderInteract();
+      announceInteractFocus();
+      return;
+    }
+  }
+}
+
+/// Activate the focused entity: the server context menu for entities
+/// (same link-tap round-trip as tapping a name in the story), a bare
+/// movement command for exits — walking leaves the room, so the mode
+/// drops with it.
+function interactActivate() {
+  syncInteractFocus();
+  const current = interactCurrent();
+  if (!current) return;
+  const { entity } = current;
+  if (entity.command) {
+    exitInteract();
+    sendCommand(entity.command);
+    return;
+  }
+  if (!state.ws || state.ws.readyState !== WebSocket.OPEN) return;
+  const requestId = ++menuRequestCounter;
+  pendingMenuRequest = requestId;
+  openSheetLoading(entity.noun || entity.label);
+  state.ws.send(JSON.stringify({
+    t: "link_tap",
+    d: {
+      request_id: requestId,
+      exist_id: entity.existId,
+      noun: entity.noun || "",
+      text: entity.label,
+    },
+  }));
+}
+
+const interactBar = document.getElementById("interact-bar");
+let interactNoteTimer = 0;
+
+// Interact-bar placement (persisted per device in uiPrefs.interactPos):
+//   { mode: "dock", edge: "top"|"bottom" }        full-width along an edge
+//   { mode: "float", x: 0..1, y: 0..1, w: px }    free-floating, dropped
+// Default is a bottom dock (the historical position). Long-pressing the
+// bar drags it; dropping near the top/bottom edge snaps to a dock, else
+// it free-floats where dropped. Taps on the buttons still change target.
+function defaultInteractPos() {
+  return { mode: "dock", edge: "bottom" };
+}
+
+function applyInteractPos() {
+  const p = (uiPrefs.interactPos && uiPrefs.interactPos.mode)
+    ? uiPrefs.interactPos
+    : defaultInteractPos();
+  const s = interactBar.style;
+  if (p.mode === "float") {
+    // A floating bar is a compact, content-width puck (CSS .floating sets
+    // width:max-content) so it can move in both axes; docked stays full
+    // width for easy tapping. Clamp the anchor into the viewport.
+    interactBar.classList.add("floating");
+    s.width = "";
+    s.right = "auto";
+    s.bottom = "auto";
+    s.left = `${Math.min(0.98, Math.max(0.02, p.x != null ? p.x : 0.5)) * 100}%`;
+    s.top = `${Math.min(0.95, Math.max(0.02, p.y != null ? p.y : 0.85)) * 100}%`;
+  } else {
+    interactBar.classList.remove("floating");
+    s.width = "";
+    s.left = "8px";
+    s.right = "8px";
+    if (p.edge === "top") {
+      s.top = "8px";
+      s.bottom = "auto";
+    } else {
+      s.bottom = "8px";
+      s.top = "auto";
+    }
+  }
+}
+
+// Long-press to drag; a plain tap falls through to the buttons. Mirrors
+// the floating-button gesture (hold timer + movement threshold + capture),
+// then snaps to an edge dock or free-floats on drop.
+(function attachInteractDrag() {
+  // Drag is MOVEMENT-driven, not hold-driven: a tap (down+up with no real
+  // movement) falls through to the buttons/target-select; moving the
+  // finger past MOVE_EPS starts a drag. (An earlier 300ms hold gate made
+  // a natural quick grab-and-drag register as a tap — the bar never moved,
+  // which read as "stuck".)
+  const MOVE_EPS = 8; // px of movement before a press becomes a drag
+  const EDGE_PX = 64; // finger within this of a container edge on release = dock
+  let tracking = false; // pointer is down on the bar, watching for movement
+  let dragging = false;
+  let pointerId = null;
+  let startX = 0, startY = 0;
+  let lastPointerY = 0; // live finger Y, for edge-distance snap on release
+
+  const parentRect = () => interactBar.offsetParent
+    ? interactBar.offsetParent.getBoundingClientRect()
+    : { left: 0, top: 0, width: window.innerWidth, height: window.innerHeight };
+
+  interactBar.addEventListener("pointerdown", (ev) => {
+    tracking = true;
+    dragging = false;
+    pointerId = ev.pointerId;
+    startX = ev.clientX;
+    startY = ev.clientY;
+    lastPointerY = ev.clientY;
+  });
+
+  interactBar.addEventListener("pointermove", (ev) => {
+    if (!tracking && !dragging) return;
+    lastPointerY = ev.clientY;
+    const dx = ev.clientX - startX;
+    const dy = ev.clientY - startY;
+    if (!dragging) {
+      if (Math.hypot(dx, dy) < MOVE_EPS) return; // not enough movement = still a tap
+      dragging = true;
+      // .floating shrinks the bar to content width (a movable puck) so it
+      // tracks the finger in both axes instead of staying full-width.
+      interactBar.classList.add("dragging", "floating");
+      try { interactBar.setPointerCapture(ev.pointerId); } catch { /* ok */ }
+      // Clear the docked anchors so only `top` drives vertical position.
+      // Leaving `bottom` (or `right`) set alongside `top`/`left` makes CSS
+      // stretch the bar to span between both anchors during the drag.
+      interactBar.style.width = "";
+      interactBar.style.right = "auto";
+      interactBar.style.bottom = "auto";
+    }
+    const r = parentRect();
+    const w = interactBar.offsetWidth;
+    const h = interactBar.offsetHeight;
+    // Anchor by the bar's top-left, keeping the grab point under the finger.
+    let x = (ev.clientX - r.left - w / 2) / r.width;
+    let y = (ev.clientY - r.top - h / 2) / r.height;
+    x = Math.min(0.98, Math.max(0.02, x));
+    y = Math.min(0.95, Math.max(0.02, y));
+    interactBar.style.left = `${x * 100}%`;
+    interactBar.style.top = `${y * 100}%`;
+    interactBar.dataset.dx = x;
+    interactBar.dataset.dy = y;
+  });
+
+  const endDrag = (ev) => {
+    tracking = false;
+    pointerId = null;
+    if (dragging) {
+      // Snap by the finger's distance from an edge of the bar's OWN
+      // positioning container (#pane-wrap), not the window — the bar sits
+      // below the header/chips, so window.innerHeight math was off and a
+      // bottom-docked bar kept re-docking. Measure release-Y inside the
+      // container; dock only within EDGE_PX of its top/bottom edge.
+      const r = parentRect();
+      // Prefer the release event's own Y; fall back to the last move.
+      const rawY = (ev && typeof ev.clientY === "number") ? ev.clientY : lastPointerY;
+      const relY = rawY - r.top; // finger Y within the container
+      if (relY <= EDGE_PX) {
+        uiPrefs.interactPos = { mode: "dock", edge: "top" };
+      } else if (relY >= r.height - EDGE_PX) {
+        uiPrefs.interactPos = { mode: "dock", edge: "bottom" };
+      } else {
+        uiPrefs.interactPos = {
+          mode: "float",
+          x: parseFloat(interactBar.dataset.dx || "0.5"),
+          y: parseFloat(interactBar.dataset.dy || "0.85"),
+        };
+      }
+      saveUiPrefs();
+      interactBar.classList.remove("dragging");
+      applyInteractPos();
+    }
+    // Clear on a timeout so the click that follows pointerup still sees
+    // dragging=true and the buttons skip activation on a drag-release.
+    setTimeout(() => { dragging = false; }, 0);
+  };
+  interactBar.addEventListener("pointerup", endDrag);
+  interactBar.addEventListener("pointercancel", endDrag);
+  interactBar.addEventListener("contextmenu", (ev) => ev.preventDefault());
+  // Swallow a button tap that concludes a drag.
+  interactBar.addEventListener("click", (ev) => {
+    if (dragging) { ev.stopPropagation(); ev.preventDefault(); }
+  }, true);
+
+  // Expose so drag-end/apply can be reused; also apply the saved position
+  // once at startup.
+  window.__applyInteractPos = applyInteractPos;
+})();
+
+function flashInteractNote(text) {
+  applyInteractPos();
+  interactBar.hidden = false;
+  document.getElementById("ia-cat").textContent = "";
+  document.getElementById("ia-entity").textContent = text;
+  clearTimeout(interactNoteTimer);
+  interactNoteTimer = setTimeout(() => {
+    if (!interact) interactBar.hidden = true;
+  }, 1600);
+}
+
+function renderInteract() {
+  if (!interact) {
+    interactBar.hidden = true;
+    return;
+  }
+  const current = interactCurrent();
+  const cat = document.getElementById("ia-cat");
+  const entity = document.getElementById("ia-entity");
+  if (current) {
+    cat.textContent = `${INTERACT_LABELS[current.category]} ${current.index + 1}/${current.count}`;
+    entity.textContent = current.entity.label;
+  } else {
+    cat.textContent = INTERACT_LABELS[interact.category];
+    entity.textContent = "nothing here";
+  }
+  applyInteractPos();
+  interactBar.hidden = false;
+}
+
+/// Speak focus changes when speech is on (ephemeral UI — skip the queue
+/// caps, mirror of the desktop TTS announce).
+function announceInteractFocus() {
+  const current = interactCurrent();
+  if (!current || !speechPrefs.enabled || !speechAvailable()) return;
+  const utterance = new SpeechSynthesisUtterance(
+    `${current.entity.label}, ${INTERACT_LABELS[current.category]}`,
+  );
+  speechSynthesis.speak(utterance);
+}
+
+// Compact bar: one wrapping cycler per axis (lists are short; the pad's
+// right stick still steps both directions), tap the label or ⏎ to act.
+document.getElementById("interact-btn").addEventListener("click", toggleInteract);
+document.getElementById("ia-close").addEventListener("click", exitInteract);
+document.getElementById("ia-next").addEventListener("click", () => interactMove(1));
+document.getElementById("ia-cat-next").addEventListener("click", () => interactCategoryMove(1));
+document.getElementById("ia-go").addEventListener("click", interactActivate);
+document.getElementById("ia-label").addEventListener("click", interactActivate);
+
+function pollGamepads() {
+  const pads = gamepadPads();
+  if (!pads.length) {
+    stopGamepadLoop();
+    gpStickSector = null;
+    gpWheel = null;
+    gpWheelFired = false;
+    gpAimRecenterNeeded = false;
+    hideWheel();
+    return;
+  }
+  for (const pad of pads) {
+    const prev = gpPrev.get(pad.index) || [];
+    pad.buttons.forEach((button, i) => {
+      const pressed = !!(button && button.pressed);
+      if (pressed && !prev[i]) handleGamepadButton(i);
+    });
+    gpPrev.set(pad.index, pad.buttons.map((b) => !!(b && b.pressed)));
+  }
+
+  const axes = pads[0].axes || [];
+  const leftX = axes[0] || 0;
+  const leftYUp = -(axes[1] || 0);
+  const rightXRaw = axes[2] || 0;
+  const rightYUp = -(axes[3] || 0);
+
+  // Assign stick roles from movement_stick: the movement stick walks the
+  // compass; the other ("aim" stick) aims the wheel, scrolls, and does
+  // the interact cycling.
+  const moveOnRight = wheelTuning.movement_stick === "right";
+  const stickX = moveOnRight ? rightXRaw : leftX;
+  const stickYUp = moveOnRight ? rightYUp : leftYUp;
+
+  // Radial wheel: while a wheel-bound button is held, the aim stick aims
+  // and a dwell commits a slice; releasing fires the committed leaf.
+  // A sheet stealing the screen cancels instead of firing.
+  const heldWheelKey =
+    controllerPrefs.enabled && sheet.hidden ? gpHeldWheelKey() : null;
+  // Which stick aims: a held wheel's `stick` override wins, else the
+  // default aim stick (the non-movement one).
+  const wheelName = heldWheelKey === "" ? "default" : heldWheelKey;
+  const override = wheelName != null ? wheelStick[wheelName] : null;
+  const aimOnRight = override === "right" ? true
+    : override === "left" ? false
+    : !moveOnRight;
+  const aimX = aimOnRight ? rightXRaw : leftX;
+  const aimYUp = aimOnRight ? rightYUp : leftYUp;
+  const aimIsMoveStick = aimOnRight === moveOnRight;
+
+  if (heldWheelKey === null && gpWheelFired) {
+    // Fresh hold re-arms after a fired leaf; seed the movement hysteresis
+    // so a still-deflected movement stick doesn't walk on release.
+    gpWheelFired = false;
+    gpStickSector = gpStickSectorFor(stickX, stickYUp, gpStickSector);
+  }
+  if (!gpWheel && heldWheelKey !== null && !gpWheelFired) {
+    gpWheel = {
+      key: heldWheelKey, path: [], aimed: null,
+      candidate: null, candidateSince: 0, rearmUntilCenter: false,
+      peakMagnitude: 0,
+    };
+    renderWheel();
+  } else if (gpWheel && heldWheelKey === null) {
+    // Release: fire the committed leaf (via host, with debounce).
+    const { key, path, aimed } = gpWheel;
+    gpWheel = null;
+    hideWheel();
+    if (sheet.hidden && aimed !== null) {
+      const view = wheelView(key, path);
+      const real = view ? WheelCore.leafRealAt(view, aimed) : null;
+      if (real != null) wheelFire(key, [...path, real]);
+    }
+    gpStickSector = gpStickSectorFor(stickX, stickYUp, gpStickSector);
+    gpAimRecenterNeeded = true;
+  } else if (gpWheel) {
+    wheelAim(aimX, aimYUp);
+  }
+
+  // Compass movement. Suppressed while a wheel owns the aim stick *and*
+  // that aim stick is the movement stick, plus the fired-hold tail. When
+  // the wheel aims with the other stick, walking stays live.
+  const wheelUp = !!gpWheel || gpWheelFired;
+  const wheelOwnsMove = wheelUp && aimIsMoveStick;
+  if (!wheelOwnsMove) {
+    const sector = gpStickSectorFor(stickX, stickYUp, gpStickSector);
+    if (sector !== gpStickSector) {
+      if (sector !== null && sheet.hidden && controllerPrefs.enabled) {
+        sendCommand(GP_STICK_DIRS[sector]);
+      }
+      gpStickSector = sector;
+    }
+  }
+
+  // Aim stick: interact-mode focus cycling, else story scroll. Silenced
+  // while it aims an open wheel, and until it recenters after a wheel
+  // closes (so leftover deflection can't scroll or cycle).
+  if (gpAimRecenterNeeded && Math.hypot(aimX, aimYUp) < 0.35) {
+    gpAimRecenterNeeded = false;
+  }
+  const aimOwnedByWheel = !!gpWheel || gpWheelFired || gpAimRecenterNeeded;
+  if (aimOwnedByWheel) {
+    // Keep the interact hysteresis synced so resuming doesn't fire a
+    // stale cycle step.
+    gpRightDir = gpFourWay(aimX, aimYUp, gpRightDir);
+  } else if (interact && sheet.hidden) {
+    const dir = gpFourWay(aimX, aimYUp, gpRightDir);
+    if (dir !== gpRightDir) {
+      if (dir === "up") interactCategoryMove(-1);
+      else if (dir === "down") interactCategoryMove(1);
+      else if (dir === "left") interactMove(-1);
+      else if (dir === "right") interactMove(1);
+      gpRightDir = dir;
+    }
+  } else if (Math.abs(aimYUp) > 0.25 && sheet.hidden) {
+    // Stick up scrolls up (negative delta); quadratic speed curve.
+    pane.scrollBy(0, -aimYUp * Math.abs(aimYUp) * 40);
+  }
+}
+
+// Advance the dwell state machine one frame while the wheel is up. Thin
+// adapter over WheelCore.wheelAimStep (the shared, node-tested machine):
+// builds the view and tuning snapshot, injects the clock, then applies
+// the outcome (repaint and/or a mid-hold edge/retract fire).
+function wheelAim(x, yUp) {
+  const view = wheelView(gpWheel.key, gpWheel.path);
+  if (!view) return;
+  const out = WheelCore.wheelAimStep(
+    gpWheel, view, wheelTimingSnapshot(), x, yUp, performance.now(),
+  );
+  if (out.render) renderWheel();
+  if (out.fire != null) wheelCloseAndFire(view, out.fire);
+}
+
+// [controller_tuning] snapshot in the units the machine consumes
+// (magnitudes 0..1, dwells in ms).
+function wheelTimingSnapshot() {
+  return {
+    deadzone: wheelDeadzone(),
+    aimMs: wheelTuning.aim_dwell_ms || 0,
+    navMs: wheelTuning.nav_dwell_ms || 0,
+    fireMode: wheelTuning.fire_mode || "release",
+    edgeThreshold: Math.min(1, Math.max(0, (wheelTuning.edge_threshold || 0) / 100)),
+    retractDelta: Math.min(1, Math.max(0, (wheelTuning.retract_delta || 0) / 100)),
+  };
+}
+
+// Close the wheel and fire the leaf at a display seat, if it is a real,
+// non-folder seat (WheelCore.leafRealAt is the one shared guard). Used by
+// the edge/retract mid-hold fires; the release branch uses leafRealAt
+// directly (the wheel is already down there).
+function wheelCloseAndFire(view, display) {
+  const real = WheelCore.leafRealAt(view, display);
+  if (real == null) return;
+  const { key, path } = gpWheel;
+  gpWheel = null;
+  hideWheel();
+  gpWheelFired = true;
+  gpAimRecenterNeeded = true;
+  wheelFire(key, [...path, real]);
+}
+// Send a wheel pick to the host (commands + <target_id> resolve there),
+// honoring a fire debounce so a bounced button can't double-send.
+let gpWheelLastFire = 0;
+function wheelFire(key, path) {
+  const debounce = Math.max(50, wheelTuning.fire_debounce_ms || 0);
+  const now = performance.now();
+  if (now - gpWheelLastFire < debounce) return;
+  gpWheelLastFire = now;
+  sendWheelPick(key, path);
+}
+
+// Dominant-axis four-way read of a stick with the movement hysteresis:
+// one direction per deflection, re-armed by returning toward center.
+let gpRightDir = null;
+function gpFourWay(x, yUp, previous) {
+  const magnitude = Math.hypot(x, yUp);
+  if (magnitude < (previous !== null ? 0.35 : 0.6)) return null;
+  if (Math.abs(x) > Math.abs(yUp)) return x > 0 ? "right" : "left";
+  return yUp > 0 ? "up" : "down";
+}
+
+function sheetItemButtons() {
+  return sheet.hidden ? [] : [...sheetItems.querySelectorAll("button.sheet-item")];
+}
+
+function gpSetSheetFocus(index) {
+  const items = sheetItemButtons();
+  if (!items.length) return;
+  gpFocusIndex = ((index % items.length) + items.length) % items.length;
+  items.forEach((item, i) => item.classList.toggle("gp-focus", i === gpFocusIndex));
+  items[gpFocusIndex].scrollIntoView({ block: "nearest" });
+}
+
+function controllerSheetActive() {
+  return !sheet.hidden && sheetTitle.textContent === "Controller";
+}
+
+function handleGamepadButton(index) {
+  const name = GP_BUTTON_NAMES[index];
+  if (!name) return;
+
+  // The wheel owns the pad while it is up. Dwell drives navigation and
+  // commit; South/East stay as optional accelerators — South fires the
+  // slice under the stick now (or descends a folder / ascends via Back),
+  // East backs up a level. Everything else is swallowed.
+  if (gpWheel) {
+    if (name === "south") {
+      const { key, path } = gpWheel;
+      const display = gpWheel.candidate != null ? gpWheel.candidate : gpWheel.aimed;
+      if (display == null) return;
+      const view = wheelView(key, path);
+      if (!view) return;
+      const real = view.realIndex[display];
+      if (real == null || WheelCore.isBackSlice(view.slices[display])) {
+        // Back seat — synthesized or an explicit back slice.
+        if (gpWheel.path.length) {
+          gpWheel.path.pop();
+          gpWheel.aimed = null;
+          gpWheel.candidate = null;
+          gpWheel.rearmUntilCenter = true;
+          renderWheel();
+        }
+        return;
+      }
+      const slice = view.slices[display];
+      if ((slice.slices || []).length) {
+        gpWheel.path.push(real);
+        gpWheel.aimed = null;
+        gpWheel.candidate = null;
+        gpWheel.rearmUntilCenter = true;
+        renderWheel();
+      } else {
+        gpWheel = null;
+        gpWheelFired = true;
+        gpAimRecenterNeeded = true;
+        hideWheel();
+        wheelFire(key, [...path, real]);
+      }
+    } else if (name === "east") {
+      if (gpWheel.path.length) {
+        gpWheel.path.pop();
+        gpWheel.aimed = null;
+        gpWheel.candidate = null;
+        gpWheel.rearmUntilCenter = true;
+        renderWheel();
+      }
+    }
+    return;
+  }
+
+  // In the controller sheet, a physical press selects that button's row
+  // for editing (capture) instead of dispatching.
+  if (controllerSheetActive()) {
+    gpEditButton = name;
+    renderControllerSheet();
+    return;
+  }
+
+  // Any open sheet (context menus, tap-to-target, settings): the d-pad
+  // navigates, South taps the focused item, East closes.
+  if (!sheet.hidden) {
+    if (name === "dpad_up") return gpSetSheetFocus(gpFocusIndex <= 0 ? -1 : gpFocusIndex - 1);
+    if (name === "dpad_down") return gpSetSheetFocus(gpFocusIndex + 1);
+    if (name === "south") {
+      const items = sheetItemButtons();
+      const target = items[gpFocusIndex] || items[0];
+      if (target) target.click();
+      return;
+    }
+    if (name === "east") return closeSheet();
+    return; // other buttons stay quiet while a sheet is open
+  }
+
+  // Interact mode: South selects (menu / walk); every other button —
+  // d-pad, the remaining face buttons, and the whole shift bank — stays
+  // on its binds, so West/North/East can carry <target_id> attack
+  // macros. The right stick does the cycling (see pollGamepads); the
+  // mode closes from its toggle, the ✕, or walking an exit.
+  if (interact && !gpShiftHeld() && name === "south") {
+    return interactActivate();
+  }
+
+  if (!controllerPrefs.enabled) return;
+  if (gpShiftHeld()) {
+    // Shift layer: strictly the shift bank — no fall-through.
+    gpDispatchBind(controllerPrefs.shiftBinds[name]);
+    return;
+  }
+  gpDispatchBind(controllerPrefs.binds[name]);
+}
+
+// True while any button bound to "shift" is held — read from live pad
+// state so there is no press/release bookkeeping to desync.
+function gpShiftHeld() {
+  const shiftIndexes = Object.entries(GP_BUTTON_NAMES)
+    .filter(([, name]) => controllerPrefs.binds[name] === GP_SHIFT)
+    .map(([index]) => Number(index));
+  if (!shiftIndexes.length) return false;
+  return gamepadPads().some((pad) =>
+    shiftIndexes.some((i) => !!(pad.buttons[i] && pad.buttons[i].pressed)),
+  );
+}
+
+// Rumble the pad when a line arrives on a chosen stream (whispers and
+// deaths by default) — the phone counterpart of the desktop event map.
+let gpLastRumble = 0;
+function gpRumbleLine(stream) {
+  const rumble = controllerPrefs.rumble || {};
+  if (rumble.enabled === false) return;
+  const streams = rumble.streams || { whisper: true, death: true };
+  if (!streams[stream]) return;
+  const now = Date.now();
+  if (now - gpLastRumble < 1500) return; // don't buzz continuously
+  gpLastRumble = now;
+  for (const pad of gamepadPads()) {
+    pad.vibrationActuator
+      ?.playEffect?.("dual-rumble", {
+        duration: 250,
+        strongMagnitude: 0.8,
+        weakMagnitude: 0.4,
+      })
+      ?.catch?.(() => {});
+  }
+}
+
+let gpSheetShiftLayer = false;
+
+function openControllerSheet() {
+  gpEditButton = null;
+  gpSheetShiftLayer = false;
+  openSheet("Controller");
+  renderControllerSheet();
+}
+
+function renderControllerSheet() {
+  sheetItems.replaceChildren();
+
+  const pads = gamepadPads();
+  if (pads.length) {
+    sheetNote(`Connected: ${pads.map((p) => p.id).join(", ")}`, false);
+  } else {
+    sheetNote(
+      "No controller detected — pair one over Bluetooth/USB and press a button.",
+      false,
+    );
+  }
+
+  const enabledBtn = document.createElement("button");
+  enabledBtn.type = "button";
+  enabledBtn.className = "sheet-item";
+  enabledBtn.textContent = `${controllerPrefs.enabled ? "☑" : "☐"} Send bound commands`;
+  enabledBtn.addEventListener("click", () => {
+    controllerPrefs.enabled = !controllerPrefs.enabled;
+    saveControllerPrefs();
+    renderControllerSheet();
+  });
+  sheetItems.appendChild(enabledBtn);
+
+  const layerBtn = document.createElement("button");
+  layerBtn.type = "button";
+  layerBtn.className = "sheet-item";
+  layerBtn.textContent = gpSheetShiftLayer
+    ? "Editing: shift layer (while shift held) — tap for base"
+    : "Editing: base layer — tap for shift layer";
+  layerBtn.addEventListener("click", () => {
+    gpSheetShiftLayer = !gpSheetShiftLayer;
+    gpEditButton = null;
+    renderControllerSheet();
+  });
+  sheetItems.appendChild(layerBtn);
+
+  // Rumble toggles (master + per-stream).
+  const rumble =
+    controllerPrefs.rumble ||
+    (controllerPrefs.rumble = { enabled: true, streams: { whisper: true, death: true } });
+  rumble.streams = rumble.streams || { whisper: true, death: true };
+  const rumbleRow = (label, checked, onToggle) => {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "sheet-item";
+    btn.textContent = `${checked ? "☑" : "☐"} ${label}`;
+    btn.addEventListener("click", () => {
+      onToggle();
+      saveControllerPrefs();
+      renderControllerSheet();
+    });
+    sheetItems.appendChild(btn);
+  };
+  rumbleRow("Rumble on events", rumble.enabled !== false, () => {
+    rumble.enabled = rumble.enabled === false;
+  });
+  if (rumble.enabled !== false) {
+    for (const stream of ["whisper", "death", "thoughts"]) {
+      rumbleRow(`　rumble: ${stream}`, !!rumble.streams[stream], () => {
+        rumble.streams[stream] = !rumble.streams[stream];
+      });
+    }
+  }
+
+  const activeBinds = gpSheetShiftLayer
+    ? controllerPrefs.shiftBinds
+    : controllerPrefs.binds;
+
+  for (const name of GP_BUTTON_ORDER) {
+    if (gpEditButton === name) {
+      const row = document.createElement("div");
+      row.className = "sheet-empty gp-edit-row";
+      const input = document.createElement("input");
+      input.type = "text";
+      input.value = activeBinds[name] || "";
+      input.placeholder = "command, shift, wheel, or action (e.g. right_panel)";
+      const save = document.createElement("button");
+      save.type = "button";
+      save.textContent = "Save";
+      save.addEventListener("click", () => {
+        const value = input.value.trim();
+        if (value) activeBinds[name] = value;
+        else delete activeBinds[name];
+        saveControllerPrefs();
+        gpEditButton = null;
+        renderControllerSheet();
+      });
+      const cancel = document.createElement("button");
+      cancel.type = "button";
+      cancel.textContent = "Cancel";
+      cancel.addEventListener("click", () => {
+        gpEditButton = null;
+        renderControllerSheet();
+      });
+      row.append(`${name}: `, input, save, cancel);
+      sheetItems.appendChild(row);
+      queueMicrotask(() => input.focus());
+      continue;
+    }
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "sheet-item";
+    const bind = activeBinds[name];
+    btn.textContent = `${name} — ${bind || "unbound"}`;
+    btn.addEventListener("click", () => {
+      gpEditButton = name;
+      renderControllerSheet();
+    });
+    sheetItems.appendChild(btn);
+  }
+
+  sheetNote(
+    "Tap a row (or press the button on the pad) to edit. Bind a button " +
+      'to "shift" to make it the hold-modifier for the shift layer. In ' +
+      "menus the d-pad always navigates: up/down move, A taps, B closes.",
+    false,
+  );
+  const named = Object.keys(wheels.named || {});
+  sheetNote(
+    'Bind "wheel" to hold-open the radial command wheel (defined on the ' +
+      "host in keybinds.toml): aim with the left stick, release to fire; " +
+      "A opens folders, B backs up. " +
+      '"wheel:portals" is always available — its slices are the current ' +
+      "room's noun exits (go gate, climb ladder)." +
+      (named.length ? ` Named wheels: ${named.map((n) => `wheel:${n}`).join(", ")}.` : ""),
+    false,
+  );
+  sheetNote(
+    `UI actions are bindable too: ${Object.keys(GP_UI_ACTIONS).join(", ")}.`,
+    false,
+  );
+}
+
+function openSpeechSheet() {
+  openSheet("Speech");
+  if (!speechAvailable()) {
+    sheetNote("Speech synthesis is not available in this browser.", true);
+    return;
+  }
+  renderSpeechSheet();
+}
+
+function renderSpeechSheet() {
+  sheetItems.replaceChildren();
+
+  // Toggle rows rebuild the sheet in place instead of closing it
+  // (sheetButton closes on pick, which would make toggling tedious).
+  const toggleRow = (label, checked, onToggle) => {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "sheet-item";
+    btn.textContent = `${checked ? "☑" : "☐"} ${label}`;
+    btn.addEventListener("click", () => {
+      onToggle();
+      saveSpeechPrefs();
+      renderSpeechSheet();
+    });
+    sheetItems.appendChild(btn);
+  };
+
+  toggleRow("Speak incoming lines", speechPrefs.enabled, () => {
+    speechPrefs.enabled = !speechPrefs.enabled;
+    if (!speechPrefs.enabled) stopSpeaking();
+  });
+
+  // Rate slider, styled like the appearance sheet's opacity rows.
+  const rateRow = document.createElement("div");
+  rateRow.className = "alpha-row";
+  const rateLabel = document.createElement("label");
+  rateLabel.textContent = "Rate";
+  const rateSlider = document.createElement("input");
+  rateSlider.type = "range";
+  rateSlider.min = "0.5";
+  rateSlider.max = "3";
+  rateSlider.step = "0.1";
+  rateSlider.value = String(speechPrefs.rate || 1.0);
+  const rateValue = document.createElement("span");
+  rateValue.className = "alpha-value";
+  rateValue.textContent = `${rateSlider.value}x`;
+  rateSlider.addEventListener("input", () => {
+    speechPrefs.rate = Number(rateSlider.value);
+    rateValue.textContent = `${rateSlider.value}x`;
+    saveSpeechPrefs();
+  });
+  rateRow.append(rateLabel, rateSlider, rateValue);
+  sheetItems.appendChild(rateRow);
+
+  // Voice picker. Voice lists load async on some platforms (iOS); the
+  // voiceschanged hook below re-renders when they arrive.
+  const voices = speechSynthesis.getVoices();
+  if (voices.length) {
+    const voiceRow = document.createElement("div");
+    voiceRow.className = "alpha-row";
+    const voiceLabel = document.createElement("label");
+    voiceLabel.textContent = "Voice";
+    const voiceSelect = document.createElement("select");
+    const defaultOption = document.createElement("option");
+    defaultOption.value = "";
+    defaultOption.textContent = "(device default)";
+    voiceSelect.appendChild(defaultOption);
+    for (const voice of voices) {
+      const option = document.createElement("option");
+      option.value = voice.name;
+      option.textContent = voice.name;
+      voiceSelect.appendChild(option);
+    }
+    voiceSelect.value = speechVoiceByName(speechPrefs.voice) ? speechPrefs.voice : "";
+    voiceSelect.addEventListener("change", () => {
+      speechPrefs.voice = voiceSelect.value;
+      saveSpeechPrefs();
+    });
+    voiceRow.append(voiceLabel, voiceSelect);
+    sheetItems.appendChild(voiceRow);
+  }
+
+  const streamsHeading = document.createElement("div");
+  streamsHeading.className = "sheet-empty";
+  streamsHeading.textContent = "Streams to speak:";
+  sheetItems.appendChild(streamsHeading);
+  for (const stream of speechStreamChoices()) {
+    toggleRow(STREAM_LABELS[stream] || stream, !!speechPrefs.streams[stream], () => {
+      speechPrefs.streams[stream] = !speechPrefs.streams[stream];
+    });
+  }
+
+  const testBtn = document.createElement("button");
+  testBtn.type = "button";
+  testBtn.className = "sheet-item";
+  testBtn.textContent = "Test voice";
+  testBtn.addEventListener("click", () => {
+    // Speaking from a tap also satisfies mobile user-gesture unlock.
+    const utterance = new SpeechSynthesisUtterance(
+      "A giant rat scampers out of the shadows.",
+    );
+    utterance.rate = Math.min(Math.max(speechPrefs.rate || 1.0, 0.5), 3.0);
+    const voice = speechVoiceByName(speechPrefs.voice);
+    if (voice) utterance.voice = voice;
+    speechSynthesis.speak(utterance);
+  });
+  sheetItems.appendChild(testBtn);
+
+  const stopBtn = document.createElement("button");
+  stopBtn.type = "button";
+  stopBtn.className = "sheet-item";
+  stopBtn.textContent = "Stop speaking";
+  stopBtn.addEventListener("click", stopSpeaking);
+  sheetItems.appendChild(stopBtn);
+}
+
+if (speechAvailable()) {
+  // iOS/Android load voice lists asynchronously; refresh the sheet if it's
+  // showing when they land.
+  speechSynthesis.addEventListener?.("voiceschanged", () => {
+    if (!sheet.hidden && sheetTitle.textContent === "Speech") renderSpeechSheet();
+  });
+}
+
 // ---- Settings sheet + config editor ---------------------------------------
 // Config files live server-side (on Android, in the app's private storage
 // where no file manager reaches) — the editor is how highlights and colors
@@ -1170,14 +2674,18 @@ let pendingConfigRequest = null;
 
 // ---- Appearance (client-side prefs) ----------------------------------------
 // Theme presets are CSS-variable override sets; chrome toggles are body
-// classes. Both persist per device — nothing crosses the wire.
+// classes. Everything persists per device, except the theme choice,
+// which is also a roaming pref (web.theme): a server-side value wins on
+// connect and picks push back to the character profile.
 
 const UI_PREFS_KEY = "vellum-ui-prefs";
 let uiPrefs = { theme: "dark", hide: {} };
 try {
   const stored = JSON.parse(localStorage.getItem(UI_PREFS_KEY) || "{}");
   if (stored && typeof stored === "object") {
-    uiPrefs = { theme: stored.theme || "dark", hide: stored.hide || {} };
+    // Spread so per-device extras (opacity, interactPos, …) survive a
+    // reload; only theme/hide have hard defaults.
+    uiPrefs = { ...stored, theme: stored.theme || "dark", hide: stored.hide || {} };
   }
 } catch { /* defaults */ }
 // The bottom macro rail duplicates the tray + floating buttons on very
@@ -1216,11 +2724,13 @@ const OPACITY_SETTINGS = [
   ["float", "Floating buttons", "--float-alpha", 82],
   ["drawer", "Side drawers", "--drawer-alpha", 93],
   ["sheet", "Bottom menus", "--sheet-alpha", 100],
+  ["interact", "Interact bar", "--interact-alpha", 93],
 ];
 
 const CHROME_TOGGLES = [
   ["macrorail", "Macro bar (bottom)"],
   ["compass", "Compass"],
+  ["interact", "Interact button"],
   ["vitals", "Vitals bars"],
   ["hands", "Hands"],
   ["fx", "Effect pills"],
@@ -1250,6 +2760,7 @@ function applyUiPrefs() {
     const pct = Number.isFinite(opacity[key]) ? opacity[key] : dflt;
     root.style.setProperty(cssVar, String(Math.min(100, Math.max(20, pct)) / 100));
   }
+  applyInteractPos();
 }
 applyUiPrefs();
 
@@ -1269,6 +2780,7 @@ function openAppearanceSheet() {
       saveUiPrefs();
       applyUiPrefs();
       refreshThemeButtons();
+      roamPut("web.theme", key);
     });
     themeButtons.set(key, btn);
     themeRow.appendChild(btn);
@@ -1330,6 +2842,8 @@ function openAppearanceSheet() {
 function openSettingsSheet() {
   openSheet("Settings");
   sheetButton("Appearance", openAppearanceSheet);
+  sheetButton("Speech (read lines aloud)", openSpeechSheet);
+  sheetButton("Controller (gamepad)", openControllerSheet);
   sheetButton(
     soundMuted ? "Sound alerts: off — tap to enable" : "Sound alerts: on — tap to mute",
     () => {
@@ -1346,6 +2860,8 @@ function openSettingsSheet() {
       () => setMusicOff(!musicOff),
     );
   }
+  sheetButton("Client settings (saved on host)", openClientSettings);
+  sheetButton("Streams (saved on host)", openStreamsPanel);
   sheetButton("Highlight rules (this profile)", () => openHighlightList("profile"));
   sheetButton("Highlight rules (global)", () => openHighlightList("global"));
   sheetButton("Colors (this profile)", () => openColorsEditor("profile"));
@@ -1795,6 +3311,7 @@ function openSheet(title) {
   effectsSheetOpen = false;
   sheet.hidden = false;
   sheetBackdrop.hidden = false;
+  gpFocusIndex = -1; // fresh sheet, fresh d-pad focus
 }
 
 function sheetNote(text, dismisses) {
@@ -1837,6 +3354,10 @@ function openSheetLoading(noun) {
 sheetBackdrop.addEventListener("click", closeSheet);
 document.getElementById("sheet-close").addEventListener("click", closeSheet);
 
+// A pad connected before this script ran fires no gamepadconnected event;
+// pick it up if the browser already lists one.
+if (gamepadPads().length) startGamepadLoop();
+
 // Belt and braces: while the sheet is open, tapping anything that is not
 // the sheet itself (and not a link, which retargets the sheet) closes it.
 document.addEventListener("click", (ev) => {
@@ -1852,6 +3373,8 @@ document.addEventListener("click", (ev) => {
   if (ev.target.closest("#macro-rail")) return; // rail taps retarget the sheet
   if (ev.target.closest("#chips")) return; // long-press opens arrange
   if (ev.target.closest(".fx-pill")) return; // opens the effects sheet
+  if (ev.target.closest("#interact-bar")) return; // Go opens the entity menu
+  if (ev.target.closest("#interact-btn")) return; // toggling shouldn't dismiss
   if (ev.target.closest("#textsize-btn")) return; // opens the size stepper
   if (ev.target.closest("#settings-btn")) return; // opens the settings sheet
   if (ev.target.closest("#session-settings")) return; // login-screen settings
@@ -2541,8 +4064,11 @@ cmdInput.addEventListener("keydown", (ev) => {
 });
 
 // ---- Text size --------------------------------------------------------------
-// Story-text size, adjusted live from a stepper sheet and persisted per
-// device (a phone and a tablet want different sizes).
+// Story-text size, adjusted live from a stepper sheet. Roaming pref:
+// localStorage is the offline fallback, a server-side web.story_size
+// wins on connect, and stepper changes push back to the character
+// profile. (A phone and a tablet sharing a character will fight over
+// it; per-device divergence is what the unset server value preserves.)
 
 const TEXT_SIZE_KEY = "vellum-text-size";
 // 6px is genuinely tiny, but more text on screen beats enforced comfort —
@@ -2583,11 +4109,13 @@ document.getElementById("textsize-btn").addEventListener("click", () => {
     storySize -= 1;
     applyStorySize();
     refresh();
+    roamPut("web.story_size", storySize);
   });
   bigger.addEventListener("click", () => {
     storySize += 1;
     applyStorySize();
     refresh();
+    roamPut("web.story_size", storySize);
   });
   refresh();
   stepper.append(smaller, value, bigger);
@@ -2598,20 +4126,27 @@ document.getElementById("textsize-btn").addEventListener("click", () => {
 // ---- Soft keyboard / viewport --------------------------------------------
 
 // Pin the app to the *visual* viewport so the soft keyboard never covers
-// the input bar (iOS Safari doesn't resize the layout viewport). iOS also
-// *scrolls* the page to reveal the focused input instead of resizing, so
-// --vvt follows the viewport's offset to keep the app under the visible
-// region (stays 0 on platforms that resize).
+// the input bar (iOS Safari doesn't resize the layout viewport). Safari
+// reveals a focused input by moving the viewport rather than resizing,
+// and does it two different ways: iPhones offset the visual viewport
+// inside the layout viewport (vv.offsetTop), iPads scroll the document
+// itself (window.scrollY, offsetTop stays 0). vv.pageTop is the sum of
+// both — the visual viewport's offset from the document origin — so
+// following it keeps the app pinned on either device (stays 0 on
+// platforms that resize instead).
 const vv = window.visualViewport;
 function syncViewport() {
   if (!vv) return;
   document.documentElement.style.setProperty("--vvh", `${vv.height}px`);
-  document.documentElement.style.setProperty("--vvt", `${vv.offsetTop}px`);
+  document.documentElement.style.setProperty("--vvt", `${vv.pageTop}px`);
   if (autoScroll) scrollToBottom();
 }
 if (vv) {
   vv.addEventListener("resize", syncViewport);
   vv.addEventListener("scroll", syncViewport);
+  // Document scrolls (the iPad path) don't reliably fire visualViewport
+  // events — they move pageTop without touching offsetTop.
+  window.addEventListener("scroll", syncViewport);
   syncViewport();
 }
 
@@ -3364,6 +4899,546 @@ document.getElementById("colors-close").addEventListener("click", () => {
   colorsDoc = null;
 });
 
+// ---- Client settings (registry-backed, saved on the host) ------------------
+// The server dumps its settings registry (settings_get: key, label, kind,
+// scope, live value) and this sheet renders it: collapsible category
+// groups, a per-kind input per row, a per-row Character/Global scope, and
+// save-on-change via settings_put (debounced for typed fields — same
+// live-apply idiom as the Appearance sheet, no big Save button to forget).
+// Unlike Appearance (per-phone localStorage), these live in the connected
+// character/host profile. Sensitive settings arrive redacted and are only
+// sent when the user types a new value.
+
+const csOverlay = document.createElement("div");
+csOverlay.id = "cs-overlay";
+csOverlay.hidden = true;
+csOverlay.innerHTML = `
+  <div id="cs-card">
+    <div id="cs-titlebar">
+      <span id="cs-title">Client settings</span>
+      <button type="button" id="cs-close">Close</button>
+    </div>
+    <p id="cs-tier-note">These save to the connected character/host profile.
+      Appearance above is per-phone.</p>
+    <div id="cs-list"></div>
+  </div>`;
+document.body.appendChild(csOverlay);
+const csList = csOverlay.querySelector("#cs-list");
+
+let csCatalog = null;
+let csRequestCounter = 0;
+let csPendingGet = null;
+const csPendingPuts = new Map(); // request_id -> { statusEl, onSaved }
+
+csOverlay.querySelector("#cs-close").addEventListener("click", () => {
+  csOverlay.hidden = true;
+  csPendingGet = null;
+});
+
+function openClientSettings() {
+  csOverlay.hidden = false;
+  csList.replaceChildren(Object.assign(document.createElement("p"), {
+    className: "hl-empty", textContent: "Loading…",
+  }));
+  csPendingGet = ++csRequestCounter;
+  sendJson("settings_get", { request_id: csPendingGet });
+}
+
+function handleSettingsReply(d) {
+  // Roaming-pref traffic shares the settings wire but never touches the
+  // sheet UI: gets apply silently, puts are fire-and-forget.
+  if (d.request_id === roamPendingGet) {
+    roamPendingGet = null;
+    if (!d.error && Array.isArray(d.catalog)) applyRoamingPrefs(d.catalog);
+    return;
+  }
+  if (roamPendingPuts.delete(d.request_id)) {
+    if (d.error) console.debug("roaming pref save failed:", d.error);
+    return;
+  }
+  if (d.request_id === csPendingGet) {
+    csPendingGet = null;
+    if (d.error) {
+      csList.replaceChildren(Object.assign(document.createElement("p"), {
+        className: "hl-empty editor-error", textContent: d.error,
+      }));
+      return;
+    }
+    csCatalog = Array.isArray(d.catalog) ? d.catalog : [];
+    renderClientSettings();
+    return;
+  }
+  const pending = csPendingPuts.get(d.request_id);
+  if (!pending) return;
+  csPendingPuts.delete(d.request_id);
+  clearTimeout(pending.timeout);
+  if (d.error) {
+    csRowStatus(pending.statusEl, d.error, true);
+  } else {
+    if (pending.onSaved) pending.onSaved();
+    csRowStatus(pending.statusEl, "Saved", false);
+    setTimeout(() => {
+      if (pending.statusEl.textContent === "Saved") csRowStatus(pending.statusEl, "", false);
+    }, 1500);
+  }
+}
+
+function csRowStatus(el, text, isError) {
+  el.textContent = text;
+  el.classList.toggle("editor-error", !!isError);
+}
+
+function csSendPut(entry, value, scope, statusEl, onSaved, clear) {
+  csRowStatus(statusEl, "Saving…", false);
+  const requestId = ++csRequestCounter;
+  const pending = { statusEl, onSaved };
+  // Never leave a row spinning if the reply is lost (disconnect).
+  pending.timeout = setTimeout(() => {
+    if (csPendingPuts.delete(requestId)) csRowStatus(statusEl, "No reply — retry", true);
+  }, 8000);
+  csPendingPuts.set(requestId, pending);
+  sendJson("settings_put", {
+    request_id: requestId,
+    key: entry.key,
+    value,
+    scope,
+    ...(clear ? { clear: true } : {}),
+  });
+}
+
+// The current value a row's control holds, as the wire value for its kind,
+// or null with an error shown when it doesn't parse.
+function csControlValue(entry, control, statusEl) {
+  const type = entry.kind.type;
+  if (type === "bool") return control.checked;
+  if (type === "int" || type === "float") {
+    const n = Number(control.value);
+    if (control.value.trim() === "" || !Number.isFinite(n)) {
+      csRowStatus(statusEl, "Enter a number", true);
+      return null;
+    }
+    if (type === "int" && !Number.isInteger(n)) {
+      csRowStatus(statusEl, "Whole numbers only", true);
+      return null;
+    }
+    return n;
+  }
+  if (type === "list") {
+    return control.value.split("\n").map((s) => s.trim()).filter(Boolean);
+  }
+  return control.value; // text / optional_text / enum / sensitive
+}
+
+function csMakeControl(entry) {
+  const type = entry.kind.type;
+  if (type === "bool") {
+    const input = document.createElement("input");
+    input.type = "checkbox";
+    input.checked = !!entry.value;
+    return input;
+  }
+  if (type === "int" || type === "float") {
+    const input = document.createElement("input");
+    input.type = "number";
+    if (entry.kind.min !== undefined) input.min = String(entry.kind.min);
+    if (entry.kind.max !== undefined) input.max = String(entry.kind.max);
+    input.step = type === "int" ? "1" : "any";
+    input.inputMode = type === "int" ? "numeric" : "decimal";
+    input.value = String(entry.value);
+    return input;
+  }
+  if (type === "enum") {
+    const select = document.createElement("select");
+    const options = entry.kind.options || [];
+    if (!options.includes(entry.value)) select.appendChild(new Option(entry.value, entry.value));
+    for (const opt of options) select.appendChild(new Option(opt, opt));
+    select.value = entry.value;
+    return select;
+  }
+  if (type === "list") {
+    const area = document.createElement("textarea");
+    area.rows = Math.min(6, Math.max(2, (entry.value || []).length + 1));
+    area.value = (entry.value || []).join("\n");
+    area.placeholder = "One entry per line";
+    return area;
+  }
+  const input = document.createElement("input");
+  if (entry.sensitive) {
+    input.type = "password";
+    input.autocomplete = "new-password";
+    input.value = "";
+    if (entry.redacted) input.placeholder = "(unchanged)";
+  } else {
+    input.type = "text";
+    input.value = entry.value || "";
+    if (entry.kind.type === "optional_text") input.placeholder = "(empty = default)";
+  }
+  return input;
+}
+
+function csRow(entry) {
+  const row = document.createElement("div");
+  row.className = "cs-row";
+
+  const label = document.createElement("div");
+  label.className = "cs-label";
+  label.textContent = entry.label;
+  const status = document.createElement("span");
+  status.className = "cs-status";
+
+  const controls = document.createElement("div");
+  controls.className = "cs-control-row";
+  const control = csMakeControl(entry);
+
+  // Scope: per-row Character/Global choice, defaulting Character.
+  // Character-only settings save to the character file regardless — show
+  // a tag instead of a choice.
+  let scopeSel = null;
+  if (entry.scope === "character_only") {
+    const tag = document.createElement("span");
+    tag.className = "cs-tag";
+    tag.textContent = "character";
+    label.appendChild(tag);
+  } else {
+    scopeSel = document.createElement("select");
+    scopeSel.className = "cs-scope";
+    scopeSel.appendChild(new Option("Character", "character"));
+    scopeSel.appendChild(new Option("Global", "global"));
+    scopeSel.value = "character";
+  }
+
+  // A redacted secret can't be emptied by editing (the field never held
+  // it), so it gets an explicit Clear that unsets the host-side value.
+  let clearBtn = null;
+  if (entry.sensitive && entry.redacted) {
+    clearBtn = document.createElement("button");
+    clearBtn.type = "button";
+    clearBtn.className = "cs-clear";
+    clearBtn.textContent = "Clear";
+    clearBtn.addEventListener("click", () => {
+      if (!confirm(`Clear the saved ${entry.label}?`)) return;
+      csSendPut(entry, "", scopeSel ? scopeSel.value : "character", status, () => {
+        entry.redacted = false;
+        control.value = "";
+        control.placeholder = "";
+        clearBtn.hidden = true;
+      }, true);
+    });
+  }
+
+  const save = () => {
+    // Sensitive: only send when the user actually typed a replacement.
+    if (entry.sensitive && control.value === "") return;
+    const value = csControlValue(entry, control, status);
+    if (value === null && entry.kind.type !== "bool") return;
+    const onSaved = entry.sensitive
+      ? () => {
+          entry.redacted = true;
+          control.value = "";
+          control.placeholder = "(unchanged)";
+          if (clearBtn) clearBtn.hidden = false;
+        }
+      : null;
+    csSendPut(entry, value, scopeSel ? scopeSel.value : "character", status, onSaved);
+  };
+
+  // Discrete controls commit on change; typed fields also save after a
+  // typing pause so a hidden keyboard-blur isn't required.
+  control.addEventListener("change", save);
+  const typed = control.tagName === "TEXTAREA"
+    || (control.tagName === "INPUT" && control.type !== "checkbox");
+  if (typed) {
+    let debounce = 0;
+    control.addEventListener("input", () => {
+      clearTimeout(debounce);
+      debounce = setTimeout(save, 900);
+    });
+  }
+  if (scopeSel) {
+    // Re-picking scope re-saves the current value to the new file.
+    scopeSel.addEventListener("change", save);
+  }
+
+  if (entry.kind.type === "bool") {
+    // Checkbox rides inline with the label text.
+    label.prepend(control);
+    controls.append(...(scopeSel ? [scopeSel] : []), status);
+  } else {
+    controls.append(
+      control,
+      ...(clearBtn ? [clearBtn] : []),
+      ...(scopeSel ? [scopeSel] : []),
+      status,
+    );
+  }
+
+  row.append(label);
+  if (entry.description) {
+    const desc = document.createElement("div");
+    desc.className = "cs-desc";
+    desc.textContent = entry.description;
+    row.appendChild(desc);
+  }
+  row.appendChild(controls);
+  return row;
+}
+
+function renderClientSettings() {
+  csList.replaceChildren();
+  const groups = new Map(); // category -> entries, in catalog order
+  for (const entry of csCatalog || []) {
+    if (!groups.has(entry.category)) groups.set(entry.category, []);
+    groups.get(entry.category).push(entry);
+  }
+  if (!groups.size) {
+    csList.appendChild(Object.assign(document.createElement("p"), {
+      className: "hl-empty", textContent: "No settings received.",
+    }));
+    return;
+  }
+  for (const [category, entries] of [...groups.entries()].sort((a, b) =>
+    a[0].localeCompare(b[0]))) {
+    const group = document.createElement("details");
+    group.className = "cs-group";
+    const summary = document.createElement("summary");
+    summary.textContent = `${category} (${entries.length})`;
+    group.appendChild(summary);
+    for (const entry of entries) group.appendChild(csRow(entry));
+    csList.appendChild(group);
+  }
+}
+
+// ---- Streams (routing, saved on the host) ----------------------------------
+// The server ships the streams catalog (streams_get: every known stream,
+// its effective destination, and whether a window subscribes) and this
+// overlay renders it in the Client-settings idiom: one row per stream with
+// per-row save-on-change status. Subscribed rows are read-only (window
+// subscriptions are desktop-edited); orphan rows get a destination select
+// that sends streams_put (Discard / Main / fallback / a window: route).
+
+const stOverlay = document.createElement("div");
+stOverlay.id = "st-overlay";
+stOverlay.hidden = true;
+stOverlay.innerHTML = `
+  <div id="st-card">
+    <div id="st-titlebar">
+      <span id="st-title">Streams</span>
+      <button type="button" id="st-close">Close</button>
+    </div>
+    <p id="st-note">Where each game text stream goes. Rows tagged
+      "window" are claimed by a window subscription — edit those on the
+      desktop. Everything else saves to the host as you change it.</p>
+    <div id="st-list"></div>
+  </div>`;
+document.body.appendChild(stOverlay);
+const stList = stOverlay.querySelector("#st-list");
+
+let stCatalog = null;
+let stRequestCounter = 0;
+let stPendingGet = null;
+const stPendingPuts = new Map(); // request_id -> { statusEl, timeout }
+
+stOverlay.querySelector("#st-close").addEventListener("click", () => {
+  stOverlay.hidden = true;
+  stPendingGet = null;
+});
+
+function openStreamsPanel() {
+  stOverlay.hidden = false;
+  stList.replaceChildren(Object.assign(document.createElement("p"), {
+    className: "hl-empty", textContent: "Loading…",
+  }));
+  stPendingGet = ++stRequestCounter;
+  sendJson("streams_get", { request_id: stPendingGet });
+}
+
+function handleStreamsReply(d) {
+  if (d.request_id === stPendingGet) {
+    stPendingGet = null;
+    if (d.error) {
+      stList.replaceChildren(Object.assign(document.createElement("p"), {
+        className: "hl-empty editor-error", textContent: d.error,
+      }));
+      return;
+    }
+    stCatalog = d;
+    renderStreamsPanel();
+    return;
+  }
+  const pending = stPendingPuts.get(d.request_id);
+  if (!pending) return;
+  stPendingPuts.delete(d.request_id);
+  clearTimeout(pending.timeout);
+  if (d.error) {
+    csRowStatus(pending.statusEl, d.error, true);
+  } else {
+    csRowStatus(pending.statusEl, "Saved", false);
+    setTimeout(() => {
+      if (pending.statusEl.textContent === "Saved") csRowStatus(pending.statusEl, "", false);
+    }, 1500);
+  }
+}
+
+function stSendPut(stream, target, statusEl) {
+  csRowStatus(statusEl, "Saving…", false);
+  const requestId = ++stRequestCounter;
+  const pending = { statusEl };
+  // Never leave a row spinning if the reply is lost (disconnect).
+  pending.timeout = setTimeout(() => {
+    if (stPendingPuts.delete(requestId)) csRowStatus(statusEl, "No reply — retry", true);
+  }, 8000);
+  stPendingPuts.set(requestId, pending);
+  sendJson("streams_put", { request_id: requestId, stream, target });
+}
+
+function stRow(entry, windows, fallback) {
+  const row = document.createElement("div");
+  row.className = "cs-row";
+  const label = document.createElement("div");
+  label.className = "cs-label";
+  label.textContent = entry.id;
+  const status = document.createElement("span");
+  status.className = "cs-status";
+  const controls = document.createElement("div");
+  controls.className = "cs-control-row";
+
+  if (entry.subscribed) {
+    // A window subscription claims this stream; a route would only apply
+    // if that window went away. Read-only from the phone.
+    const tag = document.createElement("span");
+    tag.className = "cs-tag";
+    tag.textContent = "window";
+    label.appendChild(tag);
+    const dest = document.createElement("span");
+    dest.className = "st-dest";
+    dest.textContent = entry.destination;
+    controls.append(dest, status);
+  } else {
+    const select = document.createElement("select");
+    select.appendChild(new Option("Discard", "discard"));
+    select.appendChild(new Option("Main", "main"));
+    select.appendChild(new Option(`fallback (${fallback})`, "clear"));
+    for (const name of windows) {
+      select.appendChild(new Option(`window: ${name}`, `window:${name}`));
+    }
+    const current = entry.route || "clear";
+    if (![...select.options].some((o) => o.value === current)) {
+      // A window: route aimed at a window missing from the list still
+      // shows (delivery falls back gracefully server-side).
+      select.appendChild(new Option(current, current));
+    }
+    select.value = current;
+    select.addEventListener("change", () => {
+      stSendPut(entry.id, select.value, status);
+    });
+    controls.append(select, status);
+  }
+
+  row.append(label);
+  if (entry.label) {
+    // Friendly stream name from the Lich seen-streams registry.
+    const desc = document.createElement("div");
+    desc.className = "cs-desc";
+    desc.textContent = entry.label;
+    row.appendChild(desc);
+  }
+  row.appendChild(controls);
+  return row;
+}
+
+function renderStreamsPanel() {
+  stList.replaceChildren();
+  const rows = (stCatalog && stCatalog.streams) || [];
+  if (!rows.length) {
+    stList.appendChild(Object.assign(document.createElement("p"), {
+      className: "hl-empty",
+      textContent: "No streams known yet — they appear as the game sends them.",
+    }));
+    return;
+  }
+  const group = document.createElement("div");
+  group.className = "cs-group st-group";
+  for (const entry of rows) {
+    group.appendChild(stRow(entry, stCatalog.windows || [], stCatalog.fallback || "main"));
+  }
+  stList.appendChild(group);
+}
+
+// ---- Roaming phone prefs (per-character, server-side) ----------------------
+// Story text size, theme, and chip order ride the character profile as
+// registry settings (web.story_size / web.theme / web.chip_order) over
+// the same settings_get/put wire as the sheet above, so switching phones
+// keeps the look. Rules:
+//   - a SET server value wins over this device's localStorage and
+//     applies live on connect (and login for headless runtimes);
+//   - an UNSET server value (0 / empty) changes nothing — localStorage
+//     keeps working as before, and the local value is never pushed
+//     uninvited (no surprise migration of a per-device pref);
+//   - the server copy only changes when the user changes the pref here
+//     (stepper / theme pick / chip arrange), debounced, character
+//     scope, silent on success, and only with a session connected.
+// Drag positions and the rest of Appearance stay per-device.
+
+let roamPendingGet = null;
+const roamPendingPuts = new Set(); // request_ids of in-flight silent puts
+const roamPutTimers = new Map(); // setting key -> debounce timer
+
+function fetchRoamingPrefs() {
+  roamPendingGet = ++csRequestCounter;
+  if (!sendJson("settings_get", { request_id: roamPendingGet })) {
+    roamPendingGet = null;
+  }
+}
+
+function applyRoamingPrefs(catalog) {
+  const values = new Map();
+  for (const entry of catalog) {
+    values.set(entry.key, entry.value);
+  }
+  const size = values.get("web.story_size");
+  if (Number.isInteger(size) && size > 0) {
+    // applyStorySize clamps to this device's legible range and mirrors
+    // the result into localStorage (the offline fallback tracks it).
+    storySize = size;
+    applyStorySize();
+  }
+  const theme = values.get("web.theme");
+  if (typeof theme === "string" && theme && THEMES[theme]) {
+    uiPrefs.theme = theme;
+    saveUiPrefs();
+    applyUiPrefs();
+  }
+  const order = values.get("web.chip_order");
+  if (Array.isArray(order) && order.length) {
+    chipOrder = order.filter((s) => typeof s === "string");
+    try {
+      localStorage.setItem(CHIP_ORDER_KEY, JSON.stringify(chipOrder));
+    } catch { /* fine, just won't persist */ }
+    applyChipOrder();
+    updateChips();
+  }
+}
+
+// Push one changed roaming pref to the character profile. Debounced per
+// key (a stepper tap-tap-tap is one save), fire-and-forget: localStorage
+// already holds the value, the server copy is the roaming bonus.
+function roamPut(key, value) {
+  clearTimeout(roamPutTimers.get(key));
+  roamPutTimers.set(key, setTimeout(() => {
+    roamPutTimers.delete(key);
+    if (session.state !== "connected") return; // no session — stays local
+    const requestId = ++csRequestCounter;
+    roamPendingPuts.add(requestId);
+    const sent = sendJson("settings_put", {
+      request_id: requestId,
+      key,
+      value,
+      scope: "character",
+    });
+    if (!sent) roamPendingPuts.delete(requestId);
+  }, 600));
+}
+
 // ---- Map (full-screen canvas over the generated map scene) ----------------
 // The server pushes the same sheet the desktop mini map draws: `map_scene`
 // re-sent only when the drawn view changes (location / building / layout
@@ -3449,16 +5524,18 @@ function exitMapBrowse() {
   setMapFollow(true);
 }
 
-mapBtn.addEventListener("click", () => {
+function openMapOverlay() {
   mapOverlay.hidden = false;
   resizeMapCanvas();
   renderMapTitle();
   requestMapRender();
-});
-document.getElementById("map-close").addEventListener("click", () => {
+}
+function closeMapOverlay() {
   mapOverlay.hidden = true;
   mapPicker.hidden = true;
-});
+}
+mapBtn.addEventListener("click", openMapOverlay);
+document.getElementById("map-close").addEventListener("click", closeMapOverlay);
 mapFollowBtn.addEventListener("click", () => {
   if (mapBrowse) exitMapBrowse();
   else setMapFollow(!mapFollow);

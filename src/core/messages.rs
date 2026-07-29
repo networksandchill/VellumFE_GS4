@@ -3,12 +3,67 @@
 //! Handles parsing and routing of XML messages from the game server.
 //! Updates GameState and UiState based on incoming messages.
 
-use crate::config::{Config, SavedDialogPositions, SpellColorStyle};
+use crate::config::{Config, SavedDialogPositions, SpellColorStyle, StreamRoute};
 use crate::core::bounty_parser;
 use crate::core::GameState;
 use crate::data::*;
 use crate::parser::ParsedElement;
 // std::time unused here
+
+/// Where a line from a stream should go, decided purely from subscription
+/// state + the `[streams.routes]` map + the fallback window name. No
+/// window-existence checks happen here — delivery walks `candidates` and
+/// uses the first window that actually exists (never creating or opening
+/// one). The GUI Streams panel reuses this to preview routing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RouteDecision {
+    /// A subscribed window handles the stream; orphan routing does not apply.
+    Subscribed,
+    /// Drop the line silently.
+    Discard,
+    /// Deliver to the first window in `candidates` that exists.
+    Deliver { candidates: Vec<String> },
+}
+
+/// Routing precedence for a stream: subscribed window > `routes` entry >
+/// `fallback`. Route lookup is case-insensitive (matching the legacy
+/// drop-list comparison). A `window:<name>` route lists its window first,
+/// then the fallback window, then "main" as the last resort — windows are
+/// never auto-created or auto-opened for a route.
+pub fn route_for(
+    stream_id: &str,
+    has_subscriber: bool,
+    routes: &std::collections::BTreeMap<String, StreamRoute>,
+    fallback: &str,
+) -> RouteDecision {
+    if has_subscriber {
+        return RouteDecision::Subscribed;
+    }
+    let route = routes
+        .iter()
+        .find(|(id, _)| id.eq_ignore_ascii_case(stream_id))
+        .map(|(_, route)| route);
+    let mut candidates: Vec<String> = Vec::new();
+    match route {
+        Some(StreamRoute::Discard) => return RouteDecision::Discard,
+        Some(StreamRoute::Main) => candidates.push("main".to_string()),
+        Some(StreamRoute::Window(name)) => {
+            candidates.push(name.clone());
+            candidates.push(fallback.to_string());
+            candidates.push("main".to_string());
+        }
+        None => {
+            // Unrouted stream: existing fallback behavior ("main" as the
+            // last resort when the fallback window itself is missing).
+            candidates.push(fallback.to_string());
+            candidates.push("main".to_string());
+        }
+    }
+    // Order-preserving dedup (e.g. fallback == "main").
+    let mut seen = std::collections::HashSet::new();
+    candidates.retain(|c| seen.insert(c.clone()));
+    RouteDecision::Deliver { candidates }
+}
 
 /// Processes incoming game messages and updates state
 pub struct MessageProcessor {
@@ -39,6 +94,10 @@ pub struct MessageProcessor {
 
     /// If true, discard text because no window exists for current stream
     discard_current_stream: bool,
+
+    /// Windows whose layout def opts into TTS (`tts_speak`). Rebuilt by
+    /// `AppCore::refresh_tts_windows` on layout load and editor saves.
+    tts_windows: std::collections::HashSet<String>,
 
     /// Server time offset for countdown synchronization
     pub server_time_offset: i64,
@@ -108,6 +167,9 @@ pub struct MessageProcessor {
 
     /// Pending sounds from highlight processing (to be transferred to GameState)
     pub pending_sounds: Vec<super::highlight_engine::SoundTrigger>,
+    /// Rumble pattern names from highlight matches, drained by AppCore
+    /// into the haptic queue.
+    pub pending_rumbles: Vec<String>,
 
     /// Mapping observations parsed off the main stream (forage sense, ranger
     /// sense). AppCore drains these and attributes them to the current room
@@ -156,7 +218,12 @@ impl MessageProcessor {
             }
         }
     }
-    pub fn new(config: Config, saved_dialog_positions: SavedDialogPositions) -> Self {
+    pub fn new(mut config: Config, saved_dialog_positions: SavedDialogPositions) -> Self {
+        // Routing consults only [streams.routes]; normalize any legacy
+        // drop list on our copy in case the caller's config didn't go
+        // through Config::load_* (tests, embedders). Idempotent.
+        config.streams.migrate_drop_list_to_routes();
+
         // Create parser with presets from config, resolving palette names to hex values
         let preset_list = config
             .colors
@@ -190,6 +257,7 @@ impl MessageProcessor {
             chunk_has_main_text: false,
             chunk_has_silent_updates: false,
             discard_current_stream: false,
+            tts_windows: std::collections::HashSet::new(),
             server_time_offset: 0,
             inventory_buffer: Vec::new(),
             previous_inventory: Vec::new(),
@@ -212,6 +280,7 @@ impl MessageProcessor {
             newly_registered_container: None,
             pending_webui_handshake: None,
             pending_sounds: Vec::new(),
+            pending_rumbles: Vec::new(),
             pending_evidence: Vec::new(),
             pending_pathcode: None,
             saved_dialog_positions,
@@ -263,6 +332,9 @@ impl MessageProcessor {
     /// Refresh internal config, parser presets, and caches after a reload.
     pub fn apply_config(&mut self, mut config: Config) {
         let apply_start = std::time::Instant::now();
+        // Same legacy drop-list normalization as `new` — routing consults
+        // only [streams.routes].
+        config.streams.migrate_drop_list_to_routes();
         crate::config::Config::compile_highlight_patterns(&mut config.highlights);
         tracing::debug!(
             "apply_config: compiled highlight patterns in {:?}",
@@ -435,23 +507,24 @@ impl MessageProcessor {
                     // Stream has subscribers - route normally
                     self.discard_current_stream = false;
                 } else {
-                    // No subscribers - check drop list vs fallback routing
+                    // No subscribers - consult the route map / fallback
                     match self.resolve_orphaned_stream(id) {
-                        None => {
-                            // Stream is in drop_unsubscribed list - discard content
+                        RouteDecision::Discard => {
+                            // Routed to discard (or migrated drop-list entry)
                             self.discard_current_stream = true;
                             tracing::debug!(
-                                "Stream '{}' has no subscribers and is in drop list, discarding content",
+                                "Stream '{}' has no subscribers and routes to discard, dropping content",
                                 id
                             );
                         }
-                        Some(fallback) => {
-                            // Not in drop list - will route to fallback window later
+                        decision => {
+                            // Will deliver at flush time (first existing
+                            // candidate window; never auto-created)
                             self.discard_current_stream = false;
                             tracing::debug!(
-                                "Stream '{}' has no subscribers, will route to fallback '{}'",
+                                "Stream '{}' has no subscribers, will deliver per {:?}",
                                 id,
-                                fallback
+                                decision
                             );
                         }
                     }
@@ -679,6 +752,7 @@ impl MessageProcessor {
                 fg_color,
                 bg_color,
                 bold,
+                mono,
                 span_type,
                 link_data,
                 stream,
@@ -720,7 +794,7 @@ impl MessageProcessor {
                         fg: fg_color.clone(),
                         bg: bg_color.clone(),
                         bold: *bold,
-                        mono: false,
+                        mono: *mono,
                         span_type: data_span_type,
                         link_data: link_data.clone(),
                     };
@@ -790,7 +864,7 @@ impl MessageProcessor {
                     fg: fg_color.clone(),
                     bg: bg_color.clone(),
                     bold: *bold,
-                    mono: false,
+                    mono: *mono,
                     span_type: data_span_type,
                     link_data: link_data.clone(),
                 });
@@ -824,6 +898,45 @@ impl MessageProcessor {
                         }
                     }
                 }
+            }
+            ParsedElement::Event {
+                event_type,
+                action,
+                duration,
+            } => {
+                // Config [event_patterns] regexes matched on game text (stun
+                // rounds/recovery, raise dead, ...). The consumer was lost in
+                // the Beta 2 rewrite - the parser kept emitting these while
+                // nothing fed the stuntime countdown. end_time lives in the
+                // server clock domain, like RoundTime/CastTime above.
+                let countdown_id = match event_type.as_str() {
+                    "stun" => "stuntime",
+                    "rt" => "roundtime",
+                    "ct" => "casttime",
+                    other => other,
+                };
+                match action {
+                    crate::config::EventAction::Set => {
+                        if *duration > 0 {
+                            let end_time = chrono::Utc::now().timestamp()
+                                + self.server_time_offset
+                                + *duration as i64;
+                            self.update_countdown_by_id(ui_state, countdown_id, end_time);
+                        }
+                    }
+                    crate::config::EventAction::Clear => {
+                        self.update_countdown_by_id(ui_state, countdown_id, 0);
+                    }
+                    // Increment is reserved in the config schema; nothing
+                    // emits it yet.
+                    crate::config::EventAction::Increment => {}
+                }
+            }
+            ParsedElement::VellumTimer { id, value } => {
+                // Script-facing countdown feed (<vellumTimer id=.. value=..>):
+                // value is the absolute epoch end time in the server clock
+                // domain, like RoundTime/CastTime; 0 or a past time clears.
+                self.update_countdown_by_id(ui_state, id, (*value).max(0));
             }
             ParsedElement::LeftHand { item, link } => {
                 self.chunk_has_silent_updates = true; // Mark as silent update
@@ -1884,14 +1997,14 @@ impl MessageProcessor {
             // Check stream subscribers for discard logic (case-insensitive lookup)
             if !self.get_stream_subscribers(id).is_empty() {
                 self.discard_current_stream = false;
-            } else if self.config.streams.drop_unsubscribed.contains(&id.to_string()) {
+            } else if matches!(self.resolve_orphaned_stream(id), RouteDecision::Discard) {
                 self.discard_current_stream = true;
-                tracing::debug!("Discarding stream '{}' (in drop_unsubscribed list)", id);
+                tracing::debug!("Discarding stream '{}' (routed to discard)", id);
             } else {
-                // No subscribers - route to fallback
+                // No subscribers - deliver per route/fallback at flush time
                 self.discard_current_stream = false;
                 tracing::debug!(
-                    "Routing stream '{}' to fallback '{}'",
+                    "Routing stream '{}' per route map (fallback '{}')",
                     id,
                     self.config.streams.fallback
                 );
@@ -2436,6 +2549,15 @@ impl MessageProcessor {
         }
     }
 
+    /// Expand `:grin:`-style emoji shortcodes in the pending line, gated by
+    /// the `ui.emoji_shortcodes` toggle. Called from the flush path right
+    /// after highlights are applied.
+    fn apply_emoji_shortcodes(&mut self) {
+        if self.config.ui.emoji_shortcodes {
+            super::emoji::apply_to_segments(&mut self.current_segments);
+        }
+    }
+
     /// Flush current text to appropriate window
     pub fn flush_current_stream(&mut self, ui_state: &mut UiState) {
         self.flush_current_stream_with_tts(ui_state, None);
@@ -2577,8 +2699,14 @@ impl MessageProcessor {
         self.current_segments = highlight_result.segments;
         let deferred_replacements = highlight_result.deferred_replacements;
 
+        // Expand :grin:-style emoji shortcodes at the same seam as highlight
+        // text replacement, so every frontend sees the expanded text. Gated
+        // by ui.emoji_shortcodes (mirrors the highlight_settings toggles).
+        self.apply_emoji_shortcodes();
+
         // Queue sounds from highlight processing
         self.pending_sounds.extend(highlight_result.sounds);
+        self.pending_rumbles.extend(highlight_result.rumbles);
 
         let mut line = StyledLine {
             segments: std::mem::take(&mut self.current_segments),
@@ -3001,29 +3129,40 @@ impl MessageProcessor {
         // Restore the subscriber index taken before the loop
         self.text_stream_subscribers = subscribers_map;
 
-        // Fallback routing if no window handled the stream
-        // Uses config.streams settings: drop_unsubscribed list and fallback window
+        // Orphan routing if no subscribed window handled the stream:
+        // [streams.routes] entry (discard / main / window:<name>) else the
+        // fallback window
         if !text_added_to_any_window {
             // A move implies text was added, so the line is always present here
             let line = line_slot.as_ref().expect("line present when nothing was added");
             match self.resolve_orphaned_stream(&self.current_stream) {
-                None => {
-                    // Stream is in drop list - discard silently
+                // resolve_orphaned_stream passes has_subscriber = false, so
+                // Subscribed can't come back; nothing to do if it did.
+                RouteDecision::Subscribed => {}
+                RouteDecision::Discard => {
+                    // Routed to discard - drop silently
                     tracing::trace!(
-                        "Dropping line from stream '{}' (in drop_unsubscribed list)",
+                        "Dropping line from stream '{}' (routed to discard)",
                         self.current_stream
                     );
                     self.chunk_has_silent_updates = true;
                 }
-                Some(fallback_window) => {
-                    // Route to fallback window (defaults to "main")
-                    tracing::trace!(
-                        "Stream '{}' has no subscribers, routing to fallback '{}'",
-                        self.current_stream,
-                        fallback_window
-                    );
+                RouteDecision::Deliver { candidates } => {
+                    // The first candidate window that exists (and can display
+                    // text) receives the line, into its buffer even while
+                    // hidden. Windows are never auto-created or auto-opened
+                    // here; a missing window:<name> target falls through to
+                    // the fallback window, then "main".
                     let mut delivered = false;
-                    if let Some(fallback) = ui_state.get_window_mut(&fallback_window) {
+                    for target in &candidates {
+                        let Some(window) = ui_state.get_window_mut(target) else {
+                            continue;
+                        };
+                        tracing::trace!(
+                            "Stream '{}' has no subscribers, routing to '{}'",
+                            self.current_stream,
+                            target
+                        );
                         // Apply window-specific replacements if any
                         let final_line = if deferred_replacements.is_empty() {
                             line.clone()
@@ -3032,55 +3171,32 @@ impl MessageProcessor {
                                 segments: super::highlight_engine::apply_deferred_for_window(
                                     &line.segments,
                                     &deferred_replacements,
-                                    &fallback_window,
+                                    target,
                                 ),
                                 stream: line.stream.clone(),
                                 timestamp: line.timestamp,
                             }
                         };
-                        delivered = Self::deliver_line_to_window_content(
-                            &mut fallback.content,
+                        if !Self::deliver_line_to_window_content(
+                            &mut window.content,
                             final_line,
                             &self.current_stream,
-                        );
-                        if delivered {
-                            if let Some(tts_mgr) = tts_manager.as_deref_mut() {
-                                self.enqueue_tts(tts_mgr, &fallback_window, line);
-                            }
+                        ) {
+                            // Window can't display text - try the next candidate
+                            continue;
                         }
+                        if let Some(tts_mgr) = tts_manager.as_deref_mut() {
+                            self.enqueue_tts(tts_mgr, target, line);
+                        }
+                        delivered = true;
+                        break;
                     }
-                    if !delivered && fallback_window != "main" {
-                        // Fallback window missing or can't display text - try
-                        // main as last resort
+                    if !delivered {
                         tracing::trace!(
-                            "Fallback window '{}' not found, routing to main",
-                            fallback_window
+                            "No routing candidate exists for stream '{}' (tried {:?}), line dropped",
+                            self.current_stream,
+                            candidates
                         );
-                        if let Some(main_window) = ui_state.get_window_mut("main") {
-                            // Apply window-specific replacements if any
-                            let final_line = if deferred_replacements.is_empty() {
-                                line.clone()
-                            } else {
-                                StyledLine {
-                                    segments: super::highlight_engine::apply_deferred_for_window(
-                                        &line.segments,
-                                        &deferred_replacements,
-                                        "main",
-                                    ),
-                                    stream: line.stream.clone(),
-                                    timestamp: line.timestamp,
-                                }
-                            };
-                            if Self::deliver_line_to_window_content(
-                                &mut main_window.content,
-                                final_line,
-                                &self.current_stream,
-                            ) {
-                                if let Some(tts_mgr) = tts_manager.as_deref_mut() {
-                                    self.enqueue_tts(tts_mgr, "main", line);
-                                }
-                            }
-                        }
                     }
                 }
             }
@@ -3579,19 +3695,34 @@ impl MessageProcessor {
     }
 
     /// Enqueue text for TTS if enabled and configured for this window
+    /// Replace the set of windows whose defs opt into TTS.
+    pub fn set_tts_windows(&mut self, windows: std::collections::HashSet<String>) {
+        self.tts_windows = windows;
+    }
+
+    /// Refresh the processor's TTS config snapshot. The processor holds its
+    /// own Config copy from construction; without this, enabling TTS in the
+    /// settings editor wouldn't take effect until restart (enqueue_tts gates
+    /// on the stale copy).
+    pub fn set_tts_config(&mut self, tts: crate::config::TtsConfig) {
+        self.config.tts = tts;
+    }
+
     fn enqueue_tts(&self, tts_manager: &mut crate::tts::TtsManager, window_name: &str, line: &StyledLine) {
         // Early exit if TTS not enabled
         if !self.config.tts.enabled {
             return;
         }
 
-        // Check if this window should be spoken based on config
-        let should_speak = match window_name {
-            "thoughts" => self.config.tts.speak_thoughts,
-            "speech" => self.config.tts.speak_speech,
-            "main" => self.config.tts.speak_main,
-            _ => false, // Don't speak other windows by default
-        };
+        // Per-window opt-in from the layout def, with the classic config
+        // toggles kept for the three windows they always covered.
+        let should_speak = self.tts_windows.contains(window_name)
+            || match window_name {
+                "thoughts" => self.config.tts.speak_thoughts,
+                "speech" => self.config.tts.speak_speech,
+                "main" => self.config.tts.speak_main,
+                _ => false,
+            };
 
         if !should_speak {
             return;
@@ -3611,27 +3742,16 @@ impl MessageProcessor {
             return;
         }
 
-        // Determine priority based on window
-        let priority = match window_name {
-            "thoughts" => crate::tts::Priority::High, // Thoughts are important
-            "speech" => crate::tts::Priority::High,   // Whispers are important
-            "main" => crate::tts::Priority::Normal,   // Regular game text
-            _ => crate::tts::Priority::Normal,
-        };
-
-        // Enqueue speech entry
+        // Chronological queue: the manager auto-plays when idle and chains
+        // from the utterance-end callback - nothing to trigger here, and
+        // new lines never interrupt the one being spoken.
         tts_manager.enqueue(crate::tts::SpeechEntry {
             text,
             source_window: window_name.to_string(),
-            priority,
+            priority: crate::tts::Priority::Normal,
             spoken: false,
+            repeats: 1,
         });
-
-        // Auto-speak the next item in queue (if not currently speaking)
-        // This ensures new text gets spoken immediately
-        if let Err(e) = tts_manager.speak_next() {
-            tracing::warn!("Failed to speak TTS entry: {}", e);
-        }
     }
 
     /// Map stream ID to window name
@@ -3668,17 +3788,16 @@ impl MessageProcessor {
         false
     }
 
-    /// Determine what to do with an orphaned stream (no subscribers).
-    /// Returns: Some(window_name) to route to, or None to discard.
-    fn resolve_orphaned_stream(&self, stream: &str) -> Option<String> {
-        // Check if stream is in the drop list
-        if self.config.streams.drop_unsubscribed.iter().any(|s| s.eq_ignore_ascii_case(stream)) {
-            tracing::debug!("Stream '{}' is in drop_unsubscribed list, discarding", stream);
-            return None;
-        }
-
-        // Return the fallback window (defaults to "main")
-        Some(self.config.streams.fallback.clone())
+    /// Determine what to do with an orphaned stream (no subscribers):
+    /// `[streams.routes]` entry (discard / main / window:<name>) if present,
+    /// else the fallback window. Never returns `RouteDecision::Subscribed`.
+    fn resolve_orphaned_stream(&self, stream: &str) -> RouteDecision {
+        route_for(
+            stream,
+            false,
+            &self.config.streams.routes,
+            &self.config.streams.fallback,
+        )
     }
 
     /// Clear inventory cache to force next inventory update to render
@@ -4089,6 +4208,72 @@ mod tests {
     use super::*;
 
     // ===========================================
+    // Stream routing precedence (route_for)
+    // ===========================================
+
+    fn routes(
+        entries: &[(&str, StreamRoute)],
+    ) -> std::collections::BTreeMap<String, StreamRoute> {
+        entries
+            .iter()
+            .map(|(id, route)| (id.to_string(), route.clone()))
+            .collect()
+    }
+
+    fn deliver(candidates: &[&str]) -> RouteDecision {
+        RouteDecision::Deliver {
+            candidates: candidates.iter().map(|c| c.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn route_subscribed_window_always_wins() {
+        // Even a discard route loses to a subscribed window.
+        let map = routes(&[("speech", StreamRoute::Discard)]);
+        assert_eq!(route_for("speech", true, &map, "main"), RouteDecision::Subscribed);
+    }
+
+    #[test]
+    fn route_discard_drops_orphaned_stream() {
+        let map = routes(&[("speech", StreamRoute::Discard)]);
+        assert_eq!(route_for("speech", false, &map, "main"), RouteDecision::Discard);
+        // Lookup is case-insensitive, matching the legacy drop list.
+        assert_eq!(route_for("SPEECH", false, &map, "main"), RouteDecision::Discard);
+    }
+
+    #[test]
+    fn route_main_delivers_to_main() {
+        let map = routes(&[("ooc", StreamRoute::Main)]);
+        assert_eq!(route_for("ooc", false, &map, "story"), deliver(&["main"]));
+    }
+
+    #[test]
+    fn route_window_prefers_window_then_fallback_then_main() {
+        let map = routes(&[("bounty", StreamRoute::Window("bounty".to_string()))]);
+        // Delivery takes the first candidate window that exists, so a
+        // missing "bounty" window falls back to "story", then "main" —
+        // never auto-creating or auto-opening anything.
+        assert_eq!(
+            route_for("bounty", false, &map, "story"),
+            deliver(&["bounty", "story", "main"])
+        );
+        // Duplicates collapse (fallback already "main").
+        assert_eq!(
+            route_for("bounty", false, &map, "main"),
+            deliver(&["bounty", "main"])
+        );
+    }
+
+    #[test]
+    fn route_unrouted_stream_keeps_fallback_behavior() {
+        let map = routes(&[("speech", StreamRoute::Discard)]);
+        assert_eq!(route_for("bounty", false, &map, "story"), deliver(&["story", "main"]));
+        assert_eq!(route_for("bounty", false, &map, "main"), deliver(&["main"]));
+        let empty = routes(&[]);
+        assert_eq!(route_for("anything", false, &empty, "main"), deliver(&["main"]));
+    }
+
+    // ===========================================
     // Helper function to create minimal processor for testing
     // ===========================================
 
@@ -4107,6 +4292,7 @@ mod tests {
             fast_parse: true,
             sound: None,
             sound_volume: None,
+            rumble: None,
             category: None,
             squelch: false,
             silent_prompt: false,
@@ -4279,6 +4465,35 @@ mod tests {
             result,
             Some((_window, crate::config::RedirectMode::RedirectOnly, 3))
         ));
+    }
+
+    // ===========================================
+    // Emoji shortcode toggle tests
+    // ===========================================
+
+    #[test]
+    fn test_emoji_shortcodes_applied_when_enabled() {
+        let mut processor = create_test_processor();
+        assert!(processor.config.ui.emoji_shortcodes, "default must be on");
+        processor.current_segments = vec![TextSegment::plain("You :grin: at 12:30:45.")];
+        processor.apply_emoji_shortcodes();
+        assert_eq!(
+            processor.current_segments[0].text,
+            "You \u{1F601} at 12:30:45."
+        );
+    }
+
+    #[test]
+    fn test_emoji_shortcodes_toggle_off_passthrough() {
+        let mut config = Config::default();
+        config.ui.emoji_shortcodes = false;
+        let mut processor = MessageProcessor::new(config, SavedDialogPositions::default());
+        processor.current_segments = vec![TextSegment::plain("You :grin: at :notarealcode:.")];
+        processor.apply_emoji_shortcodes();
+        assert_eq!(
+            processor.current_segments[0].text,
+            "You :grin: at :notarealcode:."
+        );
     }
 
     // ===========================================
@@ -4549,6 +4764,135 @@ mod tests {
         processor.update_text_stream_subscribers(&ui_state);
 
         assert_eq!(processor.get_stream_subscribers("combat").len(), 1);
+    }
+
+    #[test]
+    fn test_event_pattern_feeds_stun_countdown() {
+        let mut processor = create_test_processor();
+        let mut game_state = GameState::new();
+        let mut ui_state = UiState::new();
+        let mut ws = crate::data::window::WindowState::new_text("stuntime", 10);
+        ws.content = WindowContent::Countdown(crate::data::CountdownData {
+            end_time: 0,
+            cast_end_time: 0,
+            label: "Stun".to_string(),
+            countdown_id: "stuntime".to_string(),
+            color: None,
+        });
+        ui_state.windows.insert("stuntime".to_string(), ws);
+
+        let end_time_of = |ui_state: &UiState| match &ui_state
+            .windows
+            .get("stuntime")
+            .expect("stuntime window")
+            .content
+        {
+            WindowContent::Countdown(cd) => cd.end_time,
+            _ => panic!("not a countdown"),
+        };
+
+        // Set: end_time lands ~duration seconds from now (server offset 0).
+        let set = ParsedElement::Event {
+            event_type: "stun".to_string(),
+            action: crate::config::EventAction::Set,
+            duration: 15,
+        };
+        processor.process_element(
+            &set,
+            &mut game_state,
+            &mut ui_state,
+            &mut std::collections::HashMap::new(),
+            &mut None,
+            &mut false,
+            &mut None,
+            &mut None,
+            &mut None,
+            None,
+        );
+        let end = end_time_of(&ui_state);
+        let now = chrono::Utc::now().timestamp();
+        assert!(
+            (now + 13..=now + 17).contains(&end),
+            "end_time {} not ~now+15",
+            end
+        );
+
+        // Clear: recovery patterns zero the countdown.
+        let clear = ParsedElement::Event {
+            event_type: "stun".to_string(),
+            action: crate::config::EventAction::Clear,
+            duration: 0,
+        };
+        processor.process_element(
+            &clear,
+            &mut game_state,
+            &mut ui_state,
+            &mut std::collections::HashMap::new(),
+            &mut None,
+            &mut false,
+            &mut None,
+            &mut None,
+            &mut None,
+            None,
+        );
+        assert_eq!(end_time_of(&ui_state), 0);
+    }
+
+    #[test]
+    fn test_vellum_timer_feeds_countdown_by_id() {
+        let mut processor = create_test_processor();
+        let mut game_state = GameState::new();
+        let mut ui_state = UiState::new();
+        let mut ws = crate::data::window::WindowState::new_text("cataclysm", 10);
+        ws.content = WindowContent::Countdown(crate::data::CountdownData {
+            end_time: 0,
+            cast_end_time: 0,
+            label: "Cataclysm".to_string(),
+            countdown_id: "dark-cataclyst".to_string(),
+            color: None,
+        });
+        ui_state.windows.insert("cataclysm".to_string(), ws);
+
+        let end_time_of = |ui_state: &UiState| match &ui_state
+            .windows
+            .get("cataclysm")
+            .expect("countdown window")
+            .content
+        {
+            WindowContent::Countdown(cd) => cd.end_time,
+            _ => panic!("not a countdown"),
+        };
+
+        let mut process = |processor: &mut MessageProcessor,
+                           game_state: &mut GameState,
+                           ui_state: &mut UiState,
+                           value: i64| {
+            let element = ParsedElement::VellumTimer {
+                id: "dark-cataclyst".to_string(),
+                value,
+            };
+            processor.process_element(
+                &element,
+                game_state,
+                ui_state,
+                &mut std::collections::HashMap::new(),
+                &mut None,
+                &mut false,
+                &mut None,
+                &mut None,
+                &mut None,
+                None,
+            );
+        };
+
+        process(&mut processor, &mut game_state, &mut ui_state, 1_764_904_999);
+        assert_eq!(end_time_of(&ui_state), 1_764_904_999);
+
+        // 0 clears; negative values clamp to cleared instead of going weird.
+        process(&mut processor, &mut game_state, &mut ui_state, 0);
+        assert_eq!(end_time_of(&ui_state), 0);
+        process(&mut processor, &mut game_state, &mut ui_state, -5);
+        assert_eq!(end_time_of(&ui_state), 0);
     }
 
     fn make_text_window(name: &str, streams: &[&str]) -> crate::data::window::WindowState {

@@ -27,6 +27,10 @@ impl Config {
         let mut config: Config = toml::from_str(&contents)
             .context(format!("Failed to parse config file: {:?}", path))?;
 
+        // Same legacy drop-list migration as load_with_options (in-memory
+        // only; never writes files).
+        config.streams.migrate_drop_list_to_routes();
+
         // Override port from command line (if specified)
         if let Some(port) = port_override {
             config.connection.port = port;
@@ -39,6 +43,14 @@ impl Config {
         config.colors = ColorConfig::load(character)?;
         config.highlights = Self::load_highlights(character)?;
         config.keybinds = Self::load_keybinds(character)?;
+        config.controller_binds = Self::load_controller_binds().unwrap_or_default();
+        config.controller_shift_binds = Self::load_controller_binds_layer(true).unwrap_or_default();
+        config.controller_wheel = Self::load_controller_wheel().unwrap_or_default();
+        config.controller_wheels = Self::load_controller_wheels().unwrap_or_default();
+        config.controller_wheels_meta = Self::load_controller_wheels_meta().unwrap_or_default();
+        config.controller_overlay = Self::load_controller_overlay().unwrap_or_default();
+        config.controller_rumble = Self::load_controller_rumble().unwrap_or_default();
+        config.controller_tuning = Self::load_controller_tuning().unwrap_or_default();
         config.hotbars = Self::load_hotbars(character)?;
         config.app_keybinds = Self::load_app_keybinds(character)?;
         config.macros = MacrosConfig::load(character).unwrap_or_default();
@@ -198,13 +210,13 @@ impl Config {
         fs::create_dir_all(&profile)?;
         tracing::info!("Created profile directory: {:?}", profile);
 
-        // Extract config.toml to global directory (shared defaults for all characters)
-        // Character-specific overrides can still be added to profile/config.toml
-        let config_path = Self::common_config_path()?;
-        if !config_path.exists() {
-            fs::write(&config_path, DEFAULT_CONFIG).context("Failed to write config.toml")?;
-            tracing::info!("Extracted config.toml to {:?}", config_path);
-        }
+        // config.toml is deliberately NOT extracted: the embedded defaults
+        // are the bottom layer at load time (see load_layered_config), so
+        // shipped default changes reach every user automatically. A
+        // global/config.toml appears only once someone saves a global
+        // setting, and then holds just their overrides. (Existing extracted
+        // files keep working as the global layer and thin on next save.)
+        // The commented reference copy lives in templates/config_template.toml.
 
         // Extract colors.toml to global directory (shared across all characters)
         // Character-specific overrides can still be added to profile/colors.toml
@@ -245,7 +257,37 @@ impl Config {
             tracing::info!("Created empty history.txt at {:?}", history_path);
         }
 
+        // Merge newly shipped default highlights/keybinds/hotbars into the
+        // extracted files (tombstoned: user deletions stay deleted), and
+        // refresh managed data files the user never modified.
+        super::defaults_refresh::refresh_shipped_defaults()?;
+
         Ok(())
+    }
+
+    /// Read one config layer's raw file contents, if the file exists.
+    fn read_layer(path: &std::path::Path) -> Result<Option<String>> {
+        if path.exists() {
+            Ok(Some(fs::read_to_string(path).with_context(|| {
+                format!("Failed to read config layer: {:?}", path)
+            })?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// The fully layered view for a character: defaults < global < profile.
+    pub fn load_layered_config(character: Option<&str>) -> Result<Self> {
+        let global = Self::read_layer(&Self::common_config_path()?)?;
+        let profile = Self::read_layer(&Self::config_path(character)?)?;
+        super::sparse::layer_config(global.as_deref(), profile.as_deref())
+    }
+
+    /// The global layer only: defaults < global file. This is the base a
+    /// profile save diffs against.
+    fn load_global_layer() -> Result<Self> {
+        let global = Self::read_layer(&Self::common_config_path()?)?;
+        super::sparse::layer_config(global.as_deref(), None)
     }
 
     /// Load common (global) config defaults
@@ -344,14 +386,16 @@ impl Config {
         // Extract defaults on first run (idempotent - only creates missing files)
         Self::extract_defaults(character)?;
 
-        // Load global config first (defaults for all characters)
-        let mut config = Self::load_common_config()?;
+        // Layer per-leaf: code defaults < global file < profile file. Only
+        // keys a file actually states override the layer below — a profile
+        // file that sets one value no longer resets whole sections.
+        let mut config = Self::load_layered_config(character)?;
 
-        // Load character-specific config and merge (character overrides global)
-        if let Some(char_config) = Self::load_character_config_only(character)? {
-            config.merge_with(char_config);
-        }
-        // If no character config exists, we use global config with default connection
+        // Legacy [streams] drop_unsubscribed entries become routes."<id>" =
+        // "discard" and the drop list is cleared, so runtime code has one
+        // source of truth. In-memory only — load never writes files; the
+        // next sparse save carries routes and ages the old key out.
+        config.streams.migrate_drop_list_to_routes();
 
         // Override port from command line (if specified)
         if let Some(port) = port_override {
@@ -365,6 +409,14 @@ impl Config {
         config.colors = ColorConfig::load(character)?;
         config.highlights = Self::load_highlights(character)?;
         config.keybinds = Self::load_keybinds(character)?;
+        config.controller_binds = Self::load_controller_binds().unwrap_or_default();
+        config.controller_shift_binds = Self::load_controller_binds_layer(true).unwrap_or_default();
+        config.controller_wheel = Self::load_controller_wheel().unwrap_or_default();
+        config.controller_wheels = Self::load_controller_wheels().unwrap_or_default();
+        config.controller_wheels_meta = Self::load_controller_wheels_meta().unwrap_or_default();
+        config.controller_overlay = Self::load_controller_overlay().unwrap_or_default();
+        config.controller_rumble = Self::load_controller_rumble().unwrap_or_default();
+        config.controller_tuning = Self::load_controller_tuning().unwrap_or_default();
         config.hotbars = Self::load_hotbars(character)?;
         config.app_keybinds = Self::load_app_keybinds(character)?;
         config.menu_keybinds = Self::load_menu_keybinds(character)?;
@@ -400,19 +452,27 @@ impl Config {
         Ok(config)
     }
 
+    /// Write `config` to `path` sparsely: the file ends up stating exactly
+    /// the keys that differ from `base`, with comments on surviving keys
+    /// preserved and unknown keys left alone.
+    fn save_sparse(path: &std::path::Path, config: &Config, base: &Config) -> Result<()> {
+        let existing = Self::read_layer(path)?.unwrap_or_default();
+        let contents = super::sparse::sparse_config_toml(&existing, config, base)?;
+        write_atomic(path, contents)
+            .with_context(|| format!("Failed to write config file: {:?}", path))?;
+        Ok(())
+    }
+
     pub fn save(&self, character: Option<&str>) -> Result<()> {
         // Use provided character name, or fall back to stored character name
         let char_name = character.or(self.character.as_deref());
         let config_path = Self::config_path(char_name)?;
 
-        // Ensure parent directory exists
-        if let Some(parent) = config_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-
-        // Save main config (without highlights, keybinds, colors, color_palette - those are skipped)
-        let contents = toml::to_string_pretty(self).context("Failed to serialize config")?;
-        fs::write(&config_path, contents).context("Failed to write config file")?;
+        // The profile file keeps only what diverges from the global layer,
+        // so global edits keep reaching this character. (The old full dump
+        // pinned every setting into the profile forever.)
+        let base = Self::load_global_layer()?;
+        Self::save_sparse(&config_path, self, &base)?;
 
         // Save to separate files
         self.colors.save(char_name)?;
@@ -422,19 +482,10 @@ impl Config {
         Ok(())
     }
 
-    /// Save config to global config.toml
+    /// Save config to global config.toml (sparse against the code defaults).
     pub fn save_common(&self) -> Result<()> {
         let config_path = Self::common_config_path()?;
-
-        // Ensure global directory exists
-        if let Some(parent) = config_path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("Failed to create global directory: {:?}", parent))?;
-        }
-
-        // Save main config
-        let contents = toml::to_string_pretty(self).context("Failed to serialize config")?;
-        fs::write(&config_path, contents).context("Failed to write global config file")?;
+        Self::save_sparse(&config_path, self, &Config::default())?;
         tracing::info!("Saved config to global file: {:?}", config_path);
         Ok(())
     }
@@ -447,12 +498,12 @@ impl Config {
         is_global: bool,
         character: Option<&str>,
     ) -> Result<()> {
-        // Connection settings are ALWAYS character-specific
-        let actual_is_global = if key.starts_with("connection.") {
-            false
-        } else {
-            is_global
-        };
+        // Character-only settings (connection identity, pinned ports)
+        // never save to global, regardless of the requested scope.
+        let character_only = crate::config::registry::find(key)
+            .map(|def| def.scope == crate::config::registry::SettingScope::CharacterOnly)
+            .unwrap_or_else(|| key.starts_with("connection."));
+        let actual_is_global = if character_only { false } else { is_global };
 
         if actual_is_global {
             self.save_setting_to_global(key)
@@ -475,63 +526,35 @@ impl Config {
 
     /// Save a specific setting to character config
     fn save_setting_to_character(&self, key: &str, character: Option<&str>) -> Result<()> {
-        // Load current character config (or create new if doesn't exist)
-        let mut char_config = Self::load_character_config_only(character)?
-            .unwrap_or_else(Self::default);
-
-        // Update the specific setting
+        // Start from the character's layered view (not the raw file):
+        // fields the profile never set match the global layer exactly, so
+        // the sparse diff below writes this key plus existing overrides —
+        // never phantom "overrides" of serde defaults.
+        let mut char_config = Self::load_layered_config(character)?;
         Self::copy_setting(&mut char_config, self, key);
 
-        // Save to character config path
         let config_path = Self::config_path(character)?;
-        if let Some(parent) = config_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let contents = toml::to_string_pretty(&char_config).context("Failed to serialize config")?;
-        fs::write(&config_path, contents).context("Failed to write character config file")?;
+        let base = Self::load_global_layer()?;
+        Self::save_sparse(&config_path, &char_config, &base)?;
         tracing::info!("Saved setting '{}' to character config: {:?}", key, config_path);
         Ok(())
     }
 
-    /// Copy a specific setting from source to destination config
-    fn copy_setting(dest: &mut Config, src: &Config, key: &str) {
-        match key {
-            // Connection settings
-            "connection.host" => dest.connection.host = src.connection.host.clone(),
-            "connection.port" => dest.connection.port = src.connection.port,
-            "connection.character" => dest.connection.character = src.connection.character.clone(),
-            "connection.account" => dest.connection.account = src.connection.account.clone(),
-            "connection.password" => dest.connection.password = src.connection.password.clone(),
-            "connection.game" => dest.connection.game = src.connection.game.clone(),
-
-            // UI settings
-            "ui.buffer_size" => dest.ui.buffer_size = src.ui.buffer_size,
-            "ui.border_style" => dest.ui.border_style = src.ui.border_style.clone(),
-            "ui.countdown_icon" => dest.ui.countdown_icon = src.ui.countdown_icon.clone(),
-            "ui.selection_enabled" => dest.ui.selection_enabled = src.ui.selection_enabled,
-            "ui.selection_respect_window_boundaries" => {
-                dest.ui.selection_respect_window_boundaries = src.ui.selection_respect_window_boundaries
-            }
-            "ui.selection_auto_copy" => dest.ui.selection_auto_copy = src.ui.selection_auto_copy,
-            "ui.block_bank_dialog" => {
-                dest.ui.open_dialog_blocklist = src.ui.open_dialog_blocklist.clone()
-            }
-            "ui.drag_modifier_key" => dest.ui.drag_modifier_key = src.ui.drag_modifier_key.clone(),
-            "ui.min_command_length" => dest.ui.min_command_length = src.ui.min_command_length,
-
-            // Sound settings
-            "sound.enabled" => dest.sound.enabled = src.sound.enabled,
-            "sound.volume" => dest.sound.volume = src.sound.volume,
-            "sound.cooldown_ms" => dest.sound.cooldown_ms = src.sound.cooldown_ms,
-
-            // Theme settings
-            "active_theme" => dest.active_theme = src.active_theme.clone(),
-
-            // Skin settings
-            "active_skin" => dest.active_skin = src.active_skin.clone(),
-
-            _ => {
-                tracing::warn!("Unknown setting key for copy: {}", key);
+    /// Copy a specific setting from source to destination config, resolved
+    /// through the settings registry — every registered key works, not a
+    /// hand-picked subset. Returns false (with a warning) for unknown keys
+    /// so callers can surface the miss instead of silently no-op saving.
+    pub(crate) fn copy_setting(dest: &mut Config, src: &Config, key: &str) -> bool {
+        let Some(def) = crate::config::registry::find(key) else {
+            tracing::warn!("Unknown setting key for copy: {}", key);
+            return false;
+        };
+        let value = (def.get)(src);
+        match (def.set)(dest, &value) {
+            Ok(()) => true,
+            Err(err) => {
+                tracing::warn!("Failed to copy setting {}: {}", key, err);
+                false
             }
         }
     }
@@ -560,6 +583,8 @@ impl Default for Config {
                 selection_auto_copy: default_selection_auto_copy(),
                 drag_modifier_key: default_drag_modifier_key(),
                 min_command_length: default_min_command_length(),
+                emoji_shortcodes: true,
+                color_emoji: true,
                 performance_stats_enabled: default_performance_stats_enabled(),
                 perf_stats_x: default_perf_stats_x(),
                 perf_stats_y: default_perf_stats_y(),
@@ -592,6 +617,14 @@ impl Default for Config {
             },
             highlights: HashMap::new(),     // Loaded from highlights.toml
             keybinds: HashMap::new(),       // Loaded from keybinds.toml
+            controller_binds: HashMap::new(), // Loaded from [controller] of keybinds.toml
+            controller_shift_binds: HashMap::new(), // Loaded from [controller_shift]
+            controller_wheel: Vec::new(),   // Loaded from [[controller_wheel]]
+            controller_wheels: HashMap::new(), // Loaded from [controller_wheels.<name>]
+            controller_wheels_meta: HashMap::new(), // Loaded from [controller_wheels_meta.<name>]
+            controller_overlay: Vec::new(), // Loaded from [controller_overlay]
+            controller_rumble: RumbleConfig::default(),
+            controller_tuning: TuningConfig::default(),
             hotbars: HotbarsConfig::default(), // Loaded from hotbars.toml
             app_keybinds: AppKeybinds::default(), // Loaded from [app] section of keybinds.toml
             colors: ColorConfig::default(), // Loaded from colors.toml
@@ -620,6 +653,27 @@ impl Default for Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The shipped defaults/globals/config.toml must parse as a Config and
+    /// agree with the code defaults for the values it states explicitly.
+    /// These have drifted before (port 8001 vs 8000, a stale
+    /// open_dialog_blocklist, and a [ui.focus] header that was commented
+    /// out while its keys were not — silently mis-sectioning everything
+    /// after it).
+    #[test]
+    fn shipped_default_config_matches_code_defaults() {
+        let shipped: Config =
+            toml::from_str(crate::config::DEFAULT_CONFIG).expect("shipped config.toml must parse");
+        let code = Config::default();
+        assert_eq!(shipped.connection.port, code.connection.port);
+        assert_eq!(shipped.ui.buffer_size, code.ui.buffer_size);
+        assert_eq!(shipped.ui.open_dialog_blocklist, code.ui.open_dialog_blocklist);
+        // The [ui.focus] section must actually land in ui.focus (regression
+        // guard for the commented-header bug).
+        assert_eq!(shipped.ui.focus.types, code.ui.focus.types);
+        // Perf keys stay in [ui], not swallowed by a preceding sub-table.
+        assert_eq!(shipped.ui.perf_stats_width, code.ui.perf_stats_width);
+    }
 
     /// Every serialized root field that Config::save writes into the
     /// profile config must survive merge_with — fields missing from the

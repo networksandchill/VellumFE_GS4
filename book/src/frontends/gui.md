@@ -40,9 +40,13 @@ center, and right sidebar. Toggle zones from the top toolbar.
   categorized templates, toggle visibility, or reassign a window's zone.
 - **Right-click** a window body for its context menu — including **Edit
   Window…**, which opens the window editor; title bars can be hidden
-  per-window.
+  per-window. Overlapping windows in the center area offer **Send to
+  Back**, dropping the window behind any it covers so a buried one can be
+  reached (clicking a window still raises it to the front).
 - Windows can be **detached** into separate OS windows (restored across
-  sessions), or locked together into tab groups that move as a unit.
+  sessions), or locked together into tab groups that move as a unit. The
+  context menu reorders group members (**Move Up / Move Down**) and can
+  ungroup one member or the whole group.
 
 ## The Map
 
@@ -68,18 +72,30 @@ it in place. Beyond title, streams, and buffer size, the editor exposes:
 - **Countdowns**: a **fill color** override (defaults: roundtime red,
   casttime blue).
 - **Active effects**: category (spells/buffs/debuffs/cooldowns).
+- **Vitals bars**: orientation, height, text format, and per-bar toggles
+  are edited here, on the vitals window itself.
+- **Targets windows**: also edit the global `target_list.*` display
+  settings (status position, truncation, boss colors) in place.
+- **Speech**: a **speak new lines (TTS)** checkbox reads everything routed
+  to this window aloud (needs TTS on in Settings > Speech).
 - **Delete Window** — actually removes the window from the layout
   (unlike hiding, or the `.deletewindow` command, which only hides).
 
-## Custom Windows
+## Streams & Custom Windows
 
-**Windows menu → Add → Custom Window…** opens an authoring panel for
-custom text windows fed by any Lich stream id. Name the window, type
-comma-separated stream ids — or click one from the **streams seen this
-session** list — and it starts collecting that output. The panel also
-edits or deletes existing custom windows. (The TUI can do the same from
-its window editor's Streams field; `Ctrl+P` there opens the same
-seen-streams picker.)
+**Windows menu → Streams & Custom Windows…** opens a panel that does two
+things:
+
+- **Stream routing** — every stream seen this session, with a route for
+  each: a window, main, or discard. This is the GUI counterpart of the
+  `.streams` editor and writes `[streams.routes]` in
+  [config.toml](../configuration/config-toml.md#stream-routing).
+- **Custom windows** — author text windows fed by any Lich stream id.
+  Name the window, type comma-separated stream ids — or click one from
+  the seen-streams list — and it starts collecting that output. The panel
+  also edits or deletes existing custom windows. (The TUI can do the same
+  from its window editor's Streams field; `Ctrl+P` there opens the same
+  seen-streams picker.)
 
 ## Lich WebUI Panels
 
@@ -94,7 +110,9 @@ browser:
 ```
 
 Open panels are saved with your layout and reconnect automatically at
-login. Requires a Lich proxy connection (not `--direct`).
+login. Requires a Lich proxy connection (not `--direct`). Works with
+containerized Lich too — the bridge follows the host Lich advertises in
+its handshake instead of assuming localhost.
 
 ## Appearance
 
@@ -110,6 +128,111 @@ Open `.settings` → GUI panel:
 - Per-window overrides: text size, accent (border) color, wrapping, fonts.
 
 Every size is adjustable — the Wrayth-like defaults are just defaults.
+
+## Interact Mode
+
+Press **F6** (keybind action `interact_mode`) for pointer-free interaction
+with the room — built for controller players (map your d-pad to the arrow
+keys with Steam Input or similar) and anyone who'd rather not mouse:
+
+- **↑/↓** cycle entities in the current category, **←/→** switch category
+  (creatures → objects → players → exits).
+- **Enter** opens the same server context menu a click would — arrow keys
+  and Enter navigate it, Esc backs out to interact mode.
+- Activating an **exit** walks that direction and leaves the mode.
+- The focused entity is highlighted in the room window, named in a status
+  overlay, and announced through TTS when speech is enabled.
+- **Esc** exits the mode.
+
+## Controllers
+
+Plug in a gamepad and the GUI reads it natively (Xbox and PlayStation
+pads verified on Windows; no mapper software needed — turn yours off to
+avoid doubled inputs).
+
+- **Left stick** walks the 8 compass directions — deflect toward
+  northeast to head `ne`; one step per deflection.
+- **D-pad** covers the rest of movement by default: up/down go `up` and
+  `down`, right goes `out`, and left runs [`.portal`](../reference/commands.md)
+  — walk the room's door/arch/gate, with a pick list when there are
+  several.
+- While a **context menu** is open, the d-pad navigates, South
+  (A/cross) confirms, East (B/circle) cancels — that part is fixed.
+- In **[interact mode](#interact-mode)** the **right stick** does the
+  cycling — up/down switch categories, left/right step entities — and
+  **South selects** (menu, or walk the exit). Everything else keeps
+  its binds: the left stick still walks, the d-pad still runs its
+  commands, and the other face buttons (plus the shift bank) fire
+  their macros. Macros may use `<target_id>` / `<target_noun>`,
+  filled from the focused entity at press time — bind
+  `target #<target_id>\rincant 611\r` to West and cast at whatever
+  the ring is on. Toggle the mode off from its Start bind.
+
+Everything else is yours to bind with **`.controller`**: each button
+maps to a keybind action or macro, with a "press a button" capture in
+the editor (`look` on South and interact mode on Start ship as
+defaults). Bindings live in the `[controller]` table of the global
+keybinds.toml and apply to all characters.
+
+Beyond plain bindings:
+
+- **Shift layer** — hold the button bound to `controller_shift` (l2 by
+  default) and every button switches to a second bank, edited on the
+  editor's Shift tab. Defaults: shift+d-pad pages the story window,
+  shift+South stands up.
+- **Radial command wheels** — hold the button bound to
+  `controller_wheel` (r2 by default), aim with the free stick (the one
+  that isn't walking — right, unless you move `movement_stick`), release
+  to fire. Slices can be **folders** (South opens, East backs up) and
+  carry **colors** — the wedge tints from its aim floor out to the rim
+  (dim at rest, bright while aimed), so the colored band is exactly
+  the zone where the slice activates and wheels can be color-coded by
+  function. Wedges don't
+  have to be even: give a slice a fixed **span** in degrees, rotate the
+  ring with **Start**, and set a per-slice **inner** floor that demands
+  a deeper stick throw before that slice will aim. Multiple named
+  wheels via `controller_wheel:<name>` bindings; build it all on the
+  editor's Wheels tab. Its **Visual** view is a drag-and-drop designer:
+  drag a divider to trade width between wedges (it snaps to the compass
+  points — hold Shift to go free), drag a wedge's floor arc to set its
+  inner, drag a wedge's body to reorder the ring, click a wedge to edit
+  its fields, double-click a folder to step inside (and the Back wedge
+  to step back out), plus lock / even-out / mirror / rotate tools.
+  Inside a folder, **Add Back** turns the auto Back ghost into a real
+  slice you can move, resize, and color (dwelling it still ascends);
+  **Remove Back** restores the ghost. **Lock** a slice to freeze its
+  width — its span field and dividers disable, and even-out leaves it
+  alone. **Numeric** shows the same wheel as exact rows. One name is
+  dynamic:
+  **`controller_wheel:portals`**
+  (r3 by default) fills its slices from the current room's noun exits —
+  the same list [`.portal`](../reference/commands.md) resolves — so
+  `go gate` / `climb ladder` are always one hold-and-flick away.
+- **Binding legend** — Select toggles a compact overlay of your
+  bindings (`controller_overlay` action). It's curated: check **HUD**
+  on the rows you want shown. While shift is held the shift entries
+  read strong — the legend always shows what the pad does right now.
+- **Rumble** — the pad buzzes when roundtime ends, you're stunned, or
+  you die; pattern per event on the editor's Rumble tab. Beyond the
+  built-ins (off/short/long/double) you can define **custom patterns**
+  there — strength, buzz length, buzz count, gap, with a **Test**
+  button that plays the row on the pad — and any
+  [highlight rule](../customization/highlights.md) can name a pattern
+  to buzz when its text matches (rate-limited so a chatty pattern
+  can't vibrate continuously).
+- **Right stick** scrolls the story window with an analog speed curve;
+  the same page-scroll actions work from any bound key or button.
+- With several portals in a room, `.portal` (d-pad left) opens a
+  pad-navigable picker menu.
+
+## Speech (Text-to-Speech)
+
+**Settings > Speech** holds the TTS controls: enable, rate, volume, a
+voice picker, pronunciation substitutions, gag patterns, and a **Test**
+button that speaks a sample line. Pick which windows are read aloud with
+the per-window **speak new lines** checkbox in the window editor; the
+[`.tts` commands](../reference/commands.md#text-to-speech) drive the same
+settings from the input line.
 
 ## Graphics
 

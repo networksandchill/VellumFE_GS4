@@ -2,10 +2,112 @@ use anyhow::Result;
 
 use super::AppCore;
 
+/// Compass/vertical movement words — everything else in a room's wayto
+/// edges is a "portal" (go door, climb stair, enter hole, ...).
+const COMPASS_WORDS: [&str; 22] = [
+    "north", "northeast", "east", "southeast", "south", "southwest", "west", "northwest", "up",
+    "down", "out", "n", "ne", "e", "se", "s", "sw", "w", "nw", "u", "d", "o",
+];
+
+/// Room-object nouns that look like walkable portals, for the fallback
+/// when the mapdb doesn't know the current room.
+const PORTAL_NOUNS: [&str; 18] = [
+    "door", "gate", "arch", "archway", "portal", "stair", "stairs", "stairway", "steps",
+    "ladder", "trapdoor", "opening", "entrance", "path", "trail", "bridge", "ramp", "curtain",
+];
+
+/// Distinct non-compass, non-StringProc movement commands from a room's
+/// wayto edges, in stable (BTreeMap value) order.
+fn portal_candidates<'a>(wayto: impl Iterator<Item = &'a String>) -> Vec<String> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut out = Vec::new();
+    for command in wayto {
+        let trimmed = command.trim();
+        if crate::core::mapdb::is_proc_command(trimmed) {
+            continue;
+        }
+        if COMPASS_WORDS.contains(&trimmed.to_ascii_lowercase().as_str()) {
+            continue;
+        }
+        if seen.insert(trimmed.to_ascii_lowercase()) {
+            out.push(trimmed.to_string());
+        }
+    }
+    out
+}
+
+/// Seconds encoded by a macro sleep segment: the whole segment (modulo
+/// surrounding spaces) must be `s` followed by a number — `s2`, `s0.5`,
+/// `s90` (no upper bound). Anything else is a game command; a bare `s`
+/// stays the game's "south".
+fn sleep_segment_seconds(segment: &str) -> Option<f64> {
+    let digits = segment.trim().strip_prefix('s')?;
+    if digits.is_empty()
+        || !digits.chars().all(|c| c.is_ascii_digit() || c == '.')
+        || !digits.chars().any(|c| c.is_ascii_digit())
+        || digits.chars().filter(|&c| c == '.').count() > 1
+    {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+/// Split a multi-command macro containing sleep segments into the part to
+/// send immediately (joined by \r, the way multi-command strings always
+/// ride to the server) and the paused remainder as (cumulative delay,
+/// command) pairs. None when the string has no sleep segments — the
+/// normal send path handles it untouched.
+fn split_sleep_macro(
+    text: &str,
+) -> Option<(Option<String>, Vec<(std::time::Duration, String)>)> {
+    if !text.contains('\r') || !text.split('\r').any(|s| sleep_segment_seconds(s).is_some()) {
+        return None;
+    }
+    let mut immediate: Vec<&str> = Vec::new();
+    let mut delayed: Vec<(std::time::Duration, String)> = Vec::new();
+    let mut pause = 0.0_f64;
+    for segment in text.split('\r') {
+        if let Some(seconds) = sleep_segment_seconds(segment) {
+            pause += seconds;
+            continue;
+        }
+        let segment = segment.trim();
+        if segment.is_empty() {
+            continue;
+        }
+        if pause == 0.0 {
+            immediate.push(segment);
+        } else {
+            delayed.push((
+                std::time::Duration::from_secs_f64(pause),
+                segment.to_string(),
+            ));
+        }
+    }
+    Some((
+        (!immediate.is_empty()).then(|| immediate.join("\r")),
+        delayed,
+    ))
+}
+
 impl AppCore {
     /// Send command to server
     pub fn send_command(&mut self, command: String) -> Result<String> {
         use crate::data::{SpanType, StyledLine, TextSegment, WindowContent};
+
+        // Macro sleep segments: `look\rs2.5\rhide` pauses 2.5s between the
+        // commands (paused segments go out via take_outbound when due).
+        // Only strings containing a sleep segment take this path — plain
+        // multi-command macros ride through unchanged.
+        if let Some((immediate, delayed)) = split_sleep_macro(&command) {
+            for (delay, segment) in delayed {
+                self.queue_timed_command(delay, segment);
+            }
+            return match immediate {
+                Some(text) => self.send_command(text),
+                None => Ok(String::new()),
+            };
+        }
 
         // Check for dot commands (local client commands)
         if command.starts_with('.') {
@@ -292,6 +394,375 @@ impl AppCore {
         self.add_system_message(&summary);
     }
 
+    /// The current room's portal commands ("go arch", "climb stair"):
+    /// the mapdb room's wayto edges, falling back to portal-looking
+    /// nouns among the room objects when the map doesn't know the room.
+    /// Shared by `.portal` and the dynamic `portals` controller wheel.
+    pub fn portal_commands(&self) -> Vec<String> {
+        let mut candidates: Vec<String> = Vec::new();
+        if let (Some(room_id), Some(db)) = (self.map.current_room_id, self.map.mapdb()) {
+            if let Some(room) = db.room(room_id) {
+                candidates = portal_candidates(room.wayto.values());
+            }
+        }
+        if candidates.is_empty() {
+            candidates = self
+                .game_state
+                .room_objects
+                .iter()
+                .filter_map(|obj| {
+                    let noun = obj.noun.as_deref()?;
+                    PORTAL_NOUNS
+                        .contains(&noun.to_ascii_lowercase().as_str())
+                        .then(|| format!("go {}", noun))
+                })
+                .collect();
+            candidates.dedup();
+        }
+        candidates
+    }
+
+    /// `.portal [n|text]` — walk through the room's non-compass exit
+    /// ("go door", "climb stair", ...). One candidate: walk it. Several:
+    /// list them; `.portal 2` or `.portal arch` picks. Candidates come
+    /// from `portal_commands`. Returns the movement command to send
+    /// upstream, or None.
+    fn handle_portal_command(&mut self, args: &[String]) -> Option<String> {
+        let mut candidates = self.portal_commands();
+
+        match (candidates.len(), args.first()) {
+            (0, _) => {
+                self.add_system_message("No portal found here.");
+                None
+            }
+            (1, None) => Some(candidates.remove(0)),
+            (_, None) => {
+                // Several portals: open a local popup menu — keyboard and
+                // controller navigable on the desktop frontends. Phones
+                // (whose menus are server-driven) get the listing message.
+                let items: Vec<crate::data::ui_state::PopupMenuItem> = candidates
+                    .iter()
+                    .map(|cmd| crate::data::ui_state::PopupMenuItem {
+                        text: cmd.clone(),
+                        command: cmd.clone(),
+                        disabled: false,
+                    })
+                    .collect();
+                let position = self.last_link_click_pos.unwrap_or((200, 160));
+                self.ui_state.popup_menu =
+                    Some(crate::data::ui_state::PopupMenu::new(items, position));
+                self.ui_state.input_mode = crate::data::ui_state::InputMode::Menu;
+                self.needs_render = true;
+                let listing = candidates
+                    .iter()
+                    .enumerate()
+                    .map(|(i, cmd)| format!("{}) {}", i + 1, cmd))
+                    .collect::<Vec<_>>()
+                    .join("  ");
+                self.add_system_message(&format!(
+                    "Portals: {}  — pick from the menu or .portal <number|word>",
+                    listing
+                ));
+                None
+            }
+            (_, Some(pick)) => {
+                if let Ok(index) = pick.parse::<usize>() {
+                    if index >= 1 && index <= candidates.len() {
+                        return Some(candidates.remove(index - 1));
+                    }
+                }
+                let needle = pick.to_ascii_lowercase();
+                if let Some(found) = candidates
+                    .iter()
+                    .position(|cmd| cmd.to_ascii_lowercase().contains(&needle))
+                {
+                    return Some(candidates.remove(found));
+                }
+                self.add_system_message(&format!("No portal matches '{}'.", pick));
+                None
+            }
+        }
+    }
+
+    /// `.uiexport <name> [parts...]` — build a shareable `.vellumpack`
+    /// of the UI's config files. The GUI passes its live layout via
+    /// `extra_files`; other frontends export the TUI layout only.
+    pub fn uiexport_with(&mut self, args: &[String], extra_files: Vec<(String, Vec<u8>)>) {
+        let Some(name) = args.first().cloned() else {
+            self.add_system_message(&format!(
+                "Usage: .uiexport <name> [parts...] — parts: {} (default: all)",
+                crate::core::uipack::PARTS.join(", ")
+            ));
+            return;
+        };
+        let parts: Vec<String> = if args.len() > 1 {
+            args[1..].iter().map(|s| s.to_lowercase()).collect()
+        } else {
+            crate::core::uipack::PARTS.iter().map(|s| s.to_string()).collect()
+        };
+        let layout_toml = self.layout.clone().to_share_toml().ok();
+        let base = match crate::config::Config::base_dir() {
+            Ok(base) => base,
+            Err(e) => {
+                self.add_system_message(&format!("Export failed: {e:#}"));
+                return;
+            }
+        };
+        match crate::core::uipack::export(
+            &base,
+            &name,
+            &parts,
+            self.config.character.as_deref(),
+            layout_toml,
+            self.config.active_skin.as_deref(),
+            &extra_files,
+        ) {
+            Ok((path, included)) => {
+                self.add_system_message(&format!(
+                    "Exported UI pack '{}' ({}) to {}",
+                    name,
+                    included.join(", "),
+                    path.display()
+                ));
+                self.add_system_message(
+                    "Share the file anywhere — it carries no account or connection settings.",
+                );
+            }
+            Err(e) => self.add_system_message(&format!("Export failed: {e:#}")),
+        }
+    }
+
+    /// `.uiimport <name|file> [apply]` — preview a pack, or apply it
+    /// (with backups) and hot-reload what can be. Returns the pack's
+    /// GUI-layout bytes with the pack name so the GUI frontend can
+    /// install them as a named checkpoint.
+    pub fn uiimport(&mut self, args: &[String]) -> Option<(String, Vec<u8>)> {
+        let Some(target) = args.first() else {
+            self.add_system_message(
+                "Usage: .uiimport <name|file> — preview; add 'apply' to install",
+            );
+            return None;
+        };
+        let base = match crate::config::Config::base_dir() {
+            Ok(base) => base,
+            Err(e) => {
+                self.add_system_message(&format!("Import failed: {e:#}"));
+                return None;
+            }
+        };
+        let Some(path) = crate::core::uipack::resolve_pack_path(&base, target) else {
+            self.add_system_message(&format!(
+                "No pack '{}' — pass a name from {}/exports or a file path",
+                target,
+                base.display()
+            ));
+            return None;
+        };
+
+        if args.get(1).map(String::as_str) != Some("apply") {
+            match crate::core::uipack::preview(&path) {
+                Ok(preview) => {
+                    self.add_system_message(&format!(
+                        "Pack {} (VellumFE {}): {}{}",
+                        path.display(),
+                        preview.manifest.version,
+                        preview.manifest.parts.join(", "),
+                        preview
+                            .manifest
+                            .skin
+                            .as_deref()
+                            .map(|s| format!(" — skin '{s}'"))
+                            .unwrap_or_default()
+                    ));
+                    self.add_system_message(&format!(
+                        "{} file(s). Run `.uiimport {} apply` to install — replaced files are backed up.",
+                        preview.entries.len(),
+                        target
+                    ));
+                }
+                Err(e) => self.add_system_message(&format!("Could not read pack: {e:#}")),
+            }
+            return None;
+        }
+
+        match crate::core::uipack::apply(&base, &path, self.config.character.as_deref()) {
+            Ok(outcome) => {
+                for note in &outcome.notes {
+                    self.add_system_message(&format!("uiimport: {note}"));
+                }
+                if let Some(dir) = &outcome.backup_dir {
+                    self.add_system_message(&format!(
+                        "Replaced files backed up to {}",
+                        dir.display()
+                    ));
+                }
+                // Hot-reload everything the pack can touch.
+                self.reload_keybinds();
+                self.reload_highlights();
+                self.reload_hotbars();
+                self.reload_colors();
+                match crate::config::MacrosConfig::load(self.config.character.as_deref()) {
+                    Ok(macros) => {
+                        self.config.macros = macros;
+                        self.config.macros_local = crate::config::MacrosConfig::load_local(
+                            self.config.character.as_deref(),
+                        )
+                        .unwrap_or_default();
+                        if let Some(remote) = self.message_processor.remote.as_mut() {
+                            remote.set_macros(&self.config.macros);
+                        }
+                    }
+                    Err(e) => {
+                        self.add_system_message(&format!("Macros did not reload: {e:#}"))
+                    }
+                }
+                if let Some(skin) = &outcome.skin {
+                    self.config.active_skin = Some(skin.clone());
+                    let _ = self.save_config();
+                    self.add_system_message(&format!(
+                        "Active skin set to '{skin}' (the GUI applies it on next load or via Settings > Appearance)"
+                    ));
+                }
+                if let Some(layout) = &outcome.layout_name {
+                    self.add_system_message(&format!(
+                        "TUI layout installed — load it with .loadlayout {layout}"
+                    ));
+                }
+                let pack_name = path
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "imported".to_string());
+                outcome.gui_layout.map(|bytes| (pack_name, bytes))
+            }
+            Err(e) => {
+                self.add_system_message(&format!("Import failed: {e:#}"));
+                None
+            }
+        }
+    }
+
+    /// `.tts` — text-to-speech control from any frontend. Subcommands:
+    /// `status` (default), `on`, `off`, `mute`, `rate <0.5-3.0>`,
+    /// `volume <0.0-1.0>`, `voice <name|default>`, `voices`, `test`, `clear`.
+    fn handle_tts_command(&mut self, args: &[String]) {
+        match args.first().map(String::as_str).unwrap_or("status") {
+            "on" => {
+                self.config.tts.enabled = true;
+                // Full apply: the manager AND the message processor's config
+                // snapshot (the enqueue gate) both need to hear about it.
+                self.apply_tts_settings();
+                let _ = self.save_config();
+                self.add_system_message("TTS enabled.");
+            }
+            "off" => {
+                self.config.tts.enabled = false;
+                self.apply_tts_settings();
+                let _ = self.save_config();
+                self.add_system_message("TTS disabled.");
+            }
+            "mute" => {
+                self.tts_manager.toggle_mute();
+                let status = if self.tts_manager.is_muted() {
+                    "muted"
+                } else {
+                    "unmuted"
+                };
+                self.add_system_message(&format!("TTS {}.", status));
+            }
+            "rate" => match args.get(1).and_then(|v| v.parse::<f32>().ok()) {
+                Some(rate) => {
+                    let _ = self.tts_manager.set_rate(rate);
+                    self.config.tts.rate = self.tts_manager.rate();
+                    let _ = self.save_config();
+                    self.add_system_message(&format!("TTS rate: {:.1}", self.tts_manager.rate()));
+                }
+                None => self.add_system_message("Usage: .tts rate <0.5-3.0>"),
+            },
+            "volume" => match args.get(1).and_then(|v| v.parse::<f32>().ok()) {
+                Some(volume) => {
+                    let _ = self.tts_manager.set_volume(volume);
+                    self.config.tts.volume = self.tts_manager.volume();
+                    let _ = self.save_config();
+                    self.add_system_message(&format!(
+                        "TTS volume: {:.1}",
+                        self.tts_manager.volume()
+                    ));
+                }
+                None => self.add_system_message("Usage: .tts volume <0.0-1.0>"),
+            },
+            "voice" => {
+                let wanted = args[1..].join(" ");
+                if wanted.is_empty() {
+                    self.add_system_message("Usage: .tts voice <name|default>");
+                } else if wanted.eq_ignore_ascii_case("default") {
+                    self.config.tts.voice = None;
+                    self.tts_manager.set_voice_by_name(None);
+                    let _ = self.save_config();
+                    self.add_system_message("TTS voice: engine default.");
+                } else {
+                    self.config.tts.voice = Some(wanted.clone());
+                    self.tts_manager.set_voice_by_name(Some(wanted.clone()));
+                    let _ = self.save_config();
+                    self.add_system_message(&format!("TTS voice: {}", wanted));
+                }
+            }
+            "voices" => {
+                let voices = self.tts_manager.available_voices();
+                if voices.is_empty() {
+                    self.add_system_message(
+                        "No voices listed (TTS off, or this platform doesn't enumerate).",
+                    );
+                } else {
+                    self.add_system_message(&format!("TTS voices: {}", voices.join(", ")));
+                }
+            }
+            "test" => {
+                if let Err(err) = self
+                    .tts_manager
+                    .speak_text_now("A giant rat scampers out of the shadows. Roundtime, 5 seconds.")
+                {
+                    self.add_system_message(&format!("TTS test failed: {}", err));
+                } else {
+                    self.add_system_message("Speaking test sample.");
+                }
+            }
+            "clear" => {
+                self.tts_manager.clear_queue();
+                self.add_system_message("TTS queue cleared.");
+            }
+            "status" => {
+                self.add_system_message(&format!(
+                    "TTS: {} | {} | rate {:.1} | volume {:.1} | voice {} | {} queued | {}",
+                    if self.tts_manager.is_enabled() {
+                        "on"
+                    } else {
+                        "off"
+                    },
+                    if self.tts_manager.is_muted() {
+                        "muted"
+                    } else {
+                        "unmuted"
+                    },
+                    self.tts_manager.rate(),
+                    self.tts_manager.volume(),
+                    self.tts_manager.voice_name().unwrap_or("default"),
+                    self.tts_manager.queue_size(),
+                    if self.tts_manager.is_speaking() {
+                        "speaking"
+                    } else {
+                        "idle"
+                    },
+                ));
+            }
+            other => {
+                self.add_system_message(&format!(
+                    "Unknown .tts subcommand '{}'. Try: on, off, mute, rate, volume, voice, voices, test, clear, status.",
+                    other
+                ));
+            }
+        }
+    }
+
     /// `.mapdb` — map data management from any frontend. Subcommands:
     /// `status` (default), `download`, `remove`, `repo <owner/repo>`.
     fn handle_mapdb(&mut self, args: &[String]) {
@@ -566,6 +1037,38 @@ impl AppCore {
                 self.show_webinfo();
             }
 
+            // Shareable UI packs: export the files that make this UI /
+            // preview + apply a shared one. The GUI intercepts both to
+            // add / install its live layout alongside.
+            "uiexport" => {
+                let args: Vec<String> = parts[1..].iter().map(|s| s.to_string()).collect();
+                self.uiexport_with(&args, Vec::new());
+            }
+            "uiimport" => {
+                let args: Vec<String> = parts[1..].iter().map(|s| s.to_string()).collect();
+                if self.uiimport(&args).is_some() {
+                    self.add_system_message(
+                        "This pack also carries a GUI layout — run the import in the GUI to install it.",
+                    );
+                }
+            }
+
+            // Text-to-speech control from any frontend (the GUI also has
+            // Settings > Speech; on the TUI and phones this is THE way).
+            "tts" => {
+                let args: Vec<String> = parts[1..].iter().map(|s| s.to_string()).collect();
+                self.handle_tts_command(&args);
+            }
+
+            // Walk the room's non-compass exit (go door / climb stair / ...);
+            // built for controller d-pad left, works typed from anywhere.
+            "portal" => {
+                let args: Vec<String> = parts[1..].iter().map(|s| s.to_string()).collect();
+                if let Some(command) = self.handle_portal_command(&args) {
+                    return Ok(command);
+                }
+            }
+
             // Layout commands. The TUI intercepts both in
             // handle_command_submission with the real terminal size, so these
             // fallbacks only run in frontends without a cell grid (GUI,
@@ -723,9 +1226,17 @@ impl AppCore {
             "keybinds" | "kb" => {
                 return Ok("action:keybinds".to_string());
             }
+            // Controller bindings editor (GUI)
+            "controller" => {
+                return Ok("action:controller".to_string());
+            }
             // Hotbars (hotkey bar definitions)
             "hotbars" | "hotbar" => {
                 return Ok("action:hotbars".to_string());
+            }
+            // Streams (per-stream routing: every known stream and where it goes)
+            "streams" => {
+                return Ok("action:streams".to_string());
             }
             "addkeybind" | "addkey" => {
                 return Ok("action:addkeybind".to_string());
@@ -984,7 +1495,209 @@ impl AppCore {
 }
 
 #[cfg(test)]
+mod portal_tests {
+    use super::*;
+    use crate::core::state::RoomObject;
+
+    #[test]
+    fn candidates_skip_compass_and_procs_and_dupes() {
+        let wayto: Vec<String> = [
+            "north",
+            "sw",
+            "go door",
+            "go door", // second edge through the same door
+            "climb stair",
+            ";e StringProc stuff",
+            "Out",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert_eq!(
+            portal_candidates(wayto.iter()),
+            vec!["go door".to_string(), "climb stair".to_string()]
+        );
+    }
+
+    #[test]
+    fn fallback_uses_portal_nouns_from_room_objects() {
+        let mut core = AppCore::new_for_test();
+        core.game_state.room_objects = vec![
+            RoomObject {
+                name: "a wooden door".into(),
+                noun: Some("door".into()),
+                id: "1".into(),
+            },
+            RoomObject {
+                name: "a silver ring".into(),
+                noun: Some("ring".into()),
+                id: "2".into(),
+            },
+        ];
+        assert_eq!(core.handle_portal_command(&[]), Some("go door".into()));
+    }
+
+    #[test]
+    fn no_candidates_reports_and_returns_none() {
+        let mut core = AppCore::new_for_test();
+        assert_eq!(core.handle_portal_command(&[]), None);
+    }
+
+    #[test]
+    fn portals_wheel_builds_from_the_room_and_shadows_config() {
+        let mut core = AppCore::new_for_test();
+        // Empty room: no wheel, same as an empty static one.
+        assert_eq!(core.wheel_slices("portals", &[]), None);
+        assert_eq!(core.wheel_pick_command("portals", &[0]), None);
+
+        core.game_state.room_objects = vec![
+            RoomObject {
+                name: "a wooden door".into(),
+                noun: Some("door".into()),
+                id: "1".into(),
+            },
+            RoomObject {
+                name: "a stone arch".into(),
+                noun: Some("arch".into()),
+                id: "2".into(),
+            },
+        ];
+        // A static wheel named "portals" is shadowed by the dynamic one.
+        core.config.controller_wheels.insert(
+            "portals".into(),
+            vec![crate::config::WheelSlice {
+                label: "static".into(),
+                command: "static".into(),
+                ..Default::default()
+            }],
+        );
+
+        let slices = core.wheel_slices("portals", &[]).unwrap();
+        assert_eq!(slices.len(), 2);
+        assert_eq!(slices[0].label, "door"); // "go door" minus the verb
+        assert_eq!(slices[0].command, "go door");
+        assert!(!slices[0].is_folder());
+
+        assert_eq!(core.wheel_pick_command("portals", &[1]), Some("go arch".into()));
+        // Flat wheel: folder paths and out-of-range indexes resolve to
+        // nothing.
+        assert_eq!(core.wheel_slices("portals", &[0]), None);
+        assert_eq!(core.wheel_pick_command("portals", &[0, 1]), None);
+        assert_eq!(core.wheel_pick_command("portals", &[7]), None);
+
+        // Other keys still hit static config.
+        core.config.controller_wheels.insert(
+            "spells".into(),
+            vec![crate::config::WheelSlice {
+                label: "prep".into(),
+                command: "prep 101".into(),
+                ..Default::default()
+            }],
+        );
+        assert_eq!(core.wheel_pick_command("spells", &[0]), Some("prep 101".into()));
+    }
+
+    #[test]
+    fn multiple_candidates_need_a_pick() {
+        let mut core = AppCore::new_for_test();
+        core.game_state.room_objects = vec![
+            RoomObject {
+                name: "a wooden door".into(),
+                noun: Some("door".into()),
+                id: "1".into(),
+            },
+            RoomObject {
+                name: "a stone arch".into(),
+                noun: Some("arch".into()),
+                id: "2".into(),
+            },
+        ];
+        // Ambiguous with no pick: opens the local picker menu, sends nothing.
+        assert_eq!(core.handle_portal_command(&[]), None);
+        let menu = core.ui_state.popup_menu.as_ref().expect("portal picker menu");
+        assert_eq!(menu.get_items().len(), 2);
+        assert_eq!(menu.get_items()[0].command, "go door");
+        assert_eq!(
+            core.ui_state.input_mode,
+            crate::data::ui_state::InputMode::Menu
+        );
+        core.ui_state.popup_menu = None;
+        core.ui_state.input_mode = crate::data::ui_state::InputMode::Normal;
+        // Pick by number and by word.
+        assert_eq!(
+            core.handle_portal_command(&["2".into()]),
+            Some("go arch".into())
+        );
+        assert_eq!(
+            core.handle_portal_command(&["door".into()]),
+            Some("go door".into())
+        );
+        // Bad picks send nothing.
+        assert_eq!(core.handle_portal_command(&["9".into()]), None);
+        assert_eq!(core.handle_portal_command(&["window".into()]), None);
+    }
+}
+
+#[cfg(test)]
 mod tests {
+    use super::{sleep_segment_seconds, split_sleep_macro};
+    use std::time::Duration;
+
+    #[test]
+    fn sleep_segments_parse_seconds() {
+        assert_eq!(sleep_segment_seconds("s2"), Some(2.0));
+        assert_eq!(sleep_segment_seconds("s0.1"), Some(0.1));
+        assert_eq!(sleep_segment_seconds(" s3.2 "), Some(3.2)); // spaces ok
+        assert_eq!(sleep_segment_seconds("s90"), Some(90.0)); // no max
+        // Game commands stay game commands.
+        assert_eq!(sleep_segment_seconds("s"), None); // south
+        assert_eq!(sleep_segment_seconds("sw"), None);
+        assert_eq!(sleep_segment_seconds("stance defensive"), None);
+        assert_eq!(sleep_segment_seconds("s1.2.3"), None);
+        assert_eq!(sleep_segment_seconds("s."), None);
+        assert_eq!(sleep_segment_seconds("s1e3"), None);
+        assert_eq!(sleep_segment_seconds("look"), None);
+    }
+
+    #[test]
+    fn sleep_macros_split_into_immediate_and_delayed() {
+        // No sleep segments: the normal path handles it untouched.
+        assert_eq!(split_sleep_macro("look"), None);
+        assert_eq!(split_sleep_macro("hide\rlook"), None);
+
+        // command\rs3.2\rcommand — and the spaced variant.
+        for text in ["hide\rs3.2\rlook", "hide\r s3.2 \r look"] {
+            let (immediate, delayed) = split_sleep_macro(text).unwrap();
+            assert_eq!(immediate.as_deref(), Some("hide"));
+            assert_eq!(
+                delayed,
+                vec![(Duration::from_secs_f64(3.2), "look".to_string())]
+            );
+        }
+
+        // Leading sleep: nothing immediate. Consecutive sleeps accumulate.
+        let (immediate, delayed) = split_sleep_macro("s1\rlook\rs2\rs0.5\rhide").unwrap();
+        assert_eq!(immediate, None);
+        assert_eq!(
+            delayed,
+            vec![
+                (Duration::from_secs(1), "look".to_string()),
+                (Duration::from_secs_f64(3.5), "hide".to_string()),
+            ]
+        );
+
+        // Segments before the first sleep ride together, as today.
+        let (immediate, delayed) = split_sleep_macro("n\rn\rs2\rlook").unwrap();
+        assert_eq!(immediate.as_deref(), Some("n\rn"));
+        assert_eq!(delayed.len(), 1);
+
+        // Trailing \r (wrayth-style macros) doesn't produce a phantom
+        // command.
+        let (immediate, delayed) = split_sleep_macro("hide\rs1\rlook\r").unwrap();
+        assert_eq!(immediate.as_deref(), Some("hide"));
+        assert_eq!(delayed, vec![(Duration::from_secs(1), "look".to_string())]);
+    }
+
     // ========== Dot Command Parsing Tests ==========
     //
     // These tests verify the dot command parsing logic by testing:
@@ -1263,6 +1976,7 @@ mod tests {
             }
             "keybinds" | "kb" => Some("action:keybinds".to_string()),
             "hotbars" | "hotbar" => Some("action:hotbars".to_string()),
+            "streams" => Some("action:streams".to_string()),
             "addkeybind" | "addkey" => Some("action:addkeybind".to_string()),
             "colors" | "colorpalette" => Some("action:colors".to_string()),
             "addcolor" | "createcolor" => Some("action:addcolor".to_string()),
@@ -1337,6 +2051,15 @@ mod tests {
         assert_eq!(
             get_expected_action(&cmd, &args),
             Some("action:keybinds".to_string())
+        );
+    }
+
+    #[test]
+    fn test_action_streams() {
+        let (cmd, args) = parse_dot_command(".streams");
+        assert_eq!(
+            get_expected_action(&cmd, &args),
+            Some("action:streams".to_string())
         );
     }
 

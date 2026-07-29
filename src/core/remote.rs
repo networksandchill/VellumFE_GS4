@@ -20,7 +20,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::Serialize;
 use tokio::sync::{broadcast, mpsc, watch};
 
-use crate::config::MacrosConfig;
+use crate::config::{Config, MacrosConfig};
 use crate::data::remote_buffer::{RemoteBuffer, RemoteLine};
 use crate::data::widget::StyledLine;
 
@@ -104,6 +104,146 @@ pub struct RemoteMacroOption {
     /// Echoed so the editor can prefill and insert taps stay client-side.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
+}
+
+/// Radial-wheel definitions serialized for remote clients: labels, wedge
+/// tints and folder structure only — commands stay server-side and are
+/// resolved by index path on activation (`Config::wheel_pick_command`),
+/// so a stale client can never fire outdated command text. Colors are
+/// palette-resolved to CSS hex before shipping.
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub struct RemoteWheels {
+    /// The effective default wheel (`[[controller_wheel]]`, falling back
+    /// to `[controller_wheels.default]`), shown for a plain "wheel" bind.
+    pub default: Vec<RemoteWheelSlice>,
+    /// Named wheels, shown for "wheel:<name>" binds.
+    pub named: std::collections::HashMap<String, Vec<RemoteWheelSlice>>,
+    /// Input-feel tuning from `[controller_tuning]`, so the phone's dwell
+    /// wheel matches the desktop feel (one source of truth, keybinds.toml).
+    pub tuning: RemoteWheelTuning,
+    /// Per-wheel aim-stick overrides by wheel name ("default" for the
+    /// default wheel). Only the stick matters remotely — the button that
+    /// opens a wheel is the client's own bind. None/absent = the phone's
+    /// default (non-movement) stick.
+    #[serde(skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub wheel_stick: std::collections::HashMap<String, String>,
+    /// Per-wheel ring rotation in degrees (0 = up, clockwise), from
+    /// `[controller_wheels_meta.<name>].start`. Per-wheel like
+    /// `wheel_stick` — NOT part of the global tuning. Absent = slice 0 at
+    /// the top, today's layout.
+    #[serde(skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub wheel_start: std::collections::HashMap<String, f32>,
+}
+
+/// Wheel input-feel values mirrored to remote clients (see TuningConfig).
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct RemoteWheelTuning {
+    pub movement_stick: String,
+    pub back_slice: String,
+    pub deadzone: u8,
+    pub aim_dwell_ms: u32,
+    pub nav_dwell_ms: u32,
+    pub fire_debounce_ms: u32,
+    pub release_grace_ms: u32,
+    pub fire_mode: String,
+    pub edge_threshold: u8,
+    pub retract_delta: u8,
+}
+
+impl Default for RemoteWheelTuning {
+    fn default() -> Self {
+        let t = crate::config::TuningConfig::default();
+        Self {
+            movement_stick: t.movement_stick,
+            back_slice: t.back_slice,
+            deadzone: t.deadzone,
+            aim_dwell_ms: t.aim_dwell_ms,
+            nav_dwell_ms: t.nav_dwell_ms,
+            fire_debounce_ms: t.fire_debounce_ms,
+            release_grace_ms: t.release_grace_ms,
+            fire_mode: t.fire_mode,
+            edge_threshold: t.edge_threshold,
+            retract_delta: t.retract_delta,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct RemoteWheelSlice {
+    pub label: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
+    /// Explicit wedge width in degrees; absent = an even share of the
+    /// remainder. The phone lays out and aims its own ring, so spans ship.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub span: Option<f32>,
+    /// Per-slice aim floor (percent of full deflection); absent = the
+    /// global deadzone from tuning.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inner: Option<u8>,
+    /// An explicit "go up one level" seat (see WheelSlice::back); the
+    /// phone's view builder skips its synthesized Back when one ships.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub back: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub slices: Vec<RemoteWheelSlice>,
+}
+
+impl RemoteWheels {
+    pub fn from_config(config: &Config) -> Self {
+        fn wire_slices(config: &Config, slices: &[crate::config::WheelSlice]) -> Vec<RemoteWheelSlice> {
+            slices
+                .iter()
+                .map(|slice| RemoteWheelSlice {
+                    label: slice.label.clone(),
+                    color: slice
+                        .color
+                        .as_deref()
+                        .map(|c| config.resolve_palette_color(c)),
+                    span: slice.span,
+                    inner: slice.inner,
+                    back: slice.back,
+                    slices: wire_slices(config, &slice.slices),
+                })
+                .collect()
+        }
+        let t = &config.controller_tuning;
+        Self {
+            default: config
+                .wheel_level_slices("", &[])
+                .map(|slices| wire_slices(config, slices))
+                .unwrap_or_default(),
+            named: config
+                .controller_wheels
+                .iter()
+                .map(|(name, slices)| (name.clone(), wire_slices(config, slices)))
+                .collect(),
+            tuning: RemoteWheelTuning {
+                movement_stick: t.movement_stick.clone(),
+                back_slice: t.back_slice.clone(),
+                deadzone: t.deadzone,
+                aim_dwell_ms: t.aim_dwell_ms,
+                nav_dwell_ms: t.nav_dwell_ms,
+                fire_debounce_ms: t.fire_debounce_ms,
+                release_grace_ms: t.release_grace_ms,
+                fire_mode: t.fire_mode.clone(),
+                edge_threshold: t.edge_threshold,
+                retract_delta: t.retract_delta,
+            },
+            wheel_stick: config
+                .controller_wheels_meta
+                .iter()
+                .filter_map(|(name, meta)| {
+                    meta.stick.clone().map(|s| (name.clone(), s))
+                })
+                .collect(),
+            wheel_start: config
+                .controller_wheels_meta
+                .iter()
+                .filter_map(|(name, meta)| meta.start.map(|s| (name.clone(), s)))
+                .collect(),
+        }
+    }
 }
 
 impl RemoteMacros {
@@ -228,6 +368,9 @@ pub enum RemoteDelta {
     },
     /// Macro definitions changed (`.reloadmacros`); sent to every client.
     Macros(Arc<RemoteMacros>),
+    /// Radial-wheel definitions changed (keybinds reload or the desktop
+    /// wheel editor saved); sent to every client.
+    Wheels(Arc<RemoteWheels>),
     /// Active effects changed (spells/buffs/debuffs/cooldowns), in fixed
     /// category order.
     Effects(Vec<crate::data::ActiveEffectsContent>),
@@ -236,6 +379,10 @@ pub enum RemoteDelta {
     Injuries(std::collections::HashMap<String, u8>),
     /// The targetable-creature list changed.
     Targets(Vec<RemoteTarget>),
+    /// The room entity lists (interact mode) changed.
+    Entities(RemoteRoomEntities),
+    /// The room's portal list (dynamic portals wheel) changed.
+    Portals(Vec<String>),
     /// Character-sheet lines changed (experience/encumbrance/bounty/society).
     CharInfo(RemoteCharInfo),
     /// Game-session status changed (headless runtime only).
@@ -295,6 +442,29 @@ pub enum RemoteDelta {
         sounds: Vec<String>,
         error: Option<String>,
     },
+    /// Reply to one client's registry settings get/put (addressed).
+    /// `catalog` is the full setting list for gets (Null on put replies);
+    /// `key` echoes the setting a put touched; `saved` marks a successful
+    /// put.
+    Settings {
+        client_id: u64,
+        request_id: u64,
+        catalog: serde_json::Value,
+        key: Option<String>,
+        error: Option<String>,
+        saved: bool,
+    },
+    /// Reply to one client's streams get/put (addressed). `data` is the
+    /// catalog object (`{streams, windows, fallback}`) for gets, Null on
+    /// put replies; `stream` echoes the stream a put touched.
+    Streams {
+        client_id: u64,
+        request_id: u64,
+        data: serde_json::Value,
+        stream: Option<String>,
+        error: Option<String>,
+        saved: bool,
+    },
 }
 
 /// Input from a remote client, drained by the active frontend's main loop
@@ -329,6 +499,12 @@ pub enum RemoteEvent {
     /// resolves the id against config (MacrosConfig::resolve) and runs
     /// the command through the same dispatch as typed input.
     Macro { id: String },
+    /// A radial-wheel slice picked on a remote client. `key` is "" for
+    /// the default wheel or a named wheel; `path` indexes down to the
+    /// leaf. The main loop resolves it against config
+    /// (Config::wheel_pick_command) and runs the command through the
+    /// same dispatch as typed input.
+    WheelPick { key: String, path: Vec<usize> },
     /// Create or edit a phone-authored macro button (lands in the
     /// macros-local.toml overlay; AppCore::apply_macro_save).
     MacroSave {
@@ -410,6 +586,35 @@ pub enum RemoteEvent {
         scope: String,
         name: String,
     },
+    /// The full settings catalog (registry dump + live values) for the
+    /// phone settings sheet. Reply: `RemoteDelta::Settings` with `catalog`.
+    SettingsGet { client_id: u64, request_id: u64 },
+    /// Set one registered setting by dotted key. `value` is JSON typed by
+    /// the setting's kind; `scope` is "character" or "global". Applied to
+    /// the live config, persisted sparsely, then hot-refreshed where the
+    /// server can. `clear` (sensitive optional-text keys only) resets the
+    /// value to None — the only way a phone can unset a redacted secret,
+    /// since redacted values never round-trip.
+    SettingsPut {
+        client_id: u64,
+        request_id: u64,
+        key: String,
+        value: serde_json::Value,
+        scope: String,
+        clear: bool,
+    },
+    /// The streams catalog (every known stream + where it goes) for the
+    /// phone Streams panel. Reply: `RemoteDelta::Streams` with `data`.
+    StreamsGet { client_id: u64, request_id: u64 },
+    /// Set one stream's orphan route. `target` is "discard", "main",
+    /// "window:<name>", or "clear" (drop the route; fallback applies).
+    /// Route editing only — window subscriptions stay desktop-edited.
+    StreamsPut {
+        client_id: u64,
+        request_id: u64,
+        stream: String,
+        target: String,
+    },
     /// Structured color config for the phone editor ("profile"/"global").
     ColorsGet {
         client_id: u64,
@@ -450,6 +655,12 @@ pub struct RemoteStateSnapshot {
     pub injuries: std::collections::HashMap<String, u8>,
     /// Targetable creatures in the room (tap-to-target list).
     pub targets: Vec<RemoteTarget>,
+    /// Room entity lists for interact mode (creatures/objects/players).
+    pub entities: RemoteRoomEntities,
+    /// The room's portal commands ("go arch"), for the dynamic portals
+    /// wheel. Overlaid by AppCore::flush_remote_state (resolution needs
+    /// the map service, which lives on AppCore).
+    pub portals: Vec<String>,
     /// Character sheet: experience/encumbrance/bounty/society lines.
     pub char_info: RemoteCharInfo,
     /// Session status + session-control capability. Overlaid by the sink in
@@ -460,6 +671,33 @@ pub struct RemoteStateSnapshot {
     pub map_scene: RemoteMapSceneRef,
     /// Per-step map position/ghost state, paired with `map_scene`.
     pub map_state: RemoteMapState,
+}
+
+/// Room entity lists for the phone's interact mode — the same three
+/// categories the desktop focus cycle reads from GameState (exits ride
+/// the room payload). Labels are pre-built (creature statuses baked in)
+/// and nouns pre-resolved with the last-word fallback, so activation is
+/// a plain link-tap round-trip client-side.
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub struct RemoteRoomEntities {
+    pub creatures: Vec<RemoteRoomEntity>,
+    pub objects: Vec<RemoteRoomEntity>,
+    pub players: Vec<RemoteRoomEntity>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct RemoteRoomEntity {
+    /// Exist id without the leading '#' (the link-tap exist_id).
+    pub id: String,
+    pub label: String,
+    pub noun: String,
+}
+
+/// Menus want "hog", not "a muddy hog": last word of the display name
+/// when the feed omitted a noun (mirror of interact.rs fallback_noun).
+fn entity_noun(noun: Option<&str>, name: &str) -> String {
+    noun.map(str::to_string)
+        .unwrap_or_else(|| name.rsplit(' ').next().unwrap_or(name).to_string())
 }
 
 /// A targetable creature in the room, for the status drawer's tap-to-
@@ -668,6 +906,42 @@ impl RemoteStateSnapshot {
                     })
                     .collect()
             },
+            entities: RemoteRoomEntities {
+                creatures: game_state
+                    .room_creatures
+                    .iter()
+                    .map(|c| {
+                        let statuses = c.display_statuses();
+                        RemoteRoomEntity {
+                            id: c.id.trim_start_matches('#').to_string(),
+                            label: if statuses.is_empty() {
+                                c.name.clone()
+                            } else {
+                                format!("{} ({})", c.name, statuses.join(", "))
+                            },
+                            noun: entity_noun(c.noun.as_deref(), &c.name),
+                        }
+                    })
+                    .collect(),
+                objects: game_state
+                    .room_objects
+                    .iter()
+                    .map(|o| RemoteRoomEntity {
+                        id: o.id.trim_start_matches('#').to_string(),
+                        label: o.name.clone(),
+                        noun: entity_noun(o.noun.as_deref(), &o.name),
+                    })
+                    .collect(),
+                players: game_state
+                    .room_players
+                    .iter()
+                    .map(|p| RemoteRoomEntity {
+                        id: p.id.trim_start_matches('#').to_string(),
+                        label: p.name.clone(),
+                        noun: p.name.clone(),
+                    })
+                    .collect(),
+            },
             char_info: {
                 let mut info = RemoteCharInfo::default();
                 let exp = &game_state.gs4_experience;
@@ -701,7 +975,9 @@ impl RemoteStateSnapshot {
                 info
             },
             session: RemoteSessionInfo::default(),
-            // Overlaid by AppCore::flush_remote_state (the map lives there).
+            // Overlaid by AppCore::flush_remote_state (the map — and the
+            // portal resolution that needs it — live there).
+            portals: Vec::new(),
             map_scene: RemoteMapSceneRef::default(),
             map_state: RemoteMapState::default(),
         }
@@ -718,6 +994,8 @@ pub struct RemoteServerHandles {
     pub event_tx: mpsc::UnboundedSender<RemoteEvent>,
     /// Latest macro definitions, for connect-time delivery.
     pub macros_rx: watch::Receiver<Arc<RemoteMacros>>,
+    /// Latest radial-wheel definitions, for connect-time delivery.
+    pub wheels_rx: watch::Receiver<Arc<RemoteWheels>>,
     /// Identifies this process instance. Sent in `hello`; clients discard
     /// their resume cursor when it changes (seqs restart with the process).
     pub session: String,
@@ -732,6 +1010,7 @@ pub struct RemoteSink {
     delta_tx: broadcast::Sender<RemoteDelta>,
     state_tx: watch::Sender<RemoteStateSnapshot>,
     macros_tx: watch::Sender<Arc<RemoteMacros>>,
+    wheels_tx: watch::Sender<Arc<RemoteWheels>>,
     bound_port: Arc<std::sync::OnceLock<u16>>,
     /// State as of the previous flush, for change detection.
     last: RemoteStateSnapshot,
@@ -752,6 +1031,7 @@ impl RemoteSink {
         let (delta_tx, _) = broadcast::channel(DELTA_CHANNEL_CAPACITY);
         let (state_tx, state_rx) = watch::channel(RemoteStateSnapshot::default());
         let (macros_tx, macros_rx) = watch::channel(Arc::new(RemoteMacros::default()));
+        let (wheels_tx, wheels_rx) = watch::channel(Arc::new(RemoteWheels::default()));
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let session = format!(
             "{}-{}",
@@ -768,6 +1048,7 @@ impl RemoteSink {
             state_rx,
             event_tx,
             macros_rx,
+            wheels_rx,
             session,
             bound_port: bound_port.clone(),
         };
@@ -777,6 +1058,7 @@ impl RemoteSink {
                 delta_tx,
                 state_tx,
                 macros_tx,
+                wheels_tx,
                 bound_port,
                 last: RemoteStateSnapshot::default(),
                 session: RemoteSessionInfo::default(),
@@ -832,6 +1114,15 @@ impl RemoteSink {
         let macros = Arc::new(RemoteMacros::from_config(config));
         self.macros_tx.send_replace(macros.clone());
         let _ = self.delta_tx.send(RemoteDelta::Macros(macros));
+    }
+
+    /// Publish radial-wheel definitions: stored for connect-time delivery
+    /// and broadcast to already-connected clients. Called on enable, on
+    /// keybinds reload, and by the desktop wheel editor.
+    pub fn set_wheels(&mut self, config: &Config) {
+        let wheels = Arc::new(RemoteWheels::from_config(config));
+        self.wheels_tx.send_replace(wheels.clone());
+        let _ = self.delta_tx.send(RemoteDelta::Wheels(wheels));
     }
 
     /// Reply to one client's map-locations request.
@@ -949,6 +1240,48 @@ impl RemoteSink {
         });
     }
 
+    /// Route a settings catalog / put reply to the requesting client.
+    #[allow(clippy::too_many_arguments)]
+    pub fn push_settings(
+        &mut self,
+        client_id: u64,
+        request_id: u64,
+        catalog: serde_json::Value,
+        key: Option<String>,
+        error: Option<String>,
+        saved: bool,
+    ) {
+        let _ = self.delta_tx.send(RemoteDelta::Settings {
+            client_id,
+            request_id,
+            catalog,
+            key,
+            error,
+            saved,
+        });
+    }
+
+    /// Route a streams catalog / put reply to the requesting client.
+    #[allow(clippy::too_many_arguments)]
+    pub fn push_streams(
+        &mut self,
+        client_id: u64,
+        request_id: u64,
+        data: serde_json::Value,
+        stream: Option<String>,
+        error: Option<String>,
+        saved: bool,
+    ) {
+        let _ = self.delta_tx.send(RemoteDelta::Streams {
+            client_id,
+            request_id,
+            data,
+            stream,
+            error,
+            saved,
+        });
+    }
+
     /// Route a game menu response to the remote client that requested it.
     pub fn push_menu(
         &mut self,
@@ -1015,6 +1348,16 @@ impl RemoteSink {
             let _ = self
                 .delta_tx
                 .send(RemoteDelta::Targets(snap.targets.clone()));
+        }
+        if snap.entities != self.last.entities {
+            let _ = self
+                .delta_tx
+                .send(RemoteDelta::Entities(snap.entities.clone()));
+        }
+        if snap.portals != self.last.portals {
+            let _ = self
+                .delta_tx
+                .send(RemoteDelta::Portals(snap.portals.clone()));
         }
         if snap.char_info != self.last.char_info {
             let _ = self

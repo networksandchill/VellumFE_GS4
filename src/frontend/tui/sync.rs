@@ -62,7 +62,7 @@ impl TuiFrontend {
                         text_window::TextWindow::new(&text_content.title, text_content.max_lines);
 
                     if let Some(def) = window_def {
-                        let colors = resolve_window_colors(def.base(), theme);
+                        let colors = resolve_window_colors(def.base(), &app_core.config.colors.ui, theme);
                         tw.set_border_config(
                             def.base().show_border,
                             Some(def.base().border_style.clone()),
@@ -104,7 +104,7 @@ impl TuiFrontend {
                 // only when the config snapshot changed (themes, layout edits).
                 if self.config_sync_needed {
                     if let Some(def) = window_def {
-                        let colors = resolve_window_colors(def.base(), theme);
+                        let colors = resolve_window_colors(def.base(), &app_core.config.colors.ui, theme);
                         text_window.set_border_config(
                             def.base().show_border,
                             Some(def.base().border_style.clone()),
@@ -142,7 +142,7 @@ impl TuiFrontend {
                 }
 
                 // Update width for proper wrapping
-                text_window.set_width(window.position.width);
+                text_window.set_width(window.position.width.get());
 
                 // Get last synced generation
                 let last_synced_gen = self.widget_manager.last_synced_generation.get(name).copied().unwrap_or(0);
@@ -202,7 +202,7 @@ impl TuiFrontend {
                             text_window.add_text(styled_text);
                         }
                         // Finish the line with actual window width
-                        text_window.finish_line(window.position.width);
+                        text_window.finish_line(window.position.width.get());
                     }
 
                     // Update last synced generation
@@ -412,7 +412,7 @@ impl TuiFrontend {
                 if let Some(inv_window) = self.widget_manager.inventory_windows.get_mut(name) {
                     inv_window.set_title(text_content.title.clone());
                     if let Some(def) = window_def {
-                        let colors = resolve_window_colors(def.base(), theme);
+                        let colors = resolve_window_colors(def.base(), &app_core.config.colors.ui, theme);
                         inv_window.set_border_config(def.base().show_border, colors.border.clone());
                         inv_window.set_transparent_background(def.base().transparent_background);
                         inv_window.set_background_color(colors.background.clone());
@@ -492,7 +492,7 @@ impl TuiFrontend {
                 // Update configuration and content from WindowDef if present
                 if let Some(spells_window) = self.widget_manager.spells_windows.get_mut(name) {
                     if let Some(def) = window_def {
-                        let colors = resolve_window_colors(def.base(), theme);
+                        let colors = resolve_window_colors(def.base(), &app_core.config.colors.ui, theme);
                         spells_window.set_border_config(
                             def.base().show_border,
                             Some(def.base().border_style.clone()),
@@ -604,7 +604,7 @@ impl TuiFrontend {
 
                     // Apply window config from WindowDef
                     if let Some(def) = window_def {
-                        let colors = resolve_window_colors(def.base(), theme);
+                        let colors = resolve_window_colors(def.base(), &app_core.config.colors.ui, theme);
                         progress_bar.set_border_config(
                             def.base().show_border,
                             Some(def.base().border_style.clone()),
@@ -722,7 +722,7 @@ impl TuiFrontend {
 
                     // Apply window config from WindowDef
                     if let Some(def) = window_def {
-                        let colors = resolve_window_colors(def.base(), theme);
+                        let colors = resolve_window_colors(def.base(), &app_core.config.colors.ui, theme);
                         countdown_widget.set_border_config(
                             def.base().show_border,
                             Some(def.base().border_style.clone()),
@@ -830,7 +830,7 @@ impl TuiFrontend {
 
                     // Apply window config from WindowDef
                     if let Some(def) = window_def {
-                        let colors = resolve_window_colors(def.base(), theme);
+                        let colors = resolve_window_colors(def.base(), &app_core.config.colors.ui, theme);
                         widget.set_border_config(
                             def.base().show_border,
                             Some(def.base().border_style.clone()),
@@ -879,7 +879,7 @@ impl TuiFrontend {
                     if let Some(window_def) =
                         window_defs.get(name.as_str()).copied()
                     {
-                        let colors = resolve_window_colors(window_def.base(), theme);
+                        let colors = resolve_window_colors(window_def.base(), &app_core.config.colors.ui, theme);
                         spacer_widget.set_background_color(colors.background.clone());
                         spacer_widget
                             .set_transparent_background(window_def.base().transparent_background);
@@ -922,7 +922,7 @@ impl TuiFrontend {
                 quickbar_widget.set_entries(entries);
 
                 if let Some(def) = window_def {
-                    let colors = resolve_window_colors(def.base(), theme);
+                    let colors = resolve_window_colors(def.base(), &app_core.config.colors.ui, theme);
                     quickbar_widget.set_border_config(
                         def.base().show_border,
                         Some(def.base().border_style.clone()),
@@ -991,7 +991,7 @@ impl TuiFrontend {
                     if let crate::config::WindowDef::Hotkeybar { data, .. } = def {
                         bar_widget.set_vertical(data.orientation == "vertical");
                     }
-                    let colors = resolve_window_colors(def.base(), theme);
+                    let colors = resolve_window_colors(def.base(), &app_core.config.colors.ui, theme);
                     bar_widget.set_border_config(
                         def.base().show_border,
                         Some(def.base().border_style.clone()),
@@ -1044,7 +1044,7 @@ impl TuiFrontend {
                     if let Some(window_def) =
                         window_defs.get(name.as_str()).copied()
                     {
-                        let colors = resolve_window_colors(window_def.base(), theme);
+                        let colors = resolve_window_colors(window_def.base(), &app_core.config.colors.ui, theme);
                         indicator_widget.set_border_config(
                             window_def.base().show_border,
                             Some(window_def.base().border_style.clone()),
@@ -1125,7 +1125,7 @@ impl TuiFrontend {
 
                     // Get widget width from window definition
                     let widget_width = window_def
-                        .map(|w| w.base().cols)
+                        .map(|w| w.base().cols.get())
                         .unwrap_or(20); // Fallback width if not found
 
                     // Get per-window status_position if configured
@@ -1158,7 +1158,7 @@ impl TuiFrontend {
 
                     // Apply configuration
                     if let Some(window_def) = window_def {
-                        let colors = resolve_window_colors(window_def.base(), theme);
+                        let colors = resolve_window_colors(window_def.base(), &app_core.config.colors.ui, theme);
                         widget.set_border_config(
                             window_def.base().show_border,
                             Some(window_def.base().border_style.clone()),
@@ -1294,7 +1294,7 @@ impl TuiFrontend {
                     if let Some(window_def) =
                         window_defs.get(name.as_str()).copied()
                     {
-                        let colors = resolve_window_colors(window_def.base(), theme);
+                        let colors = resolve_window_colors(window_def.base(), &app_core.config.colors.ui, theme);
                         widget.set_border_config(
                             window_def.base().show_border,
                             colors.border.clone(),
@@ -1363,7 +1363,7 @@ impl TuiFrontend {
                     if let Some(window_def) =
                         window_defs.get(name.as_str()).copied()
                     {
-                        let colors = resolve_window_colors(window_def.base(), theme);
+                        let colors = resolve_window_colors(window_def.base(), &app_core.config.colors.ui, theme);
                         widget.set_border_config(
                             window_def.base().show_border,
                             Some(window_def.base().border_style.clone()),
@@ -1424,7 +1424,7 @@ impl TuiFrontend {
                     if let Some(window_def) =
                         window_defs.get(name.as_str()).copied()
                     {
-                        let colors = resolve_window_colors(window_def.base(), theme);
+                        let colors = resolve_window_colors(window_def.base(), &app_core.config.colors.ui, theme);
                         widget.set_border_config(
                             window_def.base().show_border,
                             Some(window_def.base().border_style.clone()),
@@ -1474,7 +1474,7 @@ impl TuiFrontend {
                     if let Some(window_def) =
                         window_defs.get(name.as_str()).copied()
                     {
-                        let colors = resolve_window_colors(window_def.base(), theme);
+                        let colors = resolve_window_colors(window_def.base(), &app_core.config.colors.ui, theme);
                         widget.set_border_config(
                             window_def.base().show_border,
                             Some(window_def.base().border_style.clone()),
@@ -1595,7 +1595,7 @@ impl TuiFrontend {
                 if let Some(widget) = self.widget_manager.tabbed_text_windows.get_mut(name) {
                     if self.config_sync_needed {
                         if let Some(def) = window_def {
-                            let colors = resolve_window_colors(def.base(), theme);
+                            let colors = resolve_window_colors(def.base(), &app_core.config.colors.ui, theme);
                             widget.set_border_config(
                                 def.base().show_border,
                                 Some(def.base().border_style.clone()),
@@ -1709,7 +1709,7 @@ impl TuiFrontend {
                                         };
                                         text_window.add_text(styled_text);
                                     }
-                                    text_window.finish_line(window.position.width);
+                                    text_window.finish_line(window.position.width.get());
                                 }
                                 // Apply ignore flag before unread handling so unread is skipped when ignored
                                 widget.set_tab_ignore_activity(i, ignore_activity);
@@ -1755,7 +1755,7 @@ impl TuiFrontend {
                     if let Some(window_def) =
                         window_defs.get(name.as_str()).copied()
                     {
-                        let colors = resolve_window_colors(window_def.base(), theme);
+                        let colors = resolve_window_colors(window_def.base(), &app_core.config.colors.ui, theme);
                         widget.set_border_config(
                             window_def.base().show_border,
                             Some(window_def.base().border_style.clone()),
@@ -1827,7 +1827,7 @@ impl TuiFrontend {
                     if let Some(window_def) =
                         window_defs.get(name.as_str()).copied()
                     {
-                        let colors = resolve_window_colors(window_def.base(), theme);
+                        let colors = resolve_window_colors(window_def.base(), &app_core.config.colors.ui, theme);
                         widget.set_border_config(
                             window_def.base().show_border,
                             Some(window_def.base().border_style.clone()),
@@ -1935,7 +1935,7 @@ impl TuiFrontend {
                 });
 
             if let Some(base) = base.as_ref() {
-                let colors = resolve_window_colors(base, theme);
+                let colors = resolve_window_colors(base, &app_core.config.colors.ui, theme);
                 let title = if base.show_title {
                     base.title.clone().unwrap_or_default()
                 } else {
@@ -1999,7 +1999,7 @@ impl TuiFrontend {
                     if let Some(window_def) =
                         window_defs.get(name.as_str()).copied()
                     {
-                        let colors = resolve_window_colors(window_def.base(), theme);
+                        let colors = resolve_window_colors(window_def.base(), &app_core.config.colors.ui, theme);
                         hand_widget.set_border_config(
                             window_def.base().show_border,
                             Some(window_def.base().border_style.clone()),
@@ -2099,7 +2099,7 @@ impl TuiFrontend {
                     room_window.set_replace_enabled(app_core.config.highlight_settings.replace_enabled);
                 }
 
-                let colors = resolve_window_colors(window_def.base(), theme);
+                let colors = resolve_window_colors(window_def.base(), &app_core.config.colors.ui, theme);
                 room_window.set_border_config(
                     window_def.base().show_border,
                     Some(window_def.base().border_style.clone()),
@@ -2307,7 +2307,7 @@ impl TuiFrontend {
                 // Update configuration and content from WindowDef if present
                 if let Some(perception_window) = self.widget_manager.perception_windows.get_mut(name) {
                     if let Some(def) = window_def {
-                        let colors = resolve_window_colors(def.base(), theme);
+                        let colors = resolve_window_colors(def.base(), &app_core.config.colors.ui, theme);
                         perception_window.set_show_border(def.base().show_border);
                         perception_window.set_border_color(colors.border.clone());
                         perception_window.set_background_color(colors.background.clone());
@@ -2424,7 +2424,7 @@ impl TuiFrontend {
 
                 // Apply theme colors
                 if let Some(def) = window_def {
-                    let colors = resolve_window_colors(def.base(), theme);
+                    let colors = resolve_window_colors(def.base(), &app_core.config.colors.ui, theme);
                     if let Some(border_color) = &colors.border {
                         if let Ok(c) = parse_hex_color(border_color) {
                             experience_widget.set_border_color(c);
@@ -2493,7 +2493,7 @@ impl TuiFrontend {
 
                 // Apply theme colors and config toggles
                 if let Some(crate::config::WindowDef::GS4Experience { data, .. }) = window_def {
-                    let colors = resolve_window_colors(window_def.unwrap().base(), theme);
+                    let colors = resolve_window_colors(window_def.unwrap().base(), &app_core.config.colors.ui, theme);
                     if let Some(border_color) = &colors.border {
                         if let Ok(c) = parse_hex_color(border_color) {
                             gs4_exp_widget.set_border_color(c);
@@ -2598,7 +2598,7 @@ impl TuiFrontend {
 
                 // Apply theme colors
                 if let Some(def) = window_def {
-                    let colors = resolve_window_colors(def.base(), theme);
+                    let colors = resolve_window_colors(def.base(), &app_core.config.colors.ui, theme);
                     if let Some(border_color) = &colors.border {
                         if let Ok(c) = parse_hex_color(border_color) {
                             enc_widget.set_border_color(c);
@@ -2700,7 +2700,7 @@ impl TuiFrontend {
 
                 // Apply theme colors
                 if let Some(def) = window_def {
-                    let colors = resolve_window_colors(def.base(), theme);
+                    let colors = resolve_window_colors(def.base(), &app_core.config.colors.ui, theme);
                     if let Some(border_color) = &colors.border {
                         if let Ok(c) = parse_hex_color(border_color) {
                             mv_widget.set_border_color(c);
@@ -2792,7 +2792,7 @@ impl TuiFrontend {
 
                 // Apply theme colors
                 if let Some(def) = window_def {
-                    let colors = resolve_window_colors(def.base(), theme);
+                    let colors = resolve_window_colors(def.base(), &app_core.config.colors.ui, theme);
                     if let Some(border_color) = &colors.border {
                         if let Ok(c) = parse_hex_color(border_color) {
                             betrayer_widget.set_border_color(c);

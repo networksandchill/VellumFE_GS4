@@ -35,6 +35,8 @@ pub struct HighlightPattern {
     pub sound: Option<String>, // Sound file to play when pattern matches
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sound_volume: Option<f32>, // Volume override for this sound (0.0 to 1.0)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rumble: Option<String>, // Controller rumble pattern name to play when pattern matches
     #[serde(skip_serializing_if = "Option::is_none")]
     pub category: Option<String>, // Category for grouping highlights (e.g., "Combat", "Healing", "Death")
     #[serde(default, skip_serializing_if = "is_false")]
@@ -167,7 +169,7 @@ impl Config {
         let highlights_path = Self::highlights_path(character)?;
         let contents =
             toml::to_string_pretty(&self.highlights).context("Failed to serialize highlights")?;
-        fs::write(&highlights_path, contents).context("Failed to write highlights.toml")?;
+        write_atomic(&highlights_path, contents).context("Failed to write highlights.toml")?;
         Ok(())
     }
 
@@ -190,7 +192,7 @@ impl Config {
         let toml =
             toml::to_string_pretty(&highlights).context("Failed to serialize common highlights")?;
 
-        fs::write(&path, toml)
+        write_atomic(&path, toml)
             .with_context(|| format!("Failed to write common highlights: {:?}", path))?;
 
         Ok(())
@@ -205,7 +207,7 @@ impl Config {
         let toml =
             toml::to_string_pretty(&highlights).context("Failed to serialize common highlights")?;
 
-        fs::write(&path, toml)
+        write_atomic(&path, toml)
             .with_context(|| format!("Failed to write common highlights: {:?}", path))?;
 
         Ok(())
@@ -270,7 +272,7 @@ impl Config {
         let toml = toml::to_string_pretty(&highlights)
             .context("Failed to serialize character highlights")?;
 
-        fs::write(&highlights_path, toml)
+        write_atomic(&highlights_path, toml)
             .with_context(|| format!("Failed to write highlights: {:?}", highlights_path))?;
 
         tracing::info!(
@@ -316,7 +318,7 @@ impl Config {
             let toml = toml::to_string_pretty(&highlights)
                 .context("Failed to serialize character highlights")?;
 
-            fs::write(&highlights_path, toml)
+            write_atomic(&highlights_path, toml)
                 .with_context(|| format!("Failed to write highlights: {:?}", highlights_path))?;
 
             tracing::info!(
@@ -361,7 +363,7 @@ impl Config {
         let highlights_path = highlights_dir.join(format!("{}.toml", name));
         let contents =
             toml::to_string_pretty(&self.highlights).context("Failed to serialize highlights")?;
-        fs::write(&highlights_path, contents).context("Failed to write highlights profile")?;
+        write_atomic(&highlights_path, contents).context("Failed to write highlights profile")?;
 
         Ok(highlights_path)
     }
@@ -427,6 +429,7 @@ mod tests {
             fast_parse: false,
             sound: None,
             sound_volume: None,
+            rumble: None,
             category: None,
             squelch: false,
             silent_prompt: false,
@@ -455,6 +458,7 @@ mod tests {
             fast_parse: false,
             sound: Some("damage.wav".to_string()),
             sound_volume: Some(0.8),
+            rumble: None,
             category: Some("Combat".to_string()),
             squelch: false,
             silent_prompt: false,
@@ -486,6 +490,7 @@ mod tests {
             fast_parse: false,
             sound: None,
             sound_volume: None,
+            rumble: None,
             category: Some("Ignore".to_string()),
             squelch: true,
             silent_prompt: false,
@@ -511,6 +516,7 @@ mod tests {
             fast_parse: true, // Uses Aho-Corasick
             sound: None,
             sound_volume: None,
+            rumble: None,
             category: None,
             squelch: false,
             silent_prompt: false,
@@ -536,6 +542,7 @@ mod tests {
             fast_parse: false,
             sound: None,
             sound_volume: None,
+            rumble: None,
             category: Some("Test".to_string()),
             squelch: false,
             silent_prompt: false,
@@ -700,6 +707,7 @@ mod tests {
             fast_parse: false,
             sound: None,
             sound_volume: None,
+            rumble: None,
             category: None,
             squelch: false,
             silent_prompt: false,
@@ -746,6 +754,7 @@ mod tests {
             fast_parse: false,
             sound: None,
             sound_volume: None,
+            rumble: None,
             category: None,
             squelch: false,
             silent_prompt: false,
@@ -799,6 +808,7 @@ mod tests {
             fast_parse: false,
             sound: None,
             sound_volume: None,
+            rumble: None,
             category: None,
             squelch: false,
             silent_prompt: false,

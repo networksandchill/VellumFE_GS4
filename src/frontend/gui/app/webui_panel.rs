@@ -92,6 +92,16 @@ fn paint_marker(painter: &egui::Painter, marker: &WebUiMapMarker, rect: egui::Re
                 egui::Stroke::new(3.0, red),
             );
         }
+        Some("wound1") | Some("wound2") | Some("wound3") => {
+            // CreatureBar silhouette wound dots: small filled circles, no
+            // border; colors match the browser bundle (app.css .c-im-marker).
+            let color = match marker.kind.as_deref() {
+                Some("wound1") => Color32::from_rgba_unmultiplied(230, 200, 30, 230),
+                Some("wound2") => Color32::from_rgba_unmultiplied(230, 130, 30, 230),
+                _ => Color32::from_rgba_unmultiplied(220, 40, 40, 242),
+            };
+            painter.circle_filled(rect.center(), rect.size().min_elem() / 2.0, color);
+        }
         Some("pin") => {
             let warn = Color32::from_rgb(240, 173, 78);
             painter.circle(
@@ -579,10 +589,65 @@ impl VellumGuiApp {
                         serde_json::Value::String(buffer.clone()),
                     );
                 }
+                // has_focus() re-enters the egui context; it must be read
+                // BEFORE data_mut takes the context write lock (non-reentrant
+                // -> permanent deadlock, the "Not Responding" setup pages).
+                let focused_now = response.has_focus();
                 ui.data_mut(|d| {
                     d.insert_temp(buf_id, buffer);
                     d.insert_temp(seen_id, server_value.to_string());
-                    d.insert_temp(focus_id, response.has_focus());
+                    d.insert_temp(focus_id, focused_now);
+                });
+            }
+            "textarea" => {
+                // Multi-line text field (webui-new-nodes-for-vellum.md).
+                // Same edit-state machine as text_input: keep a local
+                // buffer, never clobber focused in-progress text, commit
+                // the full string on blur only (Enter inserts a newline,
+                // which is TextEdit::multiline's default).
+                let server_value = node.value_str().unwrap_or("");
+                let buf_id = scratch_id("ta_buf");
+                let seen_id = scratch_id("ta_seen");
+                let focus_id = scratch_id("ta_focused");
+
+                let was_focused: bool = ui.data(|d| d.get_temp(focus_id)).unwrap_or(false);
+                let last_seen: String = ui.data(|d| d.get_temp(seen_id)).unwrap_or_default();
+                let mut buffer: String = ui
+                    .data(|d| d.get_temp(buf_id))
+                    .unwrap_or_else(|| server_value.to_string());
+                if server_value != last_seen && !was_focused {
+                    buffer = server_value.to_string();
+                }
+
+                if let Some(label) = node.label.as_deref() {
+                    if !label.is_empty() {
+                        ui.label(label);
+                    }
+                }
+                let rows = node.rows_hint.unwrap_or(4).clamp(2, 40) as usize;
+                let mut edit = egui::TextEdit::multiline(&mut buffer)
+                    .id_salt(scratch_id("ta_edit"))
+                    .desired_width(f32::INFINITY)
+                    .desired_rows(rows);
+                if let Some(hint) = node.placeholder.as_deref() {
+                    edit = edit.hint_text(hint);
+                }
+                let response = ui.add(edit);
+
+                if response.lost_focus() && buffer != server_value {
+                    queue_event(
+                        ui.ctx(),
+                        page,
+                        node.cid.as_deref(),
+                        serde_json::Value::String(buffer.clone()),
+                    );
+                }
+                // has_focus() re-enters the ctx lock: read BEFORE data_mut.
+                let focused_now = response.has_focus();
+                ui.data_mut(|d| {
+                    d.insert_temp(buf_id, buffer);
+                    d.insert_temp(seen_id, server_value.to_string());
+                    d.insert_temp(focus_id, focused_now);
                 });
             }
             "select" => {
@@ -769,7 +834,46 @@ impl VellumGuiApp {
                     }
                 });
             }
-            "col" | "tab" => Self::render_webui_nodes(ui, page, node.children()),
+            "col" | "tab" | "cell" => Self::render_webui_nodes(ui, page, node.children()),
+            "grid" => {
+                // Aligned matrix (webui-grid-node.md): row-major `cell`
+                // children, uniform column widths across every row (the
+                // browser uses grid-template-columns: repeat(cols, 1fr)).
+                // Empty cells are spacers; a lone unlabeled checkbox is
+                // centered (row/column headers carry its meaning).
+                let cells = node.children();
+                if cells.is_empty() {
+                    return;
+                }
+                let cols = (node.cols.unwrap_or(1).max(1) as usize).min(cells.len().max(1));
+                let compact = node.compact.unwrap_or(false);
+                let spacing = if compact { 2.0 } else { ui.spacing().item_spacing.x };
+                let avail = ui.available_width() - spacing * (cols.saturating_sub(1)) as f32;
+                let cell_width = (avail / cols as f32).max(10.0);
+                for row in cells.chunks(cols) {
+                    ui.horizontal_top(|ui| {
+                        ui.spacing_mut().item_spacing.x = spacing;
+                        for cell in row {
+                            let center = matches!(cell.children(),
+                                [only] if only.t == "checkbox"
+                                    && only.label.as_deref().unwrap_or("").is_empty());
+                            let layout = if center {
+                                egui::Layout::top_down(egui::Align::Center)
+                            } else {
+                                egui::Layout::top_down(egui::Align::Min)
+                            };
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(cell_width, 0.0),
+                                layout,
+                                |ui| {
+                                    ui.set_width(cell_width);
+                                    Self::render_webui_nodes(ui, page, cell.children());
+                                },
+                            );
+                        }
+                    });
+                }
+            }
             "tabs" => {
                 let tabs = node.children();
                 if tabs.is_empty() {
@@ -1031,5 +1135,105 @@ impl VellumGuiApp {
             }
             None => render_grid(ui),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::data::webui::{WebUiPanelContent, WebUiServerMessage};
+
+    // Render frames captured from live Lich sessions that hung the GUI
+    // ("Not Responding") when opened as panels. See
+    // lich5-docker/docs/vellum-tabs-crash-report.md.
+    const ECLEANSE: &str =
+        include_str!("../../../../tests/data/vellum-crash-payload-ecleanse.json");
+    const BIGSHOT: &str =
+        include_str!("../../../../tests/data/vellum-crash-payload-bigshot.json");
+
+    fn content_from_capture(raw: &str) -> WebUiPanelContent {
+        let msg: WebUiServerMessage = serde_json::from_str(raw).expect("captured payload parses");
+        let WebUiServerMessage::Render { page, tree, .. } = msg else {
+            panic!("capture is not a render envelope");
+        };
+        let mut content = WebUiPanelContent::new(page, "capture");
+        content.tree = Some(tree);
+        content.connected = true;
+        content
+    }
+
+    /// Renders a captured page for several headless frames on a worker
+    /// thread; the watchdog turns an infinite layout/parse loop into a test
+    /// failure instead of a stuck test process.
+    fn assert_renders_without_hanging(raw: impl Into<String>) {
+        let raw = raw.into();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let content = content_from_capture(&raw);
+            let ctx = egui::Context::default();
+            for _ in 0..8 {
+                let input = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(420.0, 640.0),
+                    )),
+                    ..Default::default()
+                };
+                ctx.begin_pass(input);
+                let mut root = egui::Ui::new(
+                    ctx.clone(),
+                    egui::Id::new("webui_panel_test_root"),
+                    egui::UiBuilder::new().max_rect(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(420.0, 640.0),
+                    )),
+                );
+                super::VellumGuiApp::render_webui_content(&mut root, &content);
+                let _ = ctx.end_pass();
+            }
+            let _ = done_tx.send(());
+        });
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .expect("webui renderer hung on captured payload");
+    }
+
+    #[test]
+    fn captured_ecleanse_setup_renders_without_hanging() {
+        assert_renders_without_hanging(ECLEANSE);
+    }
+
+    #[test]
+    fn captured_bigshot_setup_renders_without_hanging() {
+        assert_renders_without_hanging(BIGSHOT);
+    }
+
+    #[test]
+    fn textarea_and_wound_markers_render_without_hanging() {
+        // The other webui-new-nodes-for-vellum.md additions: a textarea
+        // (multi-line value + rows hint) and image_map wound marker kinds.
+        let raw = r#"{"type":"render","page":"nodes/demo","seq":1,
+            "tree":{"t":"page","title":"Nodes","children":[
+              {"t":"textarea","cid":"textarea:notes","label":"Notes",
+               "value":"line one\nline two","placeholder":"...","rows_hint":5},
+              {"t":"image_map","cid":"image_map:0","src":"/files/x.png","scale":1.0,
+               "markers":[
+                 {"id":"a","x1":0,"y1":0,"x2":8,"y2":8,"kind":"wound1"},
+                 {"id":"b","x1":10,"y1":0,"x2":18,"y2":8,"kind":"wound2"},
+                 {"id":"c","x1":20,"y1":0,"x2":28,"y2":8,"kind":"wound3"}]}
+            ]}}"#;
+        assert_renders_without_hanging(raw);
+    }
+
+    #[test]
+    fn grid_node_sample_renders_without_hanging() {
+        // Spec sample from lich5-docker/docs/webui-grid-node.md, wrapped in
+        // a minimal render envelope.
+        let grid = include_str!("../../../../tests/data/webui-grid-node-sample.json");
+        let raw = format!(
+            r#"{{"type":"render","page":"grid/demo","seq":1,
+                "tree":{{"t":"page","title":"Grid","children":[{}]}}}}"#,
+            grid
+        );
+        assert_renders_without_hanging(raw);
     }
 }

@@ -5,7 +5,8 @@
 //! relays envelopes between the server and the frontend over channels:
 //!
 //! ```text
-//! Lich (ws://127.0.0.1:<port>/ws)
+//! Lich (ws://<host>:<port>/ws — host from the handshake url: loopback
+//!       for a local Lich, a LAN address for a containerized one)
 //!        │  ▲
 //!  hello/pages/render/close        subscribe/unsubscribe/event
 //!        ▼  │
@@ -17,7 +18,8 @@
 //! ```
 //!
 //! Auth: the server accepts the upgrade when the request carries the
-//! `lich_webui=<token>` cookie and a loopback Origin. The token is
+//! `lich_webui=<token>` cookie and an allowlisted Origin (the dialed
+//! host:port must be in the server's allowed hosts). The token is
 //! script-level power (WebUI callbacks run Ruby inside Lich) - it is never
 //! logged here and must not appear in errors surfaced to windows.
 
@@ -49,7 +51,9 @@ pub enum WebUiEvent {
     /// User-facing notice from the server ("info" | "warn" | "error").
     Notice { level: String, text: String },
     /// Socket dropped; the task keeps retrying until `gave_up`.
-    Disconnected { gave_up: bool },
+    /// `never_connected` distinguishes "endpoint was never reachable"
+    /// (wrong/loopback-bound host, firewall) from a lost session.
+    Disconnected { gave_up: bool, never_connected: bool },
     /// Result of a `fetch_image` request (raw encoded bytes on success).
     ImageFetched {
         src: String,
@@ -95,12 +99,13 @@ impl Drop for WebUiHandle {
 /// `Disconnected { gave_up: true }` and exits (the user re-runs `.webui`).
 pub fn start(
     runtime: &tokio::runtime::Handle,
+    host: String,
     port: u16,
     token: String,
     event_tx: mpsc::UnboundedSender<WebUiEvent>,
 ) -> WebUiHandle {
     let (outbound_tx, outbound_rx) = mpsc::unbounded_channel();
-    let task = runtime.spawn(run_bridge(port, token, event_tx, outbound_rx));
+    let task = runtime.spawn(run_bridge(host, port, token, event_tx, outbound_rx));
     WebUiHandle {
         port,
         outbound_tx,
@@ -111,6 +116,7 @@ pub fn start(
 const MAX_RECONNECT_ATTEMPTS: u32 = 8;
 
 async fn run_bridge(
+    host: String,
     port: u16,
     token: String,
     event_tx: mpsc::UnboundedSender<WebUiEvent>,
@@ -119,12 +125,14 @@ async fn run_bridge(
     // Subscriptions observed on the outbound channel, replayed on reconnect.
     let mut subscriptions: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut attempts: u32 = 0;
+    let mut ever_connected = false;
 
     loop {
-        match connect(port, &token).await {
+        match connect(&host, port, &token).await {
             Ok(mut socket) => {
                 attempts = 0;
-                tracing::info!("WebUI bridge connected on port {}", port);
+                ever_connected = true;
+                tracing::info!("WebUI bridge connected to {}:{}", host, port);
 
                 // Replay subscriptions lost with the previous socket.
                 for page in &subscriptions {
@@ -188,21 +196,62 @@ async fn run_bridge(
             Err(err) => {
                 attempts += 1;
                 tracing::warn!(
-                    "WebUI bridge connect to port {} failed (attempt {}/{}): {}",
+                    "WebUI bridge connect to {}:{} failed (attempt {}/{}): {}",
+                    host,
                     port,
                     attempts,
                     MAX_RECONNECT_ATTEMPTS,
                     err
                 );
+                // Immediate feedback on the very first failure: without it,
+                // .webui looks dead for the whole retry window. A bare TCP
+                // preflight splits the two server-side failures the opaque
+                // connect() error can't: a refused/unreachable socket (WebUI
+                // bound to loopback on the Lich box, unpublished port, or a
+                // firewall) vs. a socket that accepts but rejects the upgrade
+                // (Host/Origin not in the server's allowed-hosts list). They
+                // need different fixes, so name which one.
+                if attempts == 1 && !ever_connected {
+                    let text = match preflight(&host, port).await {
+                        PreflightVerdict::Refused => format!(
+                            "can't reach the Lich WebUI at {host}:{port}: connection refused. \
+                             The server-side listener isn't reachable - on the Lich box the WebUI \
+                             is likely bound to localhost (set LICH_WEBUI_BIND=0.0.0.0 in a \
+                             container), the port isn't published, or a firewall blocks it. \
+                             Check with a browser: http://{host}:{port}/ - if that's also refused, \
+                             it's the Lich box, not VellumFE. Retrying up to {MAX_RECONNECT_ATTEMPTS} times..."
+                        ),
+                        PreflightVerdict::Connected => format!(
+                            "reached {host}:{port} but the WebUI refused the connection - the dialed \
+                             address is probably not in the server's allowed-hosts list \
+                             (LICH_WEBUI_ALLOWED_HOSTS on the Lich box must include {host}). \
+                             Retrying up to {MAX_RECONNECT_ATTEMPTS} times..."
+                        ),
+                        PreflightVerdict::Inconclusive => format!(
+                            "can't reach the Lich WebUI at {host}:{port} ({err}); \
+                             retrying up to {MAX_RECONNECT_ATTEMPTS} times..."
+                        ),
+                    };
+                    let _ = event_tx.send(WebUiEvent::Notice {
+                        level: "warn".to_string(),
+                        text,
+                    });
+                }
                 if attempts >= MAX_RECONNECT_ATTEMPTS {
-                    let _ = event_tx.send(WebUiEvent::Disconnected { gave_up: true });
+                    let _ = event_tx.send(WebUiEvent::Disconnected {
+                        gave_up: true,
+                        never_connected: !ever_connected,
+                    });
                     return;
                 }
             }
         }
 
         if event_tx
-            .send(WebUiEvent::Disconnected { gave_up: false })
+            .send(WebUiEvent::Disconnected {
+                gave_up: false,
+                never_connected: !ever_connected,
+            })
             .is_err()
         {
             return; // frontend gone
@@ -222,13 +271,14 @@ async fn run_bridge(
 /// the body is simply everything after the headers until EOF.
 pub fn fetch_image(
     runtime: &tokio::runtime::Handle,
+    host: String,
     port: u16,
     token: String,
     src: String,
     event_tx: mpsc::UnboundedSender<WebUiEvent>,
 ) {
     runtime.spawn(async move {
-        let fetch = http_get_files(port, &token, &src);
+        let fetch = http_get_files(&host, port, &token, &src);
         let data = match tokio::time::timeout(std::time::Duration::from_secs(10), fetch).await {
             Ok(Ok(bytes)) => Ok(bytes),
             Ok(Err(err)) => Err(err.to_string()),
@@ -238,18 +288,18 @@ pub fn fetch_image(
     });
 }
 
-async fn http_get_files(port: u16, token: &str, path: &str) -> anyhow::Result<Vec<u8>> {
+async fn http_get_files(host: &str, port: u16, token: &str, path: &str) -> anyhow::Result<Vec<u8>> {
     anyhow::ensure!(
         path.starts_with("/files/") && !path.contains("..") && !path.contains(['\r', '\n']),
         "unsupported image source"
     );
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port)).await?;
+    let mut stream = tokio::net::TcpStream::connect((host, port)).await?;
     let encoded_path = path.replace(' ', "%20");
     let request = format!(
-        "GET {} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nCookie: lich_webui={}\r\nConnection: close\r\n\r\n",
-        encoded_path, port, token
+        "GET {} HTTP/1.1\r\nHost: {}:{}\r\nCookie: lich_webui={}\r\nConnection: close\r\n\r\n",
+        encoded_path, host, port, token
     );
     stream.write_all(request.as_bytes()).await?;
 
@@ -270,19 +320,53 @@ async fn http_get_files(port: u16, token: &str, path: &str) -> anyhow::Result<Ve
     Ok(response[header_end + 4..].to_vec())
 }
 
+/// Which layer refused, per a bare TCP connect that carries no auth and does
+/// no upgrade — so it isolates reachability from the Host/Origin check.
+enum PreflightVerdict {
+    /// TCP connect failed (refused/unreachable/timed out): bind, publish, or
+    /// firewall on the Lich box — below the HTTP layer.
+    Refused,
+    /// TCP connect succeeded, so the real `connect()` failure is at or above
+    /// the HTTP upgrade (most likely the allowed-hosts rejection).
+    Connected,
+    /// Couldn't decide (e.g. host didn't resolve); fall back to the raw error.
+    Inconclusive,
+}
+
+/// Bare TCP probe of the advertised endpoint, bounded so a black-holed host
+/// can't stall the notice. Deliberately no cookie, no Origin, no upgrade: a
+/// success here with a failing `connect()` pins the fault to the upgrade, not
+/// reachability.
+async fn preflight(host: &str, port: u16) -> PreflightVerdict {
+    let connect = tokio::net::TcpStream::connect((host, port));
+    match tokio::time::timeout(std::time::Duration::from_secs(3), connect).await {
+        Ok(Ok(_stream)) => PreflightVerdict::Connected,
+        // Name resolution failed: nothing was dialed, so we learned nothing
+        // about the two layers - fall back to the raw connect() error.
+        Ok(Err(err)) if err.kind() == std::io::ErrorKind::NotFound => {
+            PreflightVerdict::Inconclusive
+        }
+        // Refused, timed out, unreachable, reset: a reachability failure,
+        // whose remedy set (bind/publish/firewall) is the Refused message,
+        // not the upgrade.
+        Ok(Err(_)) | Err(_) => PreflightVerdict::Refused,
+    }
+}
+
 type WsStream =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 /// Opens the authenticated WebSocket. The server requires the auth cookie
-/// AND an allowlisted Origin (`http://127.0.0.1:<port>`) on the upgrade;
-/// the cookie value is the token itself, so no /auth round-trip is needed.
-async fn connect(port: u16, token: &str) -> anyhow::Result<WsStream> {
-    let url = format!("ws://127.0.0.1:{}/ws", port);
+/// AND an allowlisted Origin (`http://<host>:<port>` — the dialed address,
+/// which must be in the server's allowed hosts) on the upgrade; the cookie
+/// value is the token itself, so no /auth round-trip is needed.
+async fn connect(host: &str, port: u16, token: &str) -> anyhow::Result<WsStream> {
+    let url = format!("ws://{}:{}/ws", host, port);
     let mut request = url.into_client_request()?;
     let headers = request.headers_mut();
     headers.insert(
         "Origin",
-        format!("http://127.0.0.1:{}", port).parse()?,
+        format!("http://{}:{}", host, port).parse()?,
     );
     headers.insert("Cookie", format!("lich_webui={}", token).parse()?);
 
@@ -332,4 +416,36 @@ fn handle_server_text(raw: &str, event_tx: &mpsc::UnboundedSender<WebUiEvent>) {
         WebUiServerMessage::Unknown => return,
     };
     let _ = event_tx.send(event);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A bound listener that never calls accept still completes the TCP
+    // handshake, so the preflight must read that as Connected - which is what
+    // pins a subsequent connect() failure to the upgrade (allowed-hosts),
+    // not to reachability.
+    #[tokio::test]
+    async fn preflight_reports_connected_when_socket_accepts() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        assert!(matches!(
+            preflight("127.0.0.1", port).await,
+            PreflightVerdict::Connected
+        ));
+    }
+
+    // Binding then dropping the listener frees the port, so a connect is
+    // refused - the reachability failure whose remedy is bind/publish/firewall.
+    #[tokio::test]
+    async fn preflight_reports_refused_when_nothing_listens() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        assert!(matches!(
+            preflight("127.0.0.1", port).await,
+            PreflightVerdict::Refused
+        ));
+    }
 }

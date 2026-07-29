@@ -22,11 +22,15 @@ use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
+mod color_emoji;
 mod detached;
 mod map_explorer;
 mod dialogs;
 mod dock;
 mod editors;
+#[cfg(feature = "gamepad")]
+mod gamepad;
+mod interact;
 mod menus;
 mod status_icons;
 mod theme;
@@ -44,7 +48,7 @@ use zones::{
 
 const INITIAL_LAYOUT_WIDTH: u16 = 160;
 const INITIAL_LAYOUT_HEIGHT: u16 = 50;
-const MAX_RENDERED_LINES: usize = 2000;
+const MAX_RENDERED_LINES: usize = 10_000;
 const MIN_VIEWPORT_WIDTH: f32 = 180.0;
 const MIN_VIEWPORT_HEIGHT: f32 = 120.0;
 const MIN_DOCKED_WINDOW_HEIGHT: f32 = 24.0;
@@ -104,6 +108,9 @@ impl WidgetRenderSettings {
 struct GuiWindowActions {
     link_clicks: Vec<GuiLinkClick>,
     window_menu_request: Option<GuiWindowMenuRequest>,
+    /// WebUI windows whose title-bar close button was clicked this frame
+    /// (window names); the app removes them and unsubscribes their pages.
+    webui_closes: Vec<String>,
 }
 
 impl GuiWindowActions {
@@ -112,6 +119,7 @@ impl GuiWindowActions {
         if let Some(request) = other.window_menu_request {
             self.window_menu_request = Some(request);
         }
+        self.webui_closes.extend(other.webui_closes);
     }
 }
 
@@ -176,6 +184,9 @@ pub struct VellumGuiApp {
     available_tabs: HashMap<TabKey, GuiTab>,
     hidden_tabs: HashSet<TabKey>,
     main_window_rects: HashMap<TabKey, [f32; 4]>,
+    /// Sidebar stacks: desired empty space above each docked window, in
+    /// points (free vertical placement; 0 / absent = stacked flush).
+    sidebar_gap_above: HashMap<TabKey, f32>,
     last_center_window_rects: HashMap<TabKey, [f32; 4]>,
     tab_zones: HashMap<TabKey, GuiShellZone>,
     no_title_tabs: HashSet<TabKey>,
@@ -197,9 +208,52 @@ pub struct VellumGuiApp {
     /// that failed to load is absent and falls back to Proportional
     /// (an unbound FontFamily::Name panics inside egui).
     registered_font_families: HashSet<String>,
+    /// Families passed to `ctx.set_fonts` this frame. egui only installs new
+    /// font definitions at the next `begin_pass`, so these must not enter
+    /// `registered_font_families` until the following frame — using a family
+    /// in the same frame it was registered panics inside epaint.
+    pending_font_families: Option<HashSet<String>>,
     /// Numpad keybind names last pushed to eframe via `set_numpad_capture_keys`;
     /// `None` until the first sync so startup always pushes the initial set.
     numpad_capture_keys: Option<HashSet<String>>,
+    /// Gamepad context; None when init failed or the feature is disabled.
+    #[cfg(feature = "gamepad")]
+    gamepad: Option<gilrs::Gilrs>,
+    /// Left-stick compass sector currently deflected (0=n..7=nw); None at
+    /// center. Movement sends on sector *change* with hysteresis.
+    #[cfg(feature = "gamepad")]
+    gp_stick_sector: Option<usize>,
+    /// Right-stick four-way direction currently deflected (interact-mode
+    /// cycling); None at center. Steps on direction *change*.
+    #[cfg(feature = "gamepad")]
+    gp_right_dir: Option<gamepad::FourWay>,
+    /// Radial wheel state while the wheel button is held: which named
+    /// wheel, the folder path descended so far, and the aimed slice.
+    /// Firing happens on release.
+    #[cfg(feature = "gamepad")]
+    gp_wheel: Option<gamepad::WheelUi>,
+    /// A leaf already fired during this hold of the wheel button; the
+    /// wheel stays closed (and release fires nothing) until a fresh hold,
+    /// so one hold never fires twice.
+    #[cfg(feature = "gamepad")]
+    gp_wheel_fired: bool,
+    /// When the wheel last dispatched a command; a repeat fire inside
+    /// [controller_tuning] fire_debounce_ms is suppressed.
+    #[cfg(feature = "gamepad")]
+    gp_wheel_last_fire: Option<std::time::Instant>,
+    /// Set when a wheel closes while the aim stick is still deflected: the
+    /// stick's normal function (scroll / interact cycle) stays suppressed
+    /// until it returns to center once, so releasing the wheel can't also
+    /// scroll or cycle from the leftover deflection.
+    #[cfg(feature = "gamepad")]
+    gp_aim_recenter_needed: bool,
+    /// Binding-legend overlay visibility (controller_overlay toggles it).
+    #[cfg(feature = "gamepad")]
+    gp_overlay: bool,
+    /// Live rumble effects: gilrs stops an effect when dropped, so each
+    /// stays here until its expiry.
+    #[cfg(feature = "gamepad")]
+    gp_rumble: Vec<(gilrs::ff::Effect, std::time::Instant)>,
     ui_settings: GuiUiSettings,
     tab_settings: HashMap<TabKey, TabSettings>,
     /// Windows locked together; each group renders as one window in the
@@ -224,6 +278,8 @@ pub struct VellumGuiApp {
     settings_editor: Option<editors::SettingsEditorState>,
     highlight_editor: Option<editors::HighlightEditorState>,
     keybind_editor: Option<editors::KeybindEditorState>,
+    #[cfg(feature = "gamepad")]
+    controller_editor: Option<editors::ControllerEditorState>,
     hotbar_editor: Option<editors::HotbarEditorState>,
     colors_editor: Option<editors::ColorsEditorState>,
     theme_browser: Option<editors::ThemeBrowserState>,
@@ -232,6 +288,11 @@ pub struct VellumGuiApp {
     window_editor: Option<editors::WindowEditorState>,
     custom_windows_editor: Option<editors::CustomWindowsEditorState>,
     doll_calibration: Option<editors::DollCalibrationState>,
+    /// Editor window Id to raise to the top on the next frame. Set when a
+    /// settings command (`.controller`, `.settings`, …) is re-issued while
+    /// its editor is already open, so the command surfaces the buried
+    /// window instead of silently rebuilding (and wiping) its state.
+    pending_editor_raise: Option<egui::Id>,
     search_bar_needs_focus: bool,
     /// Cached search-bar match count: (lowercased query, content fingerprint, count).
     search_match_cache: Option<(String, u64, usize)>,
@@ -271,9 +332,11 @@ pub struct VellumGuiApp {
     is_direct_connection: bool,
     /// Ensures the layout-driven auto-handshake fires once per connect.
     webui_handshake_sent: bool,
-    /// (port, auth token) of the connected WebUI server, for /files/ image
-    /// fetches. The token is script-level power: never log it.
-    webui_endpoint: Option<(u16, String)>,
+    /// (host, port, auth token) of the connected WebUI server, for /files/
+    /// image fetches. Host comes from the handshake url (loopback for a
+    /// local Lich, a LAN address for a containerized one). The token is
+    /// script-level power: never log it.
+    webui_endpoint: Option<(String, u16, String)>,
     /// Raw bridge event sender; image fetch tasks report through it.
     webui_event_tx: Option<mpsc::UnboundedSender<crate::webui::WebUiEvent>>,
     /// Image srcs with a fetch task in flight (dedupes re-queues).
@@ -413,6 +476,7 @@ impl VellumGuiApp {
         let dock::RestoredLayoutState {
             hidden_tabs,
             main_window_rects,
+            sidebar_gap_above,
             tab_zones,
             no_title_tabs,
             shell_layout,
@@ -427,6 +491,19 @@ impl VellumGuiApp {
             &available_tabs,
             initial_width,
         );
+
+        // Legacy GUI files stored per-window text size/font/wrap in
+        // TabSettings; those now live on the shared layout defs. Migrate
+        // once: marking both stores dirty persists the move on both sides.
+        let mut tab_settings = tab_settings;
+        let (migrated_layout, migrated_gui) = Self::migrate_tab_settings_to_layout(
+            &mut tab_settings,
+            &mut app_core.layout,
+            |key| available_tabs.get(key).map(|tab| tab.window_name.clone()),
+        );
+        if migrated_layout {
+            app_core.layout_modified_since_save = true;
+        }
 
         let command_history =
             Self::load_command_history(app_core.config.character.as_deref());
@@ -456,6 +533,7 @@ impl VellumGuiApp {
             available_tabs,
             hidden_tabs,
             main_window_rects,
+            sidebar_gap_above,
             last_center_window_rects: HashMap::new(),
             tab_zones,
             no_title_tabs,
@@ -463,7 +541,9 @@ impl VellumGuiApp {
             layout_profile,
             layout_character,
             core_layout_size,
-            layout_dirty: false,
+            // Migration emptied legacy TabSettings fields; rewrite the GUI
+            // file so they stay emptied.
+            layout_dirty: migrated_gui,
             layout_dirty_since: None,
             applied_theme_id: None,
             current_theme: crate::theme::AppTheme::default(),
@@ -471,7 +551,28 @@ impl VellumGuiApp {
             ui_font,
             fonts_applied: false,
             registered_font_families: HashSet::new(),
+            pending_font_families: None,
             numpad_capture_keys: None,
+            #[cfg(feature = "gamepad")]
+            gamepad: gilrs::Gilrs::new()
+                .inspect_err(|e| tracing::warn!("gamepad init failed: {}", e))
+                .ok(),
+            #[cfg(feature = "gamepad")]
+            gp_stick_sector: None,
+            #[cfg(feature = "gamepad")]
+            gp_right_dir: None,
+            #[cfg(feature = "gamepad")]
+            gp_wheel: None,
+            #[cfg(feature = "gamepad")]
+            gp_wheel_fired: false,
+            #[cfg(feature = "gamepad")]
+            gp_wheel_last_fire: None,
+            #[cfg(feature = "gamepad")]
+            gp_aim_recenter_needed: false,
+            #[cfg(feature = "gamepad")]
+            gp_overlay: false,
+            #[cfg(feature = "gamepad")]
+            gp_rumble: Vec::new(),
             ui_settings,
             tab_settings,
             tab_groups,
@@ -483,6 +584,8 @@ impl VellumGuiApp {
             settings_editor: None,
             highlight_editor: None,
             keybind_editor: None,
+            #[cfg(feature = "gamepad")]
+            controller_editor: None,
             hotbar_editor: None,
             colors_editor: None,
             theme_browser: None,
@@ -491,6 +594,7 @@ impl VellumGuiApp {
             window_editor: None,
             custom_windows_editor: None,
             doll_calibration: None,
+            pending_editor_raise: None,
             search_bar_needs_focus: false,
             search_match_cache: None,
             available_tabs_fingerprint: None,
@@ -744,23 +848,46 @@ impl VellumGuiApp {
             .unwrap_or_default()
     }
 
-    fn room_component_entries(component: Option<&Vec<Vec<TextSegment>>>) -> Vec<String> {
-        component
-            .map(|lines| {
-                lines
-                    .iter()
-                    .map(|segments| {
-                        segments
-                            .iter()
-                            .map(|segment| segment.text.as_str())
-                            .collect::<String>()
-                            .trim()
-                            .to_string()
-                    })
-                    .filter(|value| !value.is_empty())
-                    .collect()
-            })
-            .unwrap_or_default()
+    /// One flowing line like "Also here: Fraemen, Zugu" with each entry a
+    /// clickable link. Fallback for when the styled room component is
+    /// missing (e.g. state fed by Lich rather than the game stream).
+    fn room_line_from_links(
+        label: &str,
+        entries: impl Iterator<Item = (String, Option<crate::data::LinkData>)>,
+    ) -> Vec<StyledLine> {
+        let mut segments = vec![TextSegment {
+            text: label.to_string(),
+            ..Default::default()
+        }];
+        let mut first = true;
+        for (text, link_data) in entries {
+            if !first {
+                segments.push(TextSegment {
+                    text: ", ".to_string(),
+                    ..Default::default()
+                });
+            }
+            first = false;
+            let span_type = if link_data.is_some() {
+                crate::data::SpanType::Link
+            } else {
+                crate::data::SpanType::Normal
+            };
+            segments.push(TextSegment {
+                text,
+                span_type,
+                link_data,
+                ..Default::default()
+            });
+        }
+        if first {
+            return Vec::new();
+        }
+        vec![StyledLine {
+            segments,
+            stream: "room".to_string(),
+            timestamp: None,
+        }]
     }
 
     fn sync_room_windows_from_components(&mut self) {
@@ -779,31 +906,62 @@ impl VellumGuiApp {
             .unwrap_or_default();
         let description =
             Self::room_component_lines(self.app_core.room_components.get("room desc"));
-        let exits = if self.app_core.game_state.exits.is_empty() {
-            Self::room_component_entries(self.app_core.room_components.get("room exits"))
-        } else {
-            self.app_core.game_state.exits.clone()
-        };
-        let players = if self.app_core.game_state.room_players.is_empty() {
-            Self::room_component_entries(self.app_core.room_components.get("room players"))
-        } else {
-            self.app_core
-                .game_state
-                .room_players
-                .iter()
-                .map(|player| player.name.clone())
-                .collect()
-        };
-        let objects = if self.app_core.game_state.room_objects.is_empty() {
-            Self::room_component_entries(self.app_core.room_components.get("room objs"))
-        } else {
-            self.app_core
-                .game_state
-                .room_objects
-                .iter()
-                .map(|object| object.name.clone())
-                .collect()
-        };
+        // Prefer the styled component text verbatim (natural "Obvious
+        // paths:" / "Also here:" phrasing, monsterbold creatures, links);
+        // synthesize an equivalent line from game state only when absent.
+        let mut exits = Self::room_component_lines(self.app_core.room_components.get("room exits"));
+        if exits.is_empty() {
+            exits = Self::room_line_from_links(
+                "Obvious exits: ",
+                self.app_core.game_state.exits.iter().map(|dir| {
+                    (
+                        dir.clone(),
+                        Some(crate::data::LinkData {
+                            exist_id: "_direct_".to_string(),
+                            noun: dir.clone(),
+                            text: dir.clone(),
+                            coord: None,
+                        }),
+                    )
+                }),
+            );
+        }
+        let mut players =
+            Self::room_component_lines(self.app_core.room_components.get("room players"));
+        if players.is_empty() {
+            players = Self::room_line_from_links(
+                "Also here: ",
+                self.app_core.game_state.room_players.iter().map(|player| {
+                    (
+                        player.name.clone(),
+                        Some(crate::data::LinkData {
+                            exist_id: player.id.clone(),
+                            noun: player.name.clone(),
+                            text: player.name.clone(),
+                            coord: None,
+                        }),
+                    )
+                }),
+            );
+        }
+        let mut objects =
+            Self::room_component_lines(self.app_core.room_components.get("room objs"));
+        if objects.is_empty() {
+            objects = Self::room_line_from_links(
+                "You also see ",
+                self.app_core.game_state.room_objects.iter().map(|object| {
+                    (
+                        object.name.clone(),
+                        Some(crate::data::LinkData {
+                            exist_id: object.id.clone(),
+                            noun: object.noun.clone().unwrap_or_else(|| object.name.clone()),
+                            text: object.name.clone(),
+                            coord: None,
+                        }),
+                    )
+                }),
+            );
+        }
 
         for window in self.app_core.ui_state.windows.values_mut() {
             let WindowContent::Room(room) = &mut window.content else {
@@ -916,24 +1074,168 @@ impl VellumGuiApp {
         self.layout_dirty = true;
     }
 
-    /// Effective text size for a window: per-tab override or the global size.
-    fn effective_text_size(&self, key: &TabKey) -> f32 {
-        self.tab_settings
+    /// The shared layout definition backing a tab, when one exists.
+    fn layout_def_for_tab(&self, key: &TabKey) -> Option<&crate::config::WindowDef> {
+        let window_name = &self.available_tabs.get(key)?.window_name;
+        self.app_core
+            .layout
+            .windows
+            .iter()
+            .find(|window| window.name() == *window_name)
+    }
+
+    /// Mutate the shared layout def backing a tab and mark layout.toml
+    /// modified (the same mechanism the Window Editor uses). Returns false
+    /// (and changes nothing) when the tab has no layout definition.
+    fn with_layout_def_for_tab(
+        &mut self,
+        key: &TabKey,
+        mutate: impl FnOnce(&mut crate::config::WindowDef),
+    ) -> bool {
+        let Some(window_name) = self
+            .available_tabs
             .get(key)
-            .and_then(|settings| settings.text_size)
+            .map(|tab| tab.window_name.clone())
+        else {
+            return false;
+        };
+        let Some(def) = self
+            .app_core
+            .layout
+            .windows
+            .iter_mut()
+            .find(|window| window.name() == window_name)
+        else {
+            return false;
+        };
+        mutate(def);
+        self.app_core.layout_modified_since_save = true;
+        true
+    }
+
+    /// Per-window text size override: the shared layout def first, then the
+    /// legacy per-tab GUI setting (pre-migration files).
+    fn text_size_override_for_tab(&self, key: &TabKey) -> Option<f32> {
+        self.layout_def_for_tab(key)
+            .and_then(|def| def.base().text_size)
+            .or_else(|| self.tab_settings.get(key).and_then(|s| s.text_size))
+    }
+
+    /// Effective text size for a window: per-window override or the global size.
+    fn effective_text_size(&self, key: &TabKey) -> f32 {
+        self.text_size_override_for_tab(key)
             .unwrap_or(self.ui_settings.text_size)
             .clamp(6.0, 72.0)
     }
 
-    /// Effective proportional font family for a window: the per-tab font
-    /// (registered as a named family during font setup) or egui's default.
-    fn effective_font_family(&self, key: &TabKey) -> egui::FontFamily {
+    /// Per-window font: the shared layout def's family name first, then the
+    /// legacy per-tab GUI setting (which can also be a custom font file).
+    fn font_ref_for_tab(&self, key: &TabKey) -> Option<FontRef> {
+        if let Some(family) = self
+            .layout_def_for_tab(key)
+            .and_then(|def| def.base().font_family.clone())
+        {
+            return Some(FontRef::Named(family));
+        }
         self.tab_settings
             .get(key)
-            .and_then(|settings| theme::font_ref_key(&settings.font_primary))
+            .map(|settings| settings.font_primary.clone())
+    }
+
+    /// Effective proportional font family for a window: the per-window font
+    /// (registered as a named family during font setup) or egui's default.
+    fn effective_font_family(&self, key: &TabKey) -> egui::FontFamily {
+        self.font_ref_for_tab(key)
+            .as_ref()
+            .and_then(theme::font_ref_key)
             .filter(|font_key| self.registered_font_families.contains(font_key))
             .map(|font_key| egui::FontFamily::Name(font_key.into()))
             .unwrap_or(egui::FontFamily::Proportional)
+    }
+
+    /// Word wrap stored on the shared layout def, for widget types whose def
+    /// carries a `wordwrap` field. None = this def has no such field.
+    fn def_wordwrap_for_tab(&self, key: &TabKey) -> Option<bool> {
+        match self.layout_def_for_tab(key)? {
+            crate::config::WindowDef::Text { data, .. } => Some(data.wordwrap),
+            crate::config::WindowDef::Inventory { data, .. }
+            | crate::config::WindowDef::Reserve { data, .. } => Some(data.wordwrap),
+            _ => None,
+        }
+    }
+
+    /// Effective wrap for a window: the def's wordwrap when it has one, else
+    /// the legacy per-tab GUI setting, else on.
+    fn effective_wrap_text(&self, key: &TabKey) -> bool {
+        self.def_wordwrap_for_tab(key).unwrap_or_else(|| {
+            self.tab_settings
+                .get(key)
+                .map(|settings| settings.wrap_text)
+                .unwrap_or(true)
+        })
+    }
+
+    /// One-time migration: move legacy per-tab GUI appearance settings
+    /// (text size, font, wrap) onto the shared layout window defs, where
+    /// they now live. A value already present on a def wins; migrated
+    /// TabSettings fields reset to their defaults either way, so a second
+    /// run is a no-op. `FontRef::Custom` (a font file path, not a family
+    /// name) stays in TabSettings and keeps working via the read fallback.
+    /// Returns (layout_changed, gui_settings_changed).
+    fn migrate_tab_settings_to_layout(
+        tab_settings: &mut HashMap<TabKey, TabSettings>,
+        layout: &mut crate::config::Layout,
+        window_name_of: impl Fn(&TabKey) -> Option<String>,
+    ) -> (bool, bool) {
+        use crate::config::WindowDef;
+
+        let mut layout_changed = false;
+        let mut gui_changed = false;
+        for (key, settings) in tab_settings.iter_mut() {
+            let Some(name) = window_name_of(key) else {
+                continue;
+            };
+            let Some(def) = layout.windows.iter_mut().find(|w| w.name() == name) else {
+                continue;
+            };
+            if let Some(size) = settings.text_size.take() {
+                if def.base().text_size.is_none() {
+                    def.base_mut().text_size = Some(size);
+                    layout_changed = true;
+                }
+                gui_changed = true;
+            }
+            if matches!(settings.font_primary, FontRef::Named(_)) {
+                let font = std::mem::take(&mut settings.font_primary);
+                if let FontRef::Named(family) = font {
+                    if def.base().font_family.is_none() {
+                        def.base_mut().font_family = Some(family);
+                        layout_changed = true;
+                    }
+                }
+                gui_changed = true;
+            }
+            if !settings.wrap_text {
+                // wrap_text=false is the only migratable signal (true is the
+                // default); only defs with a wordwrap field can hold it.
+                let target = match def {
+                    WindowDef::Text { data, .. } => Some(&mut data.wordwrap),
+                    WindowDef::Inventory { data, .. } | WindowDef::Reserve { data, .. } => {
+                        Some(&mut data.wordwrap)
+                    }
+                    _ => None,
+                };
+                if let Some(wordwrap) = target {
+                    if *wordwrap {
+                        *wordwrap = false;
+                        layout_changed = true;
+                    }
+                    settings.wrap_text = true;
+                    gui_changed = true;
+                }
+            }
+        }
+        (layout_changed, gui_changed)
     }
 
     /// Resolve the sizing values a window's content renderer needs.
@@ -945,11 +1247,7 @@ impl VellumGuiApp {
             effects_bar_height: self.ui_settings.effects_bar_height.clamp(10.0, 60.0),
             bar_corner_radius: self.ui_settings.bar_corner_radius.clamp(0.0, 12.0),
             auto_contrast_bar_text: self.ui_settings.auto_contrast_bar_text,
-            wrap_text: self
-                .tab_settings
-                .get(key)
-                .map(|settings| settings.wrap_text)
-                .unwrap_or(true),
+            wrap_text: self.effective_wrap_text(key),
             vitals: self.ui_settings.vitals.clone(),
             background: self
                 .available_tabs
@@ -1251,11 +1549,40 @@ impl VellumGuiApp {
         }
     }
 
-    /// Accent (border) color for a window, if the user set one.
+    /// Accent (border) color for a window. Precedence: the per-window GUI
+    /// accent (context menu), else the shared layout definition's
+    /// border_color — so a border color set in the window editor or the
+    /// TUI finally shows here too — else the theme frame (None).
     fn accent_color_for_tab(&self, key: &TabKey) -> Option<Color32> {
-        self.tab_settings
+        if let Some(accent) = self
+            .tab_settings
             .get(key)
             .and_then(|settings| settings.accent_color.as_deref())
+            .and_then(widgets::parse_hex_color)
+        {
+            return Some(accent);
+        }
+        let window_name = &self.available_tabs.get(key)?.window_name;
+        let base = self
+            .app_core
+            .layout
+            .windows
+            .iter()
+            .find(|window| window.name() == *window_name)?
+            .base();
+        if let Some(color) = match base.border_color.as_deref() {
+            None | Some("-") | Some("") => None,
+            Some(color) => widgets::parse_hex_color(color),
+        } {
+            return Some(color);
+        }
+        // colors.toml ui.border_color, only when actually changed from the
+        // built-in default (extracted defaults fall through to the theme).
+        self.app_core
+            .config
+            .colors
+            .ui
+            .user_border_color()
             .and_then(widgets::parse_hex_color)
     }
 
@@ -1336,6 +1663,12 @@ impl VellumGuiApp {
                     .map(|(key, rect)| MainWindowRectSnapshot {
                         key: key.clone(),
                         rect: *rect,
+                        gap_above: self
+                            .sidebar_gap_above
+                            .get(key)
+                            .copied()
+                            .filter(|value| value.is_finite() && *value > 0.0)
+                            .unwrap_or(0.0),
                     })
                     .collect();
                 rects.sort_by_key(|entry| entry.key.short_id());
@@ -1472,6 +1805,7 @@ impl VellumGuiApp {
             Self::restore_layout_state(Some(layout), &self.available_tabs, content_width);
         self.hidden_tabs = restored.hidden_tabs;
         self.main_window_rects = restored.main_window_rects;
+        self.sidebar_gap_above = restored.sidebar_gap_above;
         self.last_center_window_rects.clear();
         self.tab_zones = restored.tab_zones;
         self.no_title_tabs = restored.no_title_tabs;
@@ -1481,6 +1815,17 @@ impl VellumGuiApp {
         self.ui_font = restored.ui_font;
         self.ui_settings = restored.ui_settings;
         self.tab_settings = restored.tab_settings;
+        // Checkpoints can predate the move of per-window text size/font/wrap
+        // onto the layout defs; migrate them the same way startup does.
+        let available_tabs = &self.available_tabs;
+        let (migrated_layout, _) = Self::migrate_tab_settings_to_layout(
+            &mut self.tab_settings,
+            &mut self.app_core.layout,
+            |key| available_tabs.get(key).map(|tab| tab.window_name.clone()),
+        );
+        if migrated_layout {
+            self.app_core.layout_modified_since_save = true;
+        }
         // Lazy appliers pick up the new font/zoom/density next frame.
         self.fonts_applied = false;
         self.zoom_applied = false;
@@ -1556,6 +1901,59 @@ impl VellumGuiApp {
             }
             "layouts" => {
                 self.list_layout_checkpoints();
+                true
+            }
+            // UI packs: the GUI rides along on the core commands to add
+            // (export) / install (import) its live layout.
+            "uiexport" => {
+                let args: Vec<String> = parts.map(str::to_string).collect();
+                let mut args = {
+                    let mut all = vec![arg.unwrap_or_default().to_string()];
+                    all.extend(args);
+                    all
+                };
+                args.retain(|a| !a.is_empty());
+                let extra = self
+                    .build_layout_snapshot()
+                    .and_then(|layout| serde_json::to_vec_pretty(&layout).ok())
+                    .map(|bytes| {
+                        vec![(
+                            crate::core::uipack::GUI_LAYOUT_ENTRY.to_string(),
+                            bytes,
+                        )]
+                    })
+                    .unwrap_or_default();
+                self.app_core.uiexport_with(&args, extra);
+                true
+            }
+            "uiimport" => {
+                let args: Vec<String> = parts.map(str::to_string).collect();
+                let mut args = {
+                    let mut all = vec![arg.unwrap_or_default().to_string()];
+                    all.extend(args);
+                    all
+                };
+                args.retain(|a| !a.is_empty());
+                if let Some((pack_name, bytes)) = self.app_core.uiimport(&args) {
+                    match serde_json::from_slice(&bytes) {
+                        Ok(layout) => match save_named_layout(
+                            &layout,
+                            &self.layout_profile,
+                            &self.layout_character,
+                            &pack_name,
+                        ) {
+                            Ok(()) => self.app_core.add_system_message(&format!(
+                                "GUI layout installed — load it with .loadlayout {pack_name}"
+                            )),
+                            Err(err) => self.app_core.add_system_message(&format!(
+                                "Pack's GUI layout could not be saved: {err}"
+                            )),
+                        },
+                        Err(err) => self.app_core.add_system_message(&format!(
+                            "Pack's GUI layout did not parse: {err}"
+                        )),
+                    }
+                }
                 true
             }
             _ => false,
@@ -1676,6 +2074,41 @@ impl VellumGuiApp {
                     self.app_core
                         .handle_remote_highlight_put(client_id, request_id, scope, name, rule);
                 }
+                crate::core::remote::RemoteEvent::SettingsGet {
+                    client_id,
+                    request_id,
+                } => {
+                    self.app_core
+                        .handle_remote_settings_get(client_id, request_id);
+                }
+                crate::core::remote::RemoteEvent::SettingsPut {
+                    client_id,
+                    request_id,
+                    key,
+                    value,
+                    scope,
+                    clear,
+                } => {
+                    self.app_core.handle_remote_settings_put(
+                        client_id, request_id, key, value, scope, clear,
+                    );
+                }
+                crate::core::remote::RemoteEvent::StreamsGet {
+                    client_id,
+                    request_id,
+                } => {
+                    self.app_core
+                        .handle_remote_streams_get(client_id, request_id);
+                }
+                crate::core::remote::RemoteEvent::StreamsPut {
+                    client_id,
+                    request_id,
+                    stream,
+                    target,
+                } => {
+                    self.app_core
+                        .handle_remote_streams_put(client_id, request_id, stream, target);
+                }
                 crate::core::remote::RemoteEvent::ColorsGet {
                     client_id,
                     request_id,
@@ -1737,6 +2170,26 @@ impl VellumGuiApp {
                         None => tracing::warn!(
                             "remote macro id '{}' did not resolve (stale client?)",
                             id
+                        ),
+                    }
+                }
+                crate::core::remote::RemoteEvent::WheelPick { key, path } => {
+                    // Resolved against config (or the dynamic portals
+                    // wheel) like macros; same dispatch as typed input.
+                    match self.app_core.wheel_pick_command(&key, &path) {
+                        Some(command) => {
+                            tracing::debug!(
+                                "remote wheel pick '{}' {:?}: '{}'",
+                                key,
+                                path,
+                                command
+                            );
+                            self.dispatch_command(command);
+                        }
+                        None => tracing::warn!(
+                            "remote wheel pick '{}' {:?} did not resolve (stale client?)",
+                            key,
+                            path
                         ),
                     }
                 }
@@ -1910,9 +2363,12 @@ impl VellumGuiApp {
         };
 
         // Replace any prior bridge (Lich restarts change port and token).
+        // Dial the address the handshake url advertises — a containerized
+        // Lich hands out its reachable LAN address there, not loopback.
+        let (host, port) = handshake.endpoint();
         self.webui_bridge = None;
         self.webui_rx = None;
-        self.webui_endpoint = Some((handshake.port, token.clone()));
+        self.webui_endpoint = Some((host.clone(), port, token.clone()));
         self.webui_fetches_inflight.clear();
 
         // Same waking hop as server messages: forward bridge events and
@@ -1933,10 +2389,10 @@ impl VellumGuiApp {
         });
 
         let handle =
-            crate::webui::start(self._runtime.handle(), handshake.port, token, event_tx);
+            crate::webui::start(self._runtime.handle(), host.clone(), port, token, event_tx);
         self.webui_bridge = Some(handle);
         self.webui_rx = Some(forward_rx);
-        tracing::info!("WebUI bridge connecting to port {}", handshake.port);
+        tracing::info!("WebUI bridge connecting to {}:{}", host, port);
     }
 
     /// Applies bridge events to panel windows. Called once per frame.
@@ -1952,6 +2408,7 @@ impl VellumGuiApp {
             match event {
                 crate::webui::WebUiEvent::Hello { session, pages, .. } => {
                     self.webui_pages = pages;
+                    self.refresh_webui_window_kinds();
                     self.set_webui_windows_connected(true);
                     // Fresh connection: failed images are worth retrying, and
                     // Loading entries are orphans of the previous socket.
@@ -2011,26 +2468,105 @@ impl VellumGuiApp {
                             }
                         }
                     }
+                    // Transient pages registered while we're connected open
+                    // themselves: ";bigshot setup" pops its dialog without a
+                    // .webui round-trip (and the window auto-closes on save,
+                    // completing the dialog lifecycle). Declared panels stay
+                    // opt-in - dock once via .webui, the layout brings them
+                    // back - so a script restart never resurrects a panel
+                    // window the user closed on purpose. Dialogs (a settings
+                    // popup, e.g. map/settings) are on-demand supplemental
+                    // pages: they open via the image_map right-click popup,
+                    // never just because the script registered them. The
+                    // hello baseline never auto-opens (connecting must not
+                    // spawn windows).
+                    let fresh: Vec<String> = pages
+                        .iter()
+                        .filter(|p| !matches!(p.kind.as_deref(), Some("panel") | Some("dialog")))
+                        .filter(|p| !self.webui_pages.iter().any(|k| k.id == p.id))
+                        .map(|p| p.id.clone())
+                        .collect();
                     self.webui_pages = pages;
+                    self.refresh_webui_window_kinds();
+                    for page in fresh {
+                        self.open_webui_page(&page);
+                    }
                 }
                 crate::webui::WebUiEvent::Render { page, seq, tree } => {
                     self.apply_webui_render(&page, seq, tree);
                 }
                 crate::webui::WebUiEvent::PageClosed { page } => {
-                    self.with_webui_window(&page, |content| {
-                        content.ended = Some("The owning script exited.".to_string());
+                    // Declared panels (kind: "panel") stay docked with a
+                    // notice and resume when the script re-registers, so a
+                    // crash or ;repository restart never silently removes a
+                    // docked widget. Everything else (settings dialogs,
+                    // pages with no kind hint) closes with its script.
+                    let is_panel = self.app_core.ui_state.windows.values().any(|w| {
+                        matches!(&w.content, WindowContent::WebUi(c)
+                            if c.page_id == page && c.kind.as_deref() == Some("panel"))
                     });
+                    if is_panel {
+                        self.with_webui_window(&page, |content| {
+                            content.ended = Some("The owning script exited.".to_string());
+                        });
+                    } else {
+                        let names: Vec<String> = self
+                            .app_core
+                            .ui_state
+                            .windows
+                            .values()
+                            .filter(|w| {
+                                matches!(&w.content, WindowContent::WebUi(c)
+                                    if c.page_id == page)
+                            })
+                            .map(|w| w.name.clone())
+                            .collect();
+                        if !names.is_empty() {
+                            for name in &names {
+                                self.app_core.remove_window(name);
+                                self.app_core.layout.windows.retain(|w| w.name() != *name);
+                            }
+                            self.app_core.layout_modified_since_save = true;
+                            tracing::info!(
+                                "WebUI page '{}' ended; closed transient panel",
+                                page
+                            );
+                        }
+                    }
                 }
                 crate::webui::WebUiEvent::Notice { level, text } => {
                     self.app_core
                         .add_system_message(&format!("[WebUI {}] {}", level, text));
                 }
-                crate::webui::WebUiEvent::Disconnected { gave_up } => {
+                crate::webui::WebUiEvent::Disconnected {
+                    gave_up,
+                    never_connected,
+                } => {
                     self.set_webui_windows_connected(false);
                     if gave_up {
-                        self.app_core.add_system_message(
-                            "Lich WebUI connection lost (Lich restarted?). Run .webui to reconnect.",
-                        );
+                        if never_connected {
+                            // The endpoint refused every attempt: almost
+                            // always the advertised host isn't reachable
+                            // from this machine (WebUI bound to localhost
+                            // on the Lich box, firewall, stale address).
+                            let endpoint = self
+                                .webui_endpoint
+                                .as_ref()
+                                .map(|(host, port, _)| format!("{}:{}", host, port))
+                                .unwrap_or_else(|| "the advertised address".to_string());
+                            self.app_core.add_system_message(&format!(
+                                "Lich WebUI unreachable at {} (every attempt refused). \
+                                 If ';ui' says it is running, the WebUI is likely only \
+                                 listening on the Lich machine's localhost or its \
+                                 firewall blocks the port - check that http://{}/ opens \
+                                 in a browser on THIS machine, then run .webui again.",
+                                endpoint, endpoint
+                            ));
+                        } else {
+                            self.app_core.add_system_message(
+                                "Lich WebUI connection lost (Lich restarted?). Run .webui to reconnect.",
+                            );
+                        }
                         self.webui_bridge = None;
                         self.webui_rx = None;
                         self.webui_endpoint = None;
@@ -2130,7 +2666,10 @@ impl VellumGuiApp {
                 };
                 PopupMenuItem {
                     text,
-                    command: format!(".webui {}", page.id),
+                    // Menu commands that miss every internal prefix are sent
+                    // to the game raw (Wrayth menu semantics), so this must
+                    // be the action string, not the ".webui" dot-command.
+                    command: format!("action:webui:open:{}", page.id),
                     disabled: false,
                 }
             })
@@ -2138,6 +2677,23 @@ impl VellumGuiApp {
         self.close_all_popup_menus();
         self.app_core.ui_state.popup_menu = Some(PopupMenu::new(items, (8, 4)));
         self.app_core.ui_state.input_mode = InputMode::Menu;
+    }
+
+    /// Refreshes each hosted window's remembered page kind from the current
+    /// registry. Windows restored from a saved layout start with no kind;
+    /// this is what re-teaches them before their page can end.
+    fn refresh_webui_window_kinds(&mut self) {
+        for window in self.app_core.ui_state.windows.values_mut() {
+            if let WindowContent::WebUi(content) = &mut window.content {
+                if let Some(descriptor) =
+                    self.webui_pages.iter().find(|p| p.id == content.page_id)
+                {
+                    if descriptor.kind.is_some() {
+                        content.kind = descriptor.kind.clone();
+                    }
+                }
+            }
+        }
     }
 
     /// Creates (or focuses) the panel window for a page and subscribes.
@@ -2153,16 +2709,57 @@ impl VellumGuiApp {
             })
             .unwrap_or_else(|| page_id.to_string());
         let size = descriptor.and_then(|d| d.size);
+        let kind = descriptor.and_then(|d| d.kind.clone());
 
-        let name = self.app_core.add_webui_window(page_id, &title, size);
+        let name = self
+            .app_core
+            .add_webui_window(page_id, &title, size, kind.clone());
         self.with_webui_window(page_id, |content| {
             content.connected = true;
+            if kind.is_some() {
+                content.kind = kind.clone();
+            }
         });
         if let Some(bridge) = &self.webui_bridge {
             bridge.subscribe(page_id);
         }
         self.layout_dirty = true;
         tracing::info!("WebUI panel '{}' opened for page '{}'", name, page_id);
+    }
+
+    /// Closes one WebUI window from its title-bar close button: removes the
+    /// window and its layout entry, and unsubscribes the page so the server
+    /// sees the viewer leave (scripts with a window watchdog - ;map - treat
+    /// that as the window closing, matching the GTK/browser lifecycle).
+    fn close_webui_window(&mut self, name: &str) {
+        let page_id = self.app_core.ui_state.windows.get(name).and_then(|w| {
+            match &w.content {
+                WindowContent::WebUi(content) => Some(content.page_id.clone()),
+                _ => None,
+            }
+        });
+        let Some(page_id) = page_id else { return };
+        self.app_core.remove_window(name);
+        self.app_core.layout.windows.retain(|w| w.name() != name);
+        self.app_core.layout_modified_since_save = true;
+        self.layout_dirty = true;
+        // Only unsubscribe when no other window still shows the page.
+        let still_hosted = self.app_core.ui_state.windows.values().any(|w| {
+            matches!(&w.content, WindowContent::WebUi(c) if c.page_id == page_id)
+        });
+        if !still_hosted {
+            if let Some(bridge) = &self.webui_bridge {
+                bridge.send(crate::data::webui::WebUiClientMessage::Unsubscribe {
+                    page: page_id.clone(),
+                });
+            }
+        }
+        tracing::info!(
+            "WebUI panel '{}' closed by user (page '{}', unsubscribed: {})",
+            name,
+            page_id,
+            !still_hosted
+        );
     }
 
     /// `.webui` action entry points (returns true when handled).
@@ -2239,6 +2836,27 @@ impl VellumGuiApp {
                 continue;
             }
 
+            // Interact mode and popup-menu keyboard navigation take plain
+            // arrows/enter/escape before keybinds or text input see them.
+            // Window-move and window-context-menu keep their own Esc
+            // semantics (handled later this frame).
+            if !suppress_macro_dispatch
+                && self.window_move_state.is_none()
+                && self.window_context_menu.is_none()
+                && self.handle_modal_nav_key(&key_press.key_event, ctx)
+            {
+                consumed_keyboard_input = true;
+                ctx.input_mut(|input| {
+                    if let Some(logical_key) = key_press.logical_key {
+                        input.consume_key(key_press.modifiers, logical_key);
+                    }
+                    if let Some(physical_key) = key_press.physical_key {
+                        input.consume_key(key_press.modifiers, physical_key);
+                    }
+                });
+                continue;
+            }
+
             let target = Self::resolve_global_dispatch_target(
                 key_press.key_event,
                 &self.app_core.keybind_map,
@@ -2250,7 +2868,7 @@ impl VellumGuiApp {
             };
 
             consumed_keyboard_input = true;
-            self.execute_global_dispatch_target(target);
+            self.execute_global_dispatch_target(target, ctx);
 
             ctx.input_mut(|input| {
                 if let Some(logical_key) = key_press.logical_key {
@@ -2446,12 +3064,49 @@ impl VellumGuiApp {
         suppress_macro_dispatch: bool,
     ) -> Option<GlobalDispatchTarget> {
         if !suppress_macro_dispatch {
-            if let Some(binding @ KeyBindAction::Macro(_)) = keybind_map.get(&key_event) {
-                return Some(GlobalDispatchTarget::Macro(binding.clone()));
+            match keybind_map.get(&key_event) {
+                Some(binding @ KeyBindAction::Macro(_)) => {
+                    return Some(GlobalDispatchTarget::Macro(binding.clone()));
+                }
+                // Action bindings the core can execute without frontend help
+                // (mode/system toggles, TTS). Cursor/scroll/search/tab actions
+                // stay with the GUI's own widgets — dispatching those here
+                // would steal keys like Esc (clear_search) from every editor.
+                Some(binding @ KeyBindAction::Action(name)) => {
+                    if crate::config::KeyAction::from_str(name)
+                        .is_some_and(Self::is_core_global_action)
+                    {
+                        return Some(GlobalDispatchTarget::Macro(binding.clone()));
+                    }
+                }
+                None => {}
             }
         }
 
         Self::app_shortcut_for_key(key_event, app_keybinds).map(GlobalDispatchTarget::Shortcut)
+    }
+
+    /// Action keybinds that execute fully inside AppCore, safe to dispatch
+    /// globally in the GUI (everything else is widget-level and handled by
+    /// the GUI's own input paths).
+    fn is_core_global_action(action: crate::config::KeyAction) -> bool {
+        use crate::config::KeyAction;
+        matches!(
+            action,
+            KeyAction::InteractMode
+                | KeyAction::StopTravel
+                | KeyAction::ToggleSounds
+                | KeyAction::TogglePerformanceStats
+                | KeyAction::TtsNext
+                | KeyAction::TtsPrevious
+                | KeyAction::TtsNextUnread
+                | KeyAction::TtsStop
+                | KeyAction::TtsMuteToggle
+                | KeyAction::TtsIncreaseRate
+                | KeyAction::TtsDecreaseRate
+                | KeyAction::TtsIncreaseVolume
+                | KeyAction::TtsDecreaseVolume
+        )
     }
 
     fn app_shortcut_for_key(
@@ -2486,14 +3141,56 @@ impl VellumGuiApp {
         )
     }
 
-    fn execute_global_dispatch_target(&mut self, target: GlobalDispatchTarget) {
+    fn execute_global_dispatch_target(
+        &mut self,
+        target: GlobalDispatchTarget,
+        ctx: &egui::Context,
+    ) {
         match target {
-            GlobalDispatchTarget::Macro(action) => self.execute_macro_keybind(&action),
+            GlobalDispatchTarget::Macro(action) => self.execute_macro_keybind(&action, ctx),
             GlobalDispatchTarget::Shortcut(shortcut) => self.execute_app_shortcut(shortcut),
         }
     }
 
-    fn execute_macro_keybind(&mut self, action: &KeyBindAction) {
+    /// Scroll actions bound to keys or controller buttons, applied to the
+    /// GUI's own scroll model — the core implementations move
+    /// `content.scroll_offset`, which only the TUI renders. v1 targets the
+    /// "main" story window. Returns true when the action was a scroll.
+    fn try_gui_scroll_action(&mut self, action: &KeyBindAction, ctx: &egui::Context) -> bool {
+        let KeyBindAction::Action(name) = action else {
+            return false;
+        };
+        let scroll_id = "main";
+        let view_h: f32 = ctx
+            .data_mut(|d| d.get_temp(egui::Id::new(("text_scroll_view_h", scroll_id))))
+            .unwrap_or(400.0);
+        // (kind, value): 0 = relative px, 1 = home, 2 = end
+        let request: (u8, f32) = match name.as_str() {
+            "scroll_current_window_up_page" => (0, -(view_h * 0.85)),
+            "scroll_current_window_down_page" => (0, view_h * 0.85),
+            "scroll_current_window_up_one" => (0, -48.0),
+            "scroll_current_window_down_one" => (0, 48.0),
+            "scroll_current_window_home" => (1, 0.0),
+            "scroll_current_window_end" => (2, 0.0),
+            _ => return false,
+        };
+        ctx.data_mut(|d| {
+            d.insert_temp(egui::Id::new(("text_scroll_pending", scroll_id)), request)
+        });
+        ctx.request_repaint();
+        true
+    }
+
+    fn execute_macro_keybind(&mut self, action: &KeyBindAction, ctx: &egui::Context) {
+        if self.try_gui_scroll_action(action, ctx) {
+            return;
+        }
+        #[cfg(feature = "gamepad")]
+        if matches!(action, KeyBindAction::Action(name) if name == "controller_overlay") {
+            self.gp_overlay = !self.gp_overlay;
+            ctx.request_repaint();
+            return;
+        }
         match self.app_core.execute_keybind_action(action) {
             Ok(commands) => {
                 for outbound in commands {
@@ -3219,6 +3916,14 @@ impl VellumGuiApp {
             self.open_keybind_editor();
             return true;
         }
+        if action == "action:controller" {
+            #[cfg(feature = "gamepad")]
+            self.open_controller_editor();
+            #[cfg(not(feature = "gamepad"))]
+            self.app_core
+                .add_system_message("This build has no gamepad support.");
+            return true;
+        }
         if action == "action:hotbars" {
             self.open_hotbar_editor();
             return true;
@@ -3324,7 +4029,7 @@ impl VellumGuiApp {
             items.insert(
                 0,
                 PopupMenuItem {
-                    text: "Custom Window…".to_string(),
+                    text: "Streams & Custom Windows…".to_string(),
                     command: "action:customwindows".to_string(),
                     disabled: false,
                 },
@@ -3483,6 +4188,8 @@ impl eframe::App for VellumGuiApp {
                 ctx.request_repaint_after(at - now);
             }
         }
+        // Publish the color-emoji toggle for this frame's text painters.
+        color_emoji::set_enabled(self.app_core.config.ui.color_emoji);
         // Publish the configured item-drag modifier for link renderers.
         ctx.data_mut(|data| {
             data.insert_temp(
@@ -3494,23 +4201,41 @@ impl eframe::App for VellumGuiApp {
         // must not select it.
         let dragging_item = egui::DragAndDrop::has_any_payload(&ctx);
         ctx.global_style_mut(|style| style.interaction.selectable_labels = !dragging_item);
+        // Families set last frame are installed by now (set_fonts only takes
+        // effect at the next begin_pass), so it is safe for widgets to use them.
+        if let Some(families) = self.pending_font_families.take() {
+            self.registered_font_families = families;
+        }
         if !self.fonts_applied {
             self.fonts_applied = true;
-            let window_fonts: Vec<FontRef> = self
+            let mut window_fonts: Vec<FontRef> = self
                 .tab_settings
                 .values()
                 .map(|settings| settings.font_primary.clone())
                 .collect();
+            // Fonts assigned on shared layout defs need registering too.
+            window_fonts.extend(
+                self.app_core
+                    .layout
+                    .windows
+                    .iter()
+                    .filter_map(|window| window.base().font_family.clone().map(FontRef::Named)),
+            );
             let fonts = theme::build_font_definitions(&self.ui_font, &window_fonts);
-            self.registered_font_families = fonts
-                .families
-                .keys()
-                .filter_map(|family| match family {
-                    egui::FontFamily::Name(name) => Some(name.to_string()),
-                    _ => None,
-                })
-                .collect();
+            self.pending_font_families = Some(
+                fonts
+                    .families
+                    .keys()
+                    .filter_map(|family| match family {
+                        egui::FontFamily::Name(name) => Some(name.to_string()),
+                        _ => None,
+                    })
+                    .collect(),
+            );
             ctx.set_fonts(fonts);
+            // The new families become usable next frame; make sure it happens
+            // promptly instead of waiting for the idle repaint tick.
+            ctx.request_repaint();
         }
         self.apply_theme_if_changed(&ctx);
         self.skin_state
@@ -3538,6 +4263,8 @@ impl eframe::App for VellumGuiApp {
         }
 
         self.sync_numpad_capture_keys(frame);
+        #[cfg(feature = "gamepad")]
+        self.poll_gamepad(&ctx);
         self.handle_global_input(&ctx, frame);
 
         if self.close_requested {
@@ -3558,6 +4285,11 @@ impl eframe::App for VellumGuiApp {
             .exact_size(30.0)
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
+                    // Flat toolbar: no resting chip background on the zone
+                    // toggles / Windows menu, hover highlight only. Scoped to
+                    // this row; the dropdown menus keep normal visuals.
+                    ui.visuals_mut().widgets.inactive.weak_bg_fill =
+                        egui::Color32::TRANSPARENT;
                     ui.heading("VellumFE GUI");
                     let connection_text = if self.app_core.game_state.connected {
                         RichText::new("Connected")
@@ -3972,20 +4704,12 @@ impl eframe::App for VellumGuiApp {
                 self.hide_tab(key);
             }
         }
-        if !window_additions.is_empty() {
-            for name in window_additions {
-                if !self
-                    .app_core
-                    .ui_state
-                    .pending_window_additions
-                    .contains(&name)
-                {
-                    self.app_core.ui_state.pending_window_additions.push(name);
-                }
-            }
-            let (layout_width, layout_height) = self.core_layout_size;
-            self.app_core
-                .process_pending_window_additions(layout_width, layout_height);
+        // Same path as the popup menu's add-window items: it resolves the
+        // auto-generated names custom templates get (the core pending-queue
+        // lookup misses those and silently adds nothing) and drops blank
+        // `*_custom` widgets straight into the window editor.
+        for name in window_additions {
+            self.add_window_from_template(&name);
         }
         for (key, zone) in zone_assignments {
             self.set_tab_zone(key, zone);
@@ -4001,6 +4725,9 @@ impl eframe::App for VellumGuiApp {
                 self.window_context_menu_just_opened = true;
             }
         }
+        for name in std::mem::take(&mut zone_actions.webui_closes) {
+            self.close_webui_window(&name);
+        }
         for click in zone_actions.link_clicks {
             self.handle_link_click(click, None);
         }
@@ -4009,6 +4736,11 @@ impl eframe::App for VellumGuiApp {
         }
         self.render_window_context_popup(&ctx);
         self.render_popup_menus(&ctx);
+        self.render_interact_overlay(&ctx);
+        #[cfg(feature = "gamepad")]
+        self.render_controller_wheel(&ctx);
+        #[cfg(feature = "gamepad")]
+        self.render_controller_overlay(&ctx);
         self.render_injuries_popup(&ctx);
         self.render_editors(&ctx);
         self.render_server_dialog(&ctx);
@@ -4032,10 +4764,11 @@ impl eframe::App for VellumGuiApp {
                 continue;
             }
             match (&self.webui_endpoint, &self.webui_event_tx) {
-                (Some((port, token)), Some(event_tx)) if src.starts_with("/files/") => {
+                (Some((host, port, token)), Some(event_tx)) if src.starts_with("/files/") => {
                     self.webui_fetches_inflight.insert(src.clone());
                     crate::webui::fetch_image(
                         self._runtime.handle(),
+                        host.clone(),
                         *port,
                         token.clone(),
                         src,
@@ -4209,7 +4942,10 @@ pub fn run_native_gui(
 #[cfg(test)]
 mod tests {
     use super::widgets::parse_hex_color;
-    use super::{AppShortcut, GlobalDispatchTarget, GuiLinkDispatch, VellumGuiApp};
+    use super::{
+        AppShortcut, FontRef, GlobalDispatchTarget, GuiLinkDispatch, TabKey, TabSettings,
+        VellumGuiApp,
+    };
     use crate::config::{AppKeybinds, Config, KeyBindAction, MacroAction, TargetListConfig};
     use crate::core::state::{Creature, Player};
     use crate::data::{LinkData, SpanType, TextSegment};
@@ -4268,6 +5004,46 @@ mod tests {
             false,
         );
         assert!(matches!(target, Some(GlobalDispatchTarget::Macro(_))));
+    }
+
+    #[test]
+    fn test_global_dispatch_fires_core_action_binds() {
+        // f6 = "interact_mode" (and the TTS F-keys) are Action binds, not
+        // macros — they must dispatch globally in the GUI.
+        let key_event = KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE);
+        let mut keybind_map = HashMap::new();
+        keybind_map.insert(
+            key_event,
+            KeyBindAction::Action("interact_mode".to_string()),
+        );
+
+        let target = VellumGuiApp::resolve_global_dispatch_target(
+            key_event,
+            &keybind_map,
+            &AppKeybinds::default(),
+            false,
+        );
+        assert!(matches!(target, Some(GlobalDispatchTarget::Macro(_))));
+    }
+
+    #[test]
+    fn test_global_dispatch_leaves_widget_actions_to_the_gui() {
+        // esc = "clear_search" is widget-level: dispatching it globally
+        // would steal Esc from every editor and popup.
+        let key_event = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        let mut keybind_map = HashMap::new();
+        keybind_map.insert(
+            key_event,
+            KeyBindAction::Action("clear_search".to_string()),
+        );
+
+        let target = VellumGuiApp::resolve_global_dispatch_target(
+            key_event,
+            &keybind_map,
+            &AppKeybinds::default(),
+            false,
+        );
+        assert!(!matches!(target, Some(GlobalDispatchTarget::Macro(_))));
     }
 
     #[test]
@@ -4482,16 +5258,41 @@ mod tests {
     }
 
     #[test]
-    fn test_room_component_entries_trims_and_filters_empty() {
-        let component = vec![
-            vec![TextSegment::plain("  north  ")],
-            vec![TextSegment::plain(""), TextSegment::plain(" ")],
-            vec![TextSegment::plain("south")],
-        ];
+    fn test_room_line_from_links_builds_one_labeled_line() {
+        let lines = VellumGuiApp::room_line_from_links(
+            "Obvious exits: ",
+            ["north", "south"].iter().map(|dir| {
+                (
+                    dir.to_string(),
+                    Some(crate::data::LinkData {
+                        exist_id: "_direct_".to_string(),
+                        noun: dir.to_string(),
+                        text: dir.to_string(),
+                        coord: None,
+                    }),
+                )
+            }),
+        );
 
-        let entries = VellumGuiApp::room_component_entries(Some(&component));
+        assert_eq!(lines.len(), 1);
+        let texts: Vec<&str> = lines[0]
+            .segments
+            .iter()
+            .map(|s| s.text.as_str())
+            .collect();
+        assert_eq!(texts, vec!["Obvious exits: ", "north", ", ", "south"]);
+        assert!(lines[0].segments[1].link_data.is_some());
+        assert_eq!(
+            lines[0].segments[1].span_type,
+            crate::data::SpanType::Link
+        );
+        assert!(lines[0].segments[2].link_data.is_none());
+    }
 
-        assert_eq!(entries, vec!["north".to_string(), "south".to_string()]);
+    #[test]
+    fn test_room_line_from_links_empty_entries_yield_no_line() {
+        let lines = VellumGuiApp::room_line_from_links("Also here: ", std::iter::empty());
+        assert!(lines.is_empty());
     }
 
     #[test]
@@ -4605,5 +5406,186 @@ mod tests {
             &live_creature,
             &cfg
         ));
+    }
+
+    fn migration_test_layout() -> crate::config::Layout {
+        use crate::config::{BorderSides, CompassWidgetData, TextWidgetData, WindowBase, WindowDef};
+        let base = |name: &str| WindowBase {
+            name: name.to_string(),
+            row: crate::data::geometry::Row::new(0),
+            col: crate::data::geometry::Col::new(0),
+            rows: crate::data::geometry::Height::new(10),
+            cols: crate::data::geometry::Width::new(40),
+            show_border: true,
+            border_style: "single".to_string(),
+            border_sides: BorderSides::default(),
+            border_color: None,
+            show_title: true,
+            title: None,
+            title_position: "top-left".to_string(),
+            background_color: None,
+            text_color: None,
+            transparent_background: false,
+            locked: false,
+            min_rows: None,
+            max_rows: None,
+            min_cols: None,
+            max_cols: None,
+            visible: true,
+            content_align: None,
+            tts_speak: false,
+            text_size: None,
+            font_family: None,
+        };
+        crate::config::Layout {
+            windows: vec![
+                WindowDef::Text {
+                    base: base("main"),
+                    data: TextWidgetData {
+                        streams: vec!["main".to_string()],
+                        buffer_size: 100,
+                        wordwrap: true,
+                        show_timestamps: false,
+                        timestamp_position: None,
+                        compact: false,
+                    },
+                },
+                WindowDef::Compass {
+                    base: base("compass"),
+                    data: CompassWidgetData {
+                        active_color: None,
+                        inactive_color: None,
+                    },
+                },
+            ],
+            terminal_width: None,
+            terminal_height: None,
+            base_layout: None,
+            theme: None,
+            unknown_windows: Vec::new(),
+        }
+    }
+
+    fn migration_name_of(key: &TabKey) -> Option<String> {
+        match key {
+            TabKey::TextMain => Some("main".to_string()),
+            TabKey::Compass => Some("compass".to_string()),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn test_migrate_tab_settings_moves_values_onto_defs() {
+        let mut layout = migration_test_layout();
+        let mut settings = HashMap::new();
+        settings.insert(
+            TabKey::TextMain,
+            TabSettings {
+                text_size: Some(16.0),
+                font_primary: FontRef::Named("Fira Code".to_string()),
+                wrap_text: false,
+                ..Default::default()
+            },
+        );
+        // Compass has no wordwrap field: wrap stays a legacy GUI setting.
+        settings.insert(
+            TabKey::Compass,
+            TabSettings {
+                wrap_text: false,
+                ..Default::default()
+            },
+        );
+
+        let (layout_changed, gui_changed) = VellumGuiApp::migrate_tab_settings_to_layout(
+            &mut settings,
+            &mut layout,
+            migration_name_of,
+        );
+        assert!(layout_changed);
+        assert!(gui_changed);
+
+        assert_eq!(layout.windows[0].base().text_size, Some(16.0));
+        assert_eq!(
+            layout.windows[0].base().font_family.as_deref(),
+            Some("Fira Code")
+        );
+        let crate::config::WindowDef::Text { data, .. } = &layout.windows[0] else {
+            panic!("main window should be a text def");
+        };
+        assert!(!data.wordwrap);
+
+        let migrated = settings.get(&TabKey::TextMain).unwrap();
+        assert_eq!(migrated.text_size, None);
+        assert!(matches!(migrated.font_primary, FontRef::SystemDefault));
+        assert!(migrated.wrap_text);
+
+        // Compass: nothing moved onto the def; legacy wrap preserved.
+        assert_eq!(layout.windows[1].base().text_size, None);
+        assert!(!settings.get(&TabKey::Compass).unwrap().wrap_text);
+
+        // Idempotent: a second run changes nothing.
+        let (layout_changed, gui_changed) = VellumGuiApp::migrate_tab_settings_to_layout(
+            &mut settings,
+            &mut layout,
+            migration_name_of,
+        );
+        assert!(!layout_changed);
+        assert!(!gui_changed);
+    }
+
+    #[test]
+    fn test_migrate_tab_settings_existing_def_value_wins() {
+        let mut layout = migration_test_layout();
+        layout.windows[0].base_mut().text_size = Some(20.0);
+        layout.windows[0].base_mut().font_family = Some("Consolas".to_string());
+
+        let mut settings = HashMap::new();
+        settings.insert(
+            TabKey::TextMain,
+            TabSettings {
+                text_size: Some(16.0),
+                font_primary: FontRef::Named("Fira Code".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let (layout_changed, gui_changed) = VellumGuiApp::migrate_tab_settings_to_layout(
+            &mut settings,
+            &mut layout,
+            migration_name_of,
+        );
+        assert!(!layout_changed);
+        // The legacy fields still empty out so they stop shadowing the def.
+        assert!(gui_changed);
+        assert_eq!(layout.windows[0].base().text_size, Some(20.0));
+        assert_eq!(
+            layout.windows[0].base().font_family.as_deref(),
+            Some("Consolas")
+        );
+        let migrated = settings.get(&TabKey::TextMain).unwrap();
+        assert_eq!(migrated.text_size, None);
+        assert!(matches!(migrated.font_primary, FontRef::SystemDefault));
+    }
+
+    #[test]
+    fn test_migrate_tab_settings_ignores_unmapped_tabs() {
+        let mut layout = migration_test_layout();
+        let mut settings = HashMap::new();
+        settings.insert(
+            TabKey::Vitals,
+            TabSettings {
+                text_size: Some(16.0),
+                ..Default::default()
+            },
+        );
+
+        let (layout_changed, gui_changed) = VellumGuiApp::migrate_tab_settings_to_layout(
+            &mut settings,
+            &mut layout,
+            migration_name_of,
+        );
+        assert!(!layout_changed);
+        assert!(!gui_changed);
+        assert_eq!(settings.get(&TabKey::Vitals).unwrap().text_size, Some(16.0));
     }
 }

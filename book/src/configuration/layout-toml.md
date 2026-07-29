@@ -47,10 +47,14 @@ cols = 120
 | `title` | string | - | Custom title |
 | `show_title` | bool | `true` | Show title in border |
 | `title_position` | string | `"top-left"` | Where the title sits on the border |
-| `buffer_size` | integer | 1000 | Lines to keep (text windows) |
+| `buffer_size` | integer | 10000 | Lines to keep (text windows) |
 | `background_color` | string | - | Background color |
 | `text_color` | string | - | Default text color |
 | `transparent_background` | bool | `false` | See-through background |
+| `text_size` | float | - | Per-window font point size (GUI) |
+| `font_family` | string | - | Per-window font (GUI) |
+| `content_align` | string | - | Content alignment override |
+| `tts_speak` | bool | `false` | Speak new lines routed here ([TTS](./config-toml.md#text-to-speech)) |
 
 ### Size Constraints
 
@@ -75,6 +79,7 @@ widget_type = "text"
 streams = ["main"]              # Streams to display
 buffer_size = 10000
 compact = false                 # Remove blank lines
+wordwrap = true                 # Wrap long lines (also on inventory/tabbed)
 ```
 
 ### Tabbed Text
