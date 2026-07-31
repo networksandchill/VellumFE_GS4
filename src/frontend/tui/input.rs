@@ -79,6 +79,60 @@ impl TuiFrontend {
         }
     }
 
+    /// Apply a spell-color form result to the config and persist. Single
+    /// source for both spell-color-form dispatch paths (action-routed and
+    /// raw-key), so Save/Delete behave identically and can't drift. Save
+    /// resolves palette names to hex, then REPLACES the edited entry in place
+    /// (`edit_index`) or appends a new one — the old code always pushed, so
+    /// editing a range left a duplicate behind.
+    fn handle_spell_color_form_result(
+        &mut self,
+        app_core: &mut crate::core::AppCore,
+        result: crate::frontend::tui::spell_color_form::SpellColorFormResult,
+    ) {
+        use crate::frontend::tui::spell_color_form::SpellColorFormResult;
+        match result {
+            SpellColorFormResult::Save { mut range, edit_index } => {
+                // Resolve palette color names to hex codes.
+                range.color = app_core.config.resolve_palette_color(&range.color);
+                if let Some(ref bar) = range.bar_color {
+                    range.bar_color = Some(app_core.config.resolve_palette_color(bar));
+                }
+                if let Some(ref text) = range.text_color {
+                    range.text_color = Some(app_core.config.resolve_palette_color(text));
+                }
+                if let Some(ref bg) = range.bg_color {
+                    range.bg_color = Some(app_core.config.resolve_palette_color(bg));
+                }
+
+                let spell_colors = &mut app_core.config.colors.spell_colors;
+                match edit_index {
+                    Some(index) if index < spell_colors.len() => {
+                        spell_colors[index] = range;
+                        tracing::info!("Updated spell color range {}", index);
+                    }
+                    // Missing/out-of-range edit index falls back to append so
+                    // the user's edit is never silently lost.
+                    _ => {
+                        spell_colors.push(range);
+                        tracing::info!("Saved spell color range");
+                    }
+                }
+                Self::persist_colors(app_core);
+            }
+            SpellColorFormResult::Delete(index) => {
+                if index < app_core.config.colors.spell_colors.len() {
+                    app_core.config.colors.spell_colors.remove(index);
+                    Self::persist_colors(app_core);
+                    tracing::info!("Deleted spell color range");
+                }
+            }
+            SpellColorFormResult::Cancel => {}
+        }
+        self.spell_color_form = None;
+        app_core.ui_state.input_mode = crate::data::ui_state::InputMode::Normal;
+    }
+
     /// Apply an inline `.uicolors` edit back onto the color config. Entries
     /// are addressed the same way the browser builds them: category "UI"
     /// (named UiColors fields), "PRESETS" (preset map key), or "PROMPT"
@@ -1140,6 +1194,11 @@ impl TuiFrontend {
                         let (cmd, should_close) = dialog_state.activate_button(index);
                         command_to_send = cmd;
                         close_dialog = should_close;
+                    } else if let Some(index) = dialog::hit_test_dropdown(&layout, *x, *y) {
+                        // Click-to-cycle: advance the dropdown and fire its
+                        // command (resolved through %id% substitution).
+                        Self::set_dialog_focus(dialog_state, None);
+                        command_to_send = dialog_state.cycle_dropdown(index);
                     }
                     app_core.needs_render = true;
                 }
@@ -1289,6 +1348,18 @@ impl TuiFrontend {
                             } else {
                                 tracing::warn!("No items for menu submenu: {}", submenu_name);
                             }
+                        } else if let Some(name) = command.strip_prefix("__TOGGLE_WINDOW__") {
+                            // Windows list: flip this window's show/hide and
+                            // close the menu (U3, keyed on window name).
+                            let name = name.to_string();
+                            app_core.toggle_known_window(&name);
+                            app_core.ui_state.popup_menu = None;
+                            app_core.ui_state.submenu = None;
+                            app_core.ui_state.nested_submenu = None;
+                            app_core.ui_state.deep_submenu = None;
+                            app_core.ui_state.input_mode = InputMode::Normal;
+                            app_core.needs_render = true;
+                            return Ok((true, None));
                         } else if let Some(category) = command.strip_prefix("__SUBMENU__") {
                             // Context menu or .menu submenu
                             // Try build_submenu first (for .menu categories)
@@ -1975,9 +2046,11 @@ impl TuiFrontend {
                                     if let Some(target_link) = self.link_at_position(name, *x, *y, window_rect) {
                                         drop_target_id = Some(target_link.exist_id);
                                     } else {
-                                        // Fallback: use the window's container ID
-                                        if let Some(container_data) = app_core.game_state.container_cache.find_by_title(container_title) {
-                                            drop_target_id = Some(container_data.id.clone());
+                                        // Fallback: the window's container as a
+                                        // game-command target (command_target is
+                                        // stow-correct; plain id would be "#stow").
+                                        if let Some(container_data) = app_core.game_state.objects.find_container(container_title) {
+                                            drop_target_id = Some(container_data.command_target());
                                         }
                                     }
                                     break;  // Container window handled
@@ -2373,6 +2446,7 @@ impl TuiFrontend {
                                         name, pattern,
                                     );
                                     form.set_scope(is_global);
+                                    form.set_rumble_options(app_core.config.controller_rumble.pattern_names());
                                     self.highlight_form = Some(form);
                                     app_core.ui_state.input_mode = InputMode::HighlightForm;
                                 }
@@ -2380,9 +2454,10 @@ impl TuiFrontend {
                         }
                         crate::core::menu_actions::MenuAction::New
                         | crate::core::menu_actions::MenuAction::Add => {
-                            self.highlight_form = Some(
-                                crate::frontend::tui::highlight_form::HighlightFormWidget::new(),
-                            );
+                            let mut form =
+                                crate::frontend::tui::highlight_form::HighlightFormWidget::new();
+                            form.set_rumble_options(app_core.config.controller_rumble.pattern_names());
+                            self.highlight_form = Some(form);
                             app_core.ui_state.input_mode = InputMode::HighlightForm;
                         }
                         crate::core::menu_actions::MenuAction::Delete => {
@@ -3689,44 +3764,7 @@ impl TuiFrontend {
                         | crate::core::menu_actions::MenuAction::Save
                         | crate::core::menu_actions::MenuAction::Delete => {
                             if let Some(result) = form.handle_action(action.clone()) {
-                                match result {
-                                    crate::frontend::tui::spell_color_form::SpellColorFormResult::Save(
-                                        mut spell_color,
-                                    ) => {
-                                        // Resolve palette color names to hex codes
-                                        spell_color.color = app_core.config.resolve_palette_color(&spell_color.color);
-                                        if let Some(ref bar) = spell_color.bar_color {
-                                            spell_color.bar_color = Some(app_core.config.resolve_palette_color(bar));
-                                        }
-                                        if let Some(ref text) = spell_color.text_color {
-                                            spell_color.text_color = Some(app_core.config.resolve_palette_color(text));
-                                        }
-                                        if let Some(ref bg) = spell_color.bg_color {
-                                            spell_color.bg_color = Some(app_core.config.resolve_palette_color(bg));
-                                        }
-
-                                        app_core.config.colors.spell_colors.push(spell_color);
-                                        Self::persist_colors(app_core);
-                                        self.spell_color_form = None;
-                                        app_core.ui_state.input_mode = InputMode::Normal;
-                                        tracing::info!("Saved spell color range");
-                                    }
-                                    crate::frontend::tui::spell_color_form::SpellColorFormResult::Delete(
-                                        index,
-                                    ) => {
-                                        if index < app_core.config.colors.spell_colors.len() {
-                                            app_core.config.colors.spell_colors.remove(index);
-                                            Self::persist_colors(app_core);
-                                            tracing::info!("Deleted spell color range");
-                                        }
-                                        self.spell_color_form = None;
-                                        app_core.ui_state.input_mode = InputMode::Normal;
-                                    }
-                                    crate::frontend::tui::spell_color_form::SpellColorFormResult::Cancel => {
-                                        self.spell_color_form = None;
-                                        app_core.ui_state.input_mode = InputMode::Normal;
-                                    }
-                                }
+                                self.handle_spell_color_form_result(app_core, result);
                             }
                         }
                         _ => {
@@ -3735,43 +3773,91 @@ impl TuiFrontend {
                             let ct_mods = crossterm_bridge::to_crossterm_modifiers(modifiers);
                             let key = crossterm::event::KeyEvent::new(ct_code, ct_mods);
                             if let Some(result) = form.input(key) {
-                                match result {
-                                    crate::frontend::tui::spell_color_form::SpellColorFormResult::Save(
-                                        mut spell_color,
-                                    ) => {
-                                        // Resolve palette color names to hex codes
-                                        spell_color.color = app_core.config.resolve_palette_color(&spell_color.color);
-                                        if let Some(ref bar) = spell_color.bar_color {
-                                            spell_color.bar_color = Some(app_core.config.resolve_palette_color(bar));
-                                        }
-                                        if let Some(ref text) = spell_color.text_color {
-                                            spell_color.text_color = Some(app_core.config.resolve_palette_color(text));
-                                        }
-                                        if let Some(ref bg) = spell_color.bg_color {
-                                            spell_color.bg_color = Some(app_core.config.resolve_palette_color(bg));
-                                        }
+                                self.handle_spell_color_form_result(app_core, result);
+                            }
+                        }
+                    }
+                    app_core.needs_render = true;
+                }
+                return Ok(None);
+            }
+            InputMode::MenuKeybindEditor => {
+                if let Some(ref mut editor) = self.menu_keybind_editor {
+                    // While capturing, the next key press IS the binding — take
+                    // it verbatim (including Esc/Enter, which are valid menu
+                    // keys) rather than routing it as a menu action.
+                    if editor.is_capturing() {
+                        let key_event = crate::data::input::KeyEvent { code, modifiers };
+                        let key = crate::core::menu_actions::key_event_to_string(key_event);
+                        editor.apply_captured_key(key);
+                        app_core.needs_render = true;
+                        return Ok(None);
+                    }
 
-                                        app_core.config.colors.spell_colors.push(spell_color);
-                                        Self::persist_colors(app_core);
-                                        self.spell_color_form = None;
+                    let key_event = crate::data::input::KeyEvent { code, modifiers };
+                    let action = input_router::route_input(
+                        &key_event,
+                        &app_core.ui_state.input_mode,
+                        &app_core.config,
+                    );
+                    match action {
+                        crate::core::menu_actions::MenuAction::NavigateUp
+                        | crate::core::menu_actions::MenuAction::PreviousItem => {
+                            editor.navigate_up()
+                        }
+                        crate::core::menu_actions::MenuAction::NavigateDown
+                        | crate::core::menu_actions::MenuAction::NextItem => {
+                            editor.navigate_down()
+                        }
+                        crate::core::menu_actions::MenuAction::Select
+                        | crate::core::menu_actions::MenuAction::Edit => editor.arm_capture(),
+                        crate::core::menu_actions::MenuAction::Cancel => {
+                            self.menu_keybind_editor = None;
+                            app_core.ui_state.input_mode = InputMode::Normal;
+                        }
+                        crate::core::menu_actions::MenuAction::Save => {
+                            // Validate, then persist to the chosen scope.
+                            let validation = crate::config::menu_keybind_validator::validate_menu_keybinds(&editor.working);
+                            if validation.has_errors() {
+                                let first = validation
+                                    .errors()
+                                    .first()
+                                    .map(|e| e.message())
+                                    .unwrap_or_default();
+                                editor.set_status(format!("Cannot save: {}", first));
+                            } else {
+                                let character = app_core.config.character.clone();
+                                match crate::config::Config::save_menu_keybinds(
+                                    &editor.working,
+                                    editor.is_global,
+                                    character.as_deref(),
+                                ) {
+                                    Ok(()) => {
+                                        app_core.config.menu_keybinds = editor.working.clone();
+                                        self.menu_keybind_editor = None;
                                         app_core.ui_state.input_mode = InputMode::Normal;
-                                        tracing::info!("Saved spell color range");
+                                        app_core.add_system_message("Menu keybinds saved.");
                                     }
-                                    crate::frontend::tui::spell_color_form::SpellColorFormResult::Delete(
-                                        index,
-                                    ) => {
-                                        if index < app_core.config.colors.spell_colors.len() {
-                                            app_core.config.colors.spell_colors.remove(index);
-                                            Self::persist_colors(app_core);
-                                            tracing::info!("Deleted spell color range");
-                                        }
-                                        self.spell_color_form = None;
-                                        app_core.ui_state.input_mode = InputMode::Normal;
+                                    Err(err) => editor
+                                        .set_status(format!("Save failed: {}", err)),
+                                }
+                            }
+                        }
+                        _ => {
+                            // Plain 'd' resets the selected row to default; 'g'
+                            // toggles scope. These aren't menu-nav actions, so
+                            // they fall through to here.
+                            if modifiers.is_empty() {
+                                match code {
+                                    crate::data::input::KeyCode::Char('d')
+                                    | crate::data::input::KeyCode::Char('D') => {
+                                        editor.reset_selected_to_default()
                                     }
-                                    crate::frontend::tui::spell_color_form::SpellColorFormResult::Cancel => {
-                                        self.spell_color_form = None;
-                                        app_core.ui_state.input_mode = InputMode::Normal;
+                                    crate::data::input::KeyCode::Char('g')
+                                    | crate::data::input::KeyCode::Char('G') => {
+                                        editor.toggle_scope()
                                     }
+                                    _ => {}
                                 }
                             }
                         }
@@ -4209,7 +4295,7 @@ impl TuiFrontend {
         app_core: &mut crate::core::AppCore,
         handle_menu_action_fn: impl Fn(&mut crate::core::AppCore, &mut Self, &str) -> Result<()>,
     ) -> Result<Option<String>> {
-        
+
         use crate::data::ui_state::{InputMode, PopupMenu};
 
         if let Some(submenu_name) = command.strip_prefix("menu:") {
@@ -4220,6 +4306,7 @@ impl TuiFrontend {
                 "widgetpicker" | "addwindow" => app_core.build_add_window_menu(),
                 "hidewindow" => app_core.build_hide_window_menu(),
                 "editwindow" => app_core.build_edit_window_menu(),
+                "knownwindows" => app_core.build_known_windows_menu(),
                 _ => {
                     app_core.ui_state.popup_menu = None;
                     app_core.ui_state.input_mode = InputMode::Normal;
@@ -4362,7 +4449,7 @@ impl TuiFrontend {
                 .layout
                 .windows
                 .iter()
-                .filter(|w| w.base().visible && matches!(w.widget_type(), "indicator"))
+                .filter(|w| w.base().visibility.is_shown() && matches!(w.widget_type(), "indicator"))
                 .map(|w| w.name().to_string())
                 .collect::<Vec<String>>();
             let items = app_core.build_indicator_hide_menu(&indicators);
@@ -4539,6 +4626,17 @@ impl TuiFrontend {
                 // Regular window - just hide it
                 app_core.hide_window(window_name);
             }
+            app_core.needs_render = true;
+        } else if let Some(name) = command.strip_prefix("__TOGGLE_WINDOW__") {
+            // Windows list (keyboard Enter): flip this window's show/hide
+            // and close the menu (U3, keyed on window name).
+            let name = name.to_string();
+            app_core.toggle_known_window(&name);
+            app_core.ui_state.popup_menu = None;
+            app_core.ui_state.submenu = None;
+            app_core.ui_state.nested_submenu = None;
+            app_core.ui_state.deep_submenu = None;
+            app_core.ui_state.input_mode = InputMode::Normal;
             app_core.needs_render = true;
         } else if command == "__PERF_MENU_CLOSE__" {
             // Close the perf metrics menu

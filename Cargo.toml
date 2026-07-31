@@ -3,7 +3,7 @@ members = ["android/rust", "ios/rust"]
 
 [package]
 name = "vellum-fe"
-version = "0.3.0-beta.16"
+version = "0.3.0-beta.18"
 edition = "2021"
 authors = ["Nisugi"]
 description = "Modern, high-performance multi-frontend (TUI/GUI) client for GemStone IV"
@@ -41,6 +41,7 @@ dirs = "5"
 
 # Text processing
 regex = "1"
+fancy-regex = "0.14"  # Lookaround support for Ruby-authored gameobj-data regexes
 aho-corasick = "1"  # Fast literal string matching for highlights
 emojis = "0.9.0"  # Embedded gemoji data for :grin:-style shortcode expansion
 quick-xml = "0.36"  # XML parsing
@@ -98,6 +99,11 @@ chrono = "0.4"
 # Clipboard
 arboard = { version = "3", optional = true }
 base64 = "0.22.1"
+# SHA1 for the asset-manager (jinx) digest: repositories publish
+# base64(SHA1(bytes)) per asset (Jinx calls the field "md5"); we recompute
+# and compare byte-for-byte with Ruby's Digest::SHA1.base64digest. Already
+# in the lock via tokio-tungstenite's handshake — pinned here for direct use.
+sha1 = "0.10"
 sysinfo = { version = "0.30", optional = true }
 
 # URL opening (for LaunchURL)

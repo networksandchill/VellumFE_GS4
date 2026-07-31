@@ -85,6 +85,21 @@ pub struct MessageProcessor {
 
     /// Accumulated styled text for current stream
     current_segments: Vec<TextSegment>,
+    /// Extra lines a transform (sorter) generated from the current line;
+    /// the flush wrapper re-feeds them through the normal pipeline.
+    injected_lines: std::collections::VecDeque<Vec<TextSegment>>,
+    /// Item classifier for the sorter transform, lazily resolved through
+    /// the data pack. Cleared by `.data reload`.
+    sorter_gameobj: Option<std::sync::Arc<crate::core::gameobj_data::GameObjData>>,
+    /// Active INVENTORY FULL scan (marked/registered status → registry).
+    /// While capturing, reply lines are squelched and parsed; the prompt
+    /// finalizes it into `game_state.objects`.
+    inv_scan: crate::core::game_objects::inv_scan::InvScan,
+    /// Container contents extracted from a main-stream look line during
+    /// flush (which lacks `game_state`); drained into the registry by the
+    /// caller in `process_element`. (container_id, items)
+    pending_container_ingest:
+        Option<(String, Vec<crate::core::game_objects::GameItem>)>,
 
     /// Track if chunk (since last prompt) has main stream text
     chunk_has_main_text: bool,
@@ -253,6 +268,10 @@ impl MessageProcessor {
             highlight_engine,
             current_stream: String::from("main"),
             current_segments: Vec::new(),
+            injected_lines: std::collections::VecDeque::new(),
+            sorter_gameobj: None,
+            inv_scan: Default::default(),
+            pending_container_ingest: None,
             remote: None,
             chunk_has_main_text: false,
             chunk_has_silent_updates: false,
@@ -431,6 +450,16 @@ impl MessageProcessor {
         match element {
             ParsedElement::StreamWindow { id, subtitle, title } => {
                 self.note_seen_stream(id, title.as_deref());
+                // U3: record the stream as a window discovery for AppCore to
+                // register as a bound, Hidden-by-default layout entry (the
+                // processor can't reach the layout). Replaces the Stream
+                // offer.
+                ui_state.pending_window_discoveries.push(crate::data::WindowDiscovery {
+                    id: id.clone(),
+                    title: title.clone().unwrap_or_else(|| id.clone()),
+                    kind: crate::data::WindowDiscoveryKind::Stream,
+                    save: false,
+                });
                 self.handle_stream_window(
                     id,
                     subtitle.as_deref(),
@@ -561,6 +590,14 @@ impl MessageProcessor {
 
                 // Flush inventory buffer if we're leaving inv stream
                 if self.current_stream == "inv" {
+                    // Worn items into the registry from the same buffer the
+                    // window uses (each line's first <a> link = one worn
+                    // item; the "Your worn items are:" header and blank
+                    // lines carry no link and are skipped). Runs regardless
+                    // of whether an inventory window exists.
+                    game_state
+                        .objects
+                        .set_worn_from_lines(&self.inventory_buffer);
                     self.flush_inventory_buffer(ui_state);
                 }
 
@@ -675,6 +712,18 @@ impl MessageProcessor {
             ParsedElement::Prompt { time, text } => {
                 // Finish current stream before prompt
                 self.flush_current_stream_with_tts(ui_state, tts_manager.as_deref_mut());
+
+                // An INVENTORY FULL scan ends at the prompt: write the
+                // collected mark/register statuses into the registry.
+                if self.inv_scan.is_capturing() {
+                    for (id, status) in self.inv_scan.finish() {
+                        game_state.objects.set_status(id, status);
+                    }
+                }
+
+                // Container contents extracted from a main-stream look line
+                // during flush (which lacks game_state) land here.
+                self.drain_pending_container_ingest(game_state);
 
                 // Flush perception buffer on prompt (after all entries have accumulated)
                 if !self.perception_buffer.is_empty() {
@@ -1319,15 +1368,12 @@ impl MessageProcessor {
                 self.chunk_has_silent_updates = true;
                 tracing::debug!("DialogOpen received: id={}, title={:?}, save={}", id, title, save);
 
-                // Check blocklist first
-                if self
-                    .config
-                    .ui
-                    .open_dialog_blocklist
-                    .iter()
-                    .any(|blocked| blocked.eq_ignore_ascii_case(id))
-                {
-                    tracing::debug!("DialogOpen blocked: id={}", id);
+                // U3: dialogs reaching here are non-resident (resident ones
+                // are mined into panels). Blocklisted ones (bank-style that
+                // the user suppresses) don't pop up; the store still ingests
+                // their data so the window can be shown later.
+                if !Self::dialog_should_popup(ui_state, id) {
+                    tracing::debug!("DialogOpen suppressed (blocklisted): id={}", id);
                     return;
                 }
 
@@ -1353,13 +1399,15 @@ impl MessageProcessor {
                 // Map dialog ID to template name (they may differ, e.g., "expr" -> "gs4_experience")
                 let template_name = Config::dialog_id_to_template(id);
 
-                // If a widget template exists for this dialog, add it to layout instead of popup
+                // If a widget template exists for this dialog, add it to layout
+                // instead of a popup. Queue the DIALOG ID (not the template
+                // name) so process_pending_window_additions can tag the created
+                // window with its binding — the U2 identity that ties the feed
+                // to the placed window regardless of its display name.
                 if Config::get_window_template(template_name).is_some() {
                     tracing::debug!("DialogOpen redirected to widget: id={} -> template={}", id, template_name);
-                    // Queue the window to be added to layout (use template name, not dialog ID)
-                    let template_owned = template_name.to_string();
-                    if !ui_state.pending_window_additions.contains(&template_owned) {
-                        ui_state.pending_window_additions.push(template_owned);
+                    if !ui_state.pending_window_additions.contains(id) {
+                        ui_state.pending_window_additions.push(id.clone());
                     }
                     return;
                 }
@@ -1386,84 +1434,130 @@ impl MessageProcessor {
                     (None, None)
                 };
 
-                // No template - show as popup dialog
-                ui_state.active_dialog = Some(DialogState {
-                    id: id.clone(),
-                    title: title.clone(),
-                    buttons: Vec::new(),
-                    selected: 0,
-                    fields: Vec::new(),
-                    labels: Vec::new(),
-                    focused_field: None,
-                    progress_bars: Vec::new(),
-                    display_labels: Vec::new(),
-                    position,
-                    size,
-                    save_position: *save,
-                });
-                ui_state.input_mode = InputMode::Dialog;
-                ui_state.popup_menu = None;
-                ui_state.submenu = None;
-                ui_state.nested_submenu = None;
-                ui_state.deep_submenu = None;
+                // No template - show as popup dialog. Seed the store (so
+                // re-showing after hide works) preserving any controls the
+                // dialog already accumulated, then set the title/geometry.
+                {
+                    let dialog = ui_state.dialog_slot_mut(id);
+                    dialog.title = title.clone();
+                    dialog.position = position;
+                    dialog.size = size;
+                    dialog.save_position = *save;
+                }
+                ui_state.show_dialog_from_store(id);
+                if let Some(dialog) = ui_state.active_dialog.as_mut() {
+                    dialog.position = position;
+                    dialog.size = size;
+                    dialog.save_position = *save;
+                }
             }
             ParsedElement::DialogButtons { id, clear, buttons } => {
                 self.chunk_has_silent_updates = true;
-                if self
-                    .config
-                    .ui
-                    .open_dialog_blocklist
-                    .iter()
-                    .any(|blocked| blocked.eq_ignore_ascii_case(id))
-                {
-                    return;
+                // Always INGEST into the store (even for hidden dialogs);
+                // policy only gates DISPLAY, synced below.
+                let show = Self::dialog_should_popup(ui_state, id);
+                let dialog = ui_state.dialog_slot_mut(id);
+                if *clear {
+                    dialog.buttons.clear();
                 }
-
-                let needs_new_dialog = ui_state
-                    .active_dialog
-                    .as_ref()
-                    .map(|dialog| dialog.id != *id)
-                    .unwrap_or(true);
-                if needs_new_dialog {
-                    // Try to load saved position for this dialog
-                    let saved = self.saved_dialog_positions.dialogs.get(id);
-                    let (position, size, save_position) = if let Some(p) = saved {
-                        (Some((p.x, p.y)), p.width.zip(p.height), true)
-                    } else {
-                        (None, None, false)
-                    };
-                    ui_state.active_dialog = Some(DialogState {
-                        id: id.clone(),
-                        title: None,
-                        buttons: Vec::new(),
-                        selected: 0,
-                        fields: Vec::new(),
-                        labels: Vec::new(),
-                        focused_field: None,
-                        progress_bars: Vec::new(),
-                        display_labels: Vec::new(),
-                        position,
-                        size,
-                        save_position,
-                    });
-                    ui_state.input_mode = InputMode::Dialog;
-                    ui_state.popup_menu = None;
-                    ui_state.submenu = None;
-                    ui_state.nested_submenu = None;
-                    ui_state.deep_submenu = None;
-                }
-
-                if let Some(dialog) = ui_state.active_dialog.as_mut() {
-                    if dialog.id == *id {
-                        if *clear {
-                            dialog.buttons.clear();
-                        }
-                        dialog.buttons.extend(buttons.clone());
-                        if dialog.selected >= dialog.buttons.len() {
-                            dialog.selected = 0;
-                        }
+                // Re-sent controls REPLACE their same-id entry — blind
+                // extend piled up duplicate buttons on every dialogData
+                // refresh (seen live: combat's target/attack repeating).
+                // Id-less buttons still append.
+                for button in buttons {
+                    let existing = (!button.id.is_empty())
+                        .then(|| dialog.buttons.iter_mut().find(|b| b.id == button.id))
+                        .flatten();
+                    match existing {
+                        Some(slot) => *slot = button.clone(),
+                        None => dialog.buttons.push(button.clone()),
                     }
                 }
+                if dialog.selected >= dialog.buttons.len() {
+                    dialog.selected = 0;
+                }
+                self.sync_shown_dialog(ui_state, id, show);
+            }
+            ParsedElement::DialogDropDowns { id, clear, dropdowns } => {
+                self.chunk_has_silent_updates = true;
+                let show = Self::dialog_should_popup(ui_state, id);
+                let dialog = ui_state.dialog_slot_mut(id);
+                if *clear {
+                    dialog.dropdowns.clear();
+                }
+                for dropdown in dropdowns {
+                    match dialog.dropdowns.iter_mut().find(|d| d.id == dropdown.id) {
+                        Some(slot) => *slot = dropdown.clone(),
+                        None => dialog.dropdowns.push(dropdown.clone()),
+                    }
+                }
+                self.sync_shown_dialog(ui_state, id, show);
+            }
+            ParsedElement::DialogPanelOpen { id, title, save } => {
+                self.chunk_has_silent_updates = true;
+                // Resident dialogs that already have a dedicated widget
+                // (Buffs/Debuffs/Cooldowns/injuries/encum/expr/stance/...)
+                // are mined into those panels — don't offer them as generic
+                // dialog panels too. Only ids WITHOUT a template become
+                // dockable dialog panels (combat, befriend, ...).
+                if Config::get_window_template(Config::dialog_id_to_template(id)).is_some() {
+                    return;
+                }
+                // U3: record the resident dialog as a DialogPanel discovery
+                // for AppCore to register as a bound, Hidden-by-default
+                // dockable-panel layout entry. Replaces the resident Dialog
+                // offer. Seed the store title so the panel renders when shown.
+                ui_state.pending_window_discoveries.push(crate::data::WindowDiscovery {
+                    id: id.clone(),
+                    title: title.clone().unwrap_or_else(|| id.clone()),
+                    kind: crate::data::WindowDiscoveryKind::DialogPanel,
+                    save: *save,
+                });
+                let dialog = ui_state.dialog_slot_mut(id);
+                if dialog.title.is_none() {
+                    dialog.title = title.clone();
+                }
+            }
+            ParsedElement::DialogControls {
+                id,
+                clear,
+                links,
+                images,
+                spinboxes,
+            } => {
+                self.chunk_has_silent_updates = true;
+                let show = Self::dialog_should_popup(ui_state, id);
+                let dialog = ui_state.dialog_slot_mut(id);
+                if *clear {
+                    dialog.links.clear();
+                    dialog.images.clear();
+                    dialog.spinboxes.clear();
+                }
+                for link in links {
+                    match dialog.links.iter_mut().find(|l| l.id == link.id) {
+                        Some(slot) => *slot = link.clone(),
+                        None => dialog.links.push(link.clone()),
+                    }
+                }
+                for image in images {
+                    match dialog.images.iter_mut().find(|i| i.id == image.id) {
+                        Some(slot) => *slot = image.clone(),
+                        None => dialog.images.push(image.clone()),
+                    }
+                }
+                for spinbox in spinboxes {
+                    match dialog.spinboxes.iter_mut().find(|s| s.id == spinbox.id) {
+                        // Preserve a user-edited value across re-sends: only
+                        // take the game's value if bounds changed.
+                        Some(slot) => {
+                            slot.min = spinbox.min;
+                            slot.max = spinbox.max;
+                            slot.layout = spinbox.layout.clone();
+                        }
+                        None => dialog.spinboxes.push(spinbox.clone()),
+                    }
+                }
+                self.sync_shown_dialog(ui_state, id, show);
             }
             ParsedElement::DialogFields {
                 id,
@@ -1472,134 +1566,88 @@ impl MessageProcessor {
                 labels,
             } => {
                 self.chunk_has_silent_updates = true;
-                if self
-                    .config
-                    .ui
-                    .open_dialog_blocklist
-                    .iter()
-                    .any(|blocked| blocked.eq_ignore_ascii_case(id))
-                {
-                    return;
+                let show = Self::dialog_should_popup(ui_state, id);
+                let dialog = ui_state.dialog_slot_mut(id);
+                if *clear {
+                    dialog.fields.clear();
+                    dialog.labels.clear();
+                    dialog.focused_field = None;
                 }
 
-                let needs_new_dialog = ui_state
-                    .active_dialog
-                    .as_ref()
-                    .map(|dialog| dialog.id != *id)
-                    .unwrap_or(true);
-                if needs_new_dialog {
-                    // Try to load saved position for this dialog
-                    let saved = self.saved_dialog_positions.dialogs.get(id);
-                    let (position, size, save_position) = if let Some(p) = saved {
-                        (Some((p.x, p.y)), p.width.zip(p.height), true)
-                    } else {
-                        (None, None, false)
-                    };
-                    ui_state.active_dialog = Some(DialogState {
-                        id: id.clone(),
-                        title: None,
-                        buttons: Vec::new(),
-                        selected: 0,
-                        fields: Vec::new(),
-                        labels: Vec::new(),
-                        focused_field: None,
-                        progress_bars: Vec::new(),
-                        display_labels: Vec::new(),
-                        position,
-                        size,
-                        save_position,
-                    });
-                    ui_state.input_mode = InputMode::Dialog;
-                    ui_state.popup_menu = None;
-                    ui_state.submenu = None;
-                    ui_state.nested_submenu = None;
-                    ui_state.deep_submenu = None;
-                }
+                if !labels.is_empty() {
+                    // Separate labels into:
+                    // - display_labels: standalone labels (not paired with any field)
+                    // - labels: labels that are paired with input fields
+                    //
+                    // A label is "paired" if its ID is a prefix of a field ID
+                    // e.g., "deposit" is paired with "depositAmount"
+                    let mut paired_labels = Vec::new();
+                    let mut standalone_labels = Vec::new();
 
-                if let Some(dialog) = ui_state.active_dialog.as_mut() {
-                    if dialog.id == *id {
-                        if *clear {
-                            dialog.fields.clear();
-                            dialog.labels.clear();
-                            dialog.focused_field = None;
-                        }
-
-                        if !labels.is_empty() {
-                            // Separate labels into:
-                            // - display_labels: standalone labels (not paired with any field)
-                            // - labels: labels that are paired with input fields
-                            //
-                            // A label is "paired" if its ID is a prefix of a field ID
-                            // e.g., "deposit" is paired with "depositAmount"
-                            let mut paired_labels = Vec::new();
-                            let mut standalone_labels = Vec::new();
-
-                            for label in labels.iter() {
-                                let is_paired = fields.iter().any(|field| {
-                                    field
-                                        .id
-                                        .to_lowercase()
-                                        .starts_with(&label.id.to_lowercase())
-                                });
-
-                                let dialog_label = crate::data::DialogLabel {
-                                    id: label.id.clone(),
-                                    value: label.value.clone(),
-                                };
-
-                                if is_paired {
-                                    paired_labels.push(dialog_label);
-                                } else {
-                                    standalone_labels.push(dialog_label);
-                                }
-                            }
-
-                            dialog.labels = paired_labels;
-                            dialog.display_labels = standalone_labels;
-                        }
-
-                        let mut focused_index = None;
-                        let mut new_fields = Vec::new();
-                        for (idx, field) in fields.iter().enumerate() {
-                            if field.focused {
-                                focused_index = Some(idx);
-                            }
-                            let existing = dialog.fields.iter().find(|f| f.id == field.id);
-                            let cursor = existing
-                                .map(|f| f.cursor.min(field.value.len()))
-                                .unwrap_or_else(|| field.value.len());
-                            new_fields.push(crate::data::DialogField {
-                                id: field.id.clone(),
-                                value: field.value.clone(),
-                                cursor,
-                                enter_button: field.enter_button.clone(),
-                                focused: field.focused,
-                            });
-                        }
-                        if !new_fields.is_empty() {
-                            dialog.fields = new_fields;
-                        }
-
-                        let fallback_focus = dialog
-                            .focused_field
-                            .filter(|idx| *idx < dialog.fields.len());
-                        let focused_field = focused_index.or(fallback_focus).or_else(|| {
-                            if dialog.fields.is_empty() {
-                                None
-                            } else {
-                                Some(0)
-                            }
+                    for label in labels.iter() {
+                        let is_paired = fields.iter().any(|field| {
+                            field
+                                .id
+                                .to_lowercase()
+                                .starts_with(&label.id.to_lowercase())
                         });
 
-                        dialog.focused_field = focused_field;
-                        for (idx, field) in dialog.fields.iter_mut().enumerate() {
-                            field.focused = dialog.focused_field == Some(idx);
-                            if field.cursor > field.value.len() {
-                                field.cursor = field.value.len();
-                            }
+                        let dialog_label = crate::data::DialogLabel {
+                            id: label.id.clone(),
+                            value: label.value.clone(),
+                        };
+
+                        if is_paired {
+                            paired_labels.push(dialog_label);
+                        } else {
+                            standalone_labels.push(dialog_label);
                         }
                     }
+
+                    dialog.labels = paired_labels;
+                    dialog.display_labels = standalone_labels;
                 }
+
+                let mut focused_index = None;
+                let mut new_fields = Vec::new();
+                for (idx, field) in fields.iter().enumerate() {
+                    if field.focused {
+                        focused_index = Some(idx);
+                    }
+                    let existing = dialog.fields.iter().find(|f| f.id == field.id);
+                    let cursor = existing
+                        .map(|f| f.cursor.min(field.value.len()))
+                        .unwrap_or_else(|| field.value.len());
+                    new_fields.push(crate::data::DialogField {
+                        id: field.id.clone(),
+                        value: field.value.clone(),
+                        cursor,
+                        enter_button: field.enter_button.clone(),
+                        focused: field.focused,
+                    });
+                }
+                if !new_fields.is_empty() {
+                    dialog.fields = new_fields;
+                }
+
+                let fallback_focus =
+                    dialog.focused_field.filter(|idx| *idx < dialog.fields.len());
+                let focused_field = focused_index.or(fallback_focus).or_else(|| {
+                    if dialog.fields.is_empty() {
+                        None
+                    } else {
+                        Some(0)
+                    }
+                });
+
+                dialog.focused_field = focused_field;
+                for (idx, field) in dialog.fields.iter_mut().enumerate() {
+                    field.focused = dialog.focused_field == Some(idx);
+                    if field.cursor > field.value.len() {
+                        field.cursor = field.value.len();
+                    }
+                }
+                self.sync_shown_dialog(ui_state, id, show);
             }
             ParsedElement::DialogProgressBars {
                 id,
@@ -1607,30 +1655,23 @@ impl MessageProcessor {
                 progress_bars,
             } => {
                 self.chunk_has_silent_updates = true;
-                if self
-                    .config
-                    .ui
-                    .open_dialog_blocklist
-                    .iter()
-                    .any(|blocked| blocked.eq_ignore_ascii_case(id))
-                {
-                    return;
+                let show = Self::dialog_should_popup(ui_state, id);
+                let dialog = ui_state.dialog_slot_mut(id);
+                if *clear {
+                    dialog.progress_bars.clear();
                 }
-
-                if let Some(dialog) = ui_state.active_dialog.as_mut() {
-                    if dialog.id == *id {
-                        if *clear {
-                            dialog.progress_bars.clear();
-                        }
-                        for pb in progress_bars {
-                            dialog.progress_bars.push(crate::data::DialogProgressBar {
-                                id: pb.id.clone(),
-                                value: pb.value,
-                                text: pb.text.clone(),
-                            });
-                        }
+                for pb in progress_bars {
+                    let bar = crate::data::DialogProgressBar {
+                        id: pb.id.clone(),
+                        value: pb.value,
+                        text: pb.text.clone(),
+                    };
+                    match dialog.progress_bars.iter_mut().find(|b| b.id == pb.id) {
+                        Some(slot) => *slot = bar,
+                        None => dialog.progress_bars.push(bar),
                     }
                 }
+                self.sync_shown_dialog(ui_state, id, show);
             }
             ParsedElement::DialogLabelList { id, clear, labels } => {
                 self.chunk_has_silent_updates = true;
@@ -1904,21 +1945,23 @@ impl MessageProcessor {
                     target_ids.len()
                 );
             }
-            ParsedElement::Container { id, title, .. } => {
+            ParsedElement::Container { id, title, target } => {
                 self.chunk_has_silent_updates = true; // Mark as silent update
 
-                // Register container in cache
-                game_state.container_cache.register_container(id.clone(), title.clone());
+                // Register the container in the registry (target is the
+                // game-command id, which differs from the stream id for stow).
+                game_state
+                    .objects
+                    .register_container(id.clone(), title.clone(), target.clone());
 
-                // Signal container for discovery mode (every LOOK IN triggers this)
-                // The runtime will check if a window already exists before creating
+                // Signal the sighting for the realize pass (every LOOK IN
+                // triggers this): the frontend tick auto-(re)opens the
+                // container window when the user has opted it in, and window
+                // creation itself skips already-open windows. U3: containers
+                // are ephemeral session windows managed via the unified list.
                 if !title.is_empty() {
                     self.newly_registered_container = Some((id.clone(), title.clone()));
-                    tracing::info!(
-                        "Container seen: id='{}', title='{}' (signaling for discovery)",
-                        id,
-                        title
-                    );
+                    tracing::debug!("Container seen: id='{}', title='{}'", id, title);
                 } else {
                     tracing::debug!("Registered container: id='{}', title='{}'", id, title);
                 }
@@ -1927,15 +1970,35 @@ impl MessageProcessor {
                 self.chunk_has_silent_updates = true; // Mark as silent update
 
                 // Clear container contents
-                game_state.container_cache.clear_container(id);
+                game_state.objects.clear_container(id);
 
                 tracing::debug!("Cleared container: id='{}'", id);
             }
             ParsedElement::ContainerItem { container_id, content } => {
                 self.chunk_has_silent_updates = true; // Mark as silent update
 
-                // Add item to container
-                game_state.container_cache.add_item(container_id, content.clone());
+                // Parse the raw <inv> line into a structured GameItem,
+                // skipping the container's own header line.
+                if let Some(container) = game_state.objects.container(container_id) {
+                    let target = container.command_target();
+                    if !crate::core::game_objects::parse::is_header_line(content, &target) {
+                        if let Some(item) =
+                            crate::core::game_objects::parse_anchor(content)
+                        {
+                            game_state.objects.add_container_item(container_id, item);
+                        }
+                    }
+                } else if let Some(item) =
+                    crate::core::game_objects::parse_anchor(content)
+                {
+                    // Item arrived before the <container> tag; register it
+                    // (auto-creates a title-less entry, same as the cache).
+                    // Header lines have their own anchor id == container id,
+                    // but with no container known yet we can't dedup that;
+                    // the header's noun is the container itself, harmless to
+                    // include and corrected on the next clear+refill.
+                    game_state.objects.add_container_item(container_id, item);
+                }
 
                 tracing::trace!("Added item to container '{}': {}", container_id,
                     if content.len() > 50 { format!("{}...", &content[..50]) } else { content.clone() });
@@ -1975,6 +2038,57 @@ impl MessageProcessor {
     /// stream to "room", causing room text to be discarded. The stream is reset on prompt.
     ///
     /// DragonRealms-specific - GemStone IV doesn't use streamWindow room.
+    /// Gate a `dialogData` element through the window-offer registry:
+    /// make sure the dialog id is offered (seeding a Hidden policy from
+    /// the config blocklist the first time it's seen, so dialogData-first
+    /// ids are still suppressed) and return whether it may be shown.
+    /// After ingesting a dialogData delta into the store, reflect it into
+    /// the visible `active_dialog` if this dialog should be shown. When
+    /// first materializing a shown dialog, seed its saved position/size.
+    /// Hidden dialogs stay in the store only. If the currently-shown
+    /// dialog is a *different* id, leave it be (one popup at a time).
+    fn sync_shown_dialog(&self, ui_state: &mut UiState, id: &str, show: bool) {
+        if !show {
+            return;
+        }
+        // Don't steal the screen from a different open dialog.
+        if ui_state
+            .active_dialog
+            .as_ref()
+            .is_some_and(|d| d.id != id)
+        {
+            return;
+        }
+        let first_show = ui_state
+            .active_dialog
+            .as_ref()
+            .map(|d| d.id != id)
+            .unwrap_or(true);
+        ui_state.show_dialog_from_store(id);
+        if first_show {
+            if let Some(dialog) = ui_state.active_dialog.as_mut() {
+                if let Some(p) = self.saved_dialog_positions.dialogs.get(id) {
+                    dialog.position = Some((p.x, p.y));
+                    dialog.size = p.width.zip(p.height);
+                    dialog.save_position = true;
+                }
+            }
+        }
+    }
+
+    /// Whether a dialog's data may be shown as a transient popup. The
+    /// Whether a dialog's data may be shown as a transient popup. The
+    /// always-ingest store keeps every dialog's state regardless; this only
+    /// gates the popup. U6: nothing pops up unless the user has SHOWN it via
+    /// the Windows list (its id is in `shown_dialog_ids`) — hidden-by-default,
+    /// replacing the old blocklist.
+    fn dialog_should_popup(ui_state: &UiState, id: &str) -> bool {
+        ui_state
+            .shown_dialog_ids
+            .iter()
+            .any(|shown| shown.eq_ignore_ascii_case(id))
+    }
+
     fn handle_stream_window(
         &mut self,
         id: &str,
@@ -2360,6 +2474,22 @@ impl MessageProcessor {
                 "Extracted {} room objects from room objs",
                 game_state.room_objects.len()
             );
+
+            // Dual-write ground items into the registry (the `floor`/
+            // `ground`/`room` foreach targets). Room loot = NOT yours,
+            // distinct from at-feet. Consumers still read room_objects.
+            let ground: Vec<crate::core::game_objects::GameItem> = game_state
+                .room_objects
+                .iter()
+                .map(|o| {
+                    crate::core::game_objects::GameItem::new(
+                        o.id.clone(),
+                        o.noun.clone().unwrap_or_default(),
+                        o.name.clone(),
+                    )
+                })
+                .collect();
+            game_state.objects.set_ground(ground);
         }
 
         // Extract players from room players component
@@ -2615,8 +2745,91 @@ impl MessageProcessor {
         }
     }
 
-    /// Flush current stream with optional TTS enqueuing
+    /// Item classifier for the sorter transform, resolved lazily through
+    /// the data pack (Lich folder > local store > bundled).
+    fn sorter_gameobj(&mut self) -> std::sync::Arc<crate::core::gameobj_data::GameObjData> {
+        if self.sorter_gameobj.is_none() {
+            let resolved = crate::core::data_pack::resolve(
+                &crate::core::data_pack::GAMEOBJ_DATA,
+                self.config.map.lich_dir.as_deref(),
+            );
+            self.sorter_gameobj = Some(std::sync::Arc::new(
+                crate::core::gameobj_data::GameObjData::parse(&resolved.content),
+            ));
+        }
+        self.sorter_gameobj.clone().expect("initialized above")
+    }
+
+    /// Drop the cached classifier so the next use re-resolves sources
+    /// (`.data reload`).
+    pub fn reset_gameobj_cache(&mut self) {
+        self.sorter_gameobj = None;
+    }
+
+    /// Mirror the `.sorter` toggle into the processor's live config
+    /// (AppCore owns the persisted copy).
+    pub fn set_sorter_enabled(&mut self, enabled: bool) {
+        self.config.ui.sorter_enabled = enabled;
+    }
+
+    /// Apply container contents captured from a main-stream look line into
+    /// the registry. A look is a full snapshot, so replace (clear + refill).
+    /// Registers the container if the `<container>` tag wasn't seen (the
+    /// visible look carries the container as its first link; we don't have
+    /// its title/target here, so a later `<container>` tag refines those).
+    fn drain_pending_container_ingest(
+        &mut self,
+        game_state: &mut crate::core::state::GameState,
+    ) {
+        let Some((container_id, items)) = self.pending_container_ingest.take() else {
+            return;
+        };
+        if game_state.objects.container(&container_id).is_none() {
+            game_state.objects.register_container(
+                container_id.clone(),
+                String::new(),
+                None,
+            );
+        }
+        game_state.objects.clear_container(&container_id);
+        for item in items {
+            game_state.objects.add_container_item(&container_id, item);
+        }
+    }
+
+    /// Begin an INVENTORY FULL scan: the caller must send the returned
+    /// command to the game. Reply lines are then squelched and parsed into
+    /// per-item mark/register status, finalized at the next prompt. Returns
+    /// None if a scan is already in flight.
+    pub fn start_inventory_scan(&mut self) -> Option<&'static str> {
+        if self.inv_scan.is_capturing() {
+            return None;
+        }
+        self.inv_scan.start();
+        Some(crate::core::game_objects::inv_scan::INVENTORY_FULL_COMMAND)
+    }
+
+    pub fn inventory_scan_in_flight(&self) -> bool {
+        self.inv_scan.is_capturing()
+    }
+
+    /// Flush current stream with optional TTS enqueuing. Wrapper drains
+    /// any lines a transform injected (sorter categories) through the
+    /// same pipeline, so each gets highlights/squelch/TTS individually.
     pub fn flush_current_stream_with_tts(
+        &mut self,
+        ui_state: &mut UiState,
+        mut tts_manager: Option<&mut crate::tts::TtsManager>,
+    ) {
+        self.flush_one_line(ui_state, tts_manager.as_deref_mut());
+        while let Some(next) = self.injected_lines.pop_front() {
+            self.current_segments = next;
+            self.flush_one_line(ui_state, tts_manager.as_deref_mut());
+        }
+    }
+
+    /// Flush exactly the pending line (no injected-line draining).
+    fn flush_one_line(
         &mut self,
         ui_state: &mut UiState,
         mut tts_manager: Option<&mut crate::tts::TtsManager>,
@@ -2633,6 +2846,17 @@ impl MessageProcessor {
         // while filtering noise blank lines before any content appears
         let is_blank_line = full_text.trim().is_empty();
         if is_blank_line && !self.chunk_has_main_text {
+            self.current_segments.clear();
+            return;
+        }
+
+        // Active INVENTORY FULL scan: capture status lines into the scan
+        // and squelch the whole reply from the display. The prompt handler
+        // finalizes the scan into the registry. Header/footer lines
+        // (no link) are captured for the window bound and squelched too,
+        // so the reply block doesn't leak into the main window.
+        if self.inv_scan.is_capturing() {
+            self.inv_scan.ingest_segments(&self.current_segments);
             self.current_segments.clear();
             return;
         }
@@ -2665,6 +2889,38 @@ impl MessageProcessor {
                 crate::core::travel::mazes::parse_pathcode_line(&full_text)
             {
                 self.pending_pathcode = Some(route);
+            }
+        }
+
+        // Sorter: replace a container-look line with categorized lines.
+        // The flush wrapper drains the extras; generated lines can't
+        // re-trigger (no " you see ").
+        if self.current_stream == "main"
+            && crate::core::sorter::is_container_look(&full_text)
+        {
+            // Ingest the container's contents into the registry from the
+            // VISIBLE look line — a plain `look in` (and Lich's ;sorter
+            // reformat) can deliver contents only as this main-stream
+            // prose, not as <inv> paired tags. Buffered here; the caller
+            // drains it into game_state.objects (this fn lacks game_state).
+            if let Some(pending) = crate::core::sorter::extract_container_items(
+                &self.current_segments,
+                &full_text,
+            ) {
+                self.pending_container_ingest = Some(pending);
+            }
+
+            // Categorized display transform (only when .sorter is on).
+            if self.config.ui.sorter_enabled {
+                let data = self.sorter_gameobj();
+                if let Some(mut lines) = crate::core::sorter::transform(
+                    &self.current_segments,
+                    &full_text,
+                    &data,
+                ) {
+                    self.current_segments = lines.remove(0);
+                    self.injected_lines.extend(lines);
+                }
             }
         }
 
@@ -2831,17 +3087,12 @@ impl MessageProcessor {
         // Inventory stream is always a silent update (shouldn't trigger prompts in main window)
         if self.current_stream == "inv" {
             self.chunk_has_silent_updates = true;
-            // Check if ANY window has Inventory content type
-            if !ui_state
-                .windows
-                .values()
-                .any(|w| matches!(w.content, WindowContent::Inventory(_)))
-            {
-                tracing::trace!("Discarding inv stream content - no inventory window exists");
-                self.current_stream = original_stream;
-                return;
-            }
-            // Add line to inventory buffer instead of window
+            // Buffer unconditionally: the buffer is the source of truth for
+            // both the inventory window (if any) AND the GameObjects
+            // registry, which owns worn/carried items regardless of whether
+            // a window happens to be open. (Previously this discarded the
+            // whole feed when no inventory window existed — a latent bug
+            // that left the registry blind to worn items.)
             let num_segments = line.segments.len();
             self.inventory_buffer.push(line.segments);
             tracing::trace!("Buffered inventory line ({} segments)", num_segments);
@@ -3309,7 +3560,9 @@ impl MessageProcessor {
             }
 
             if updated_count == 0 {
-                tracing::warn!("No inventory windows found to update!");
+                // Not an error: the feed is still buffered for the registry
+                // even with no inventory window open.
+                tracing::trace!("Inventory changed; no window open (buffer kept for registry)");
             } else {
                 tracing::debug!("Updated {} inventory window(s)", updated_count);
             }
@@ -4303,6 +4556,494 @@ mod tests {
             window: None,
             compiled_regex: None,
         }
+    }
+
+    // ===========================================
+    // GameObjects registry dual-write (migration step 2)
+    // ===========================================
+
+    #[test]
+    fn inventory_scan_captures_status_then_prompt_writes_registry() {
+        use crate::data::widget::{LinkData, TextSegment};
+        let mut processor = create_test_processor();
+        let mut game_state = GameState::new();
+        let mut ui_state = UiState::default();
+
+        // Start the scan (the caller would send the returned command).
+        assert_eq!(processor.start_inventory_scan(), Some("inventory full"));
+        assert!(processor.inventory_scan_in_flight());
+        // Starting again while in flight is a no-op.
+        assert_eq!(processor.start_inventory_scan(), None);
+
+        // Feed reply lines as segments (what the flush path would pass).
+        let link = |id: &str, noun: &str, name: &str| TextSegment {
+            text: name.to_string(),
+            link_data: Some(LinkData {
+                exist_id: id.to_string(),
+                noun: noun.to_string(),
+                text: name.to_string(),
+                coord: None,
+            }),
+            ..Default::default()
+        };
+        // header (no link) — captured for the window, no status.
+        processor.inv_scan.ingest_segments(&[TextSegment::plain(
+            "You are currently wearing:",
+        )]);
+        processor.inv_scan.ingest_segments(&[
+            TextSegment::plain("  some "),
+            link("1", "gloves", "triton hide gloves"),
+            TextSegment::plain(" with knuckles (registered) (marked)"),
+        ]);
+        processor.inv_scan.ingest_segments(&[
+            TextSegment::plain("  a "),
+            link("2", "ring", "plain ring"),
+        ]);
+
+        // The prompt finalizes into the registry.
+        let prompt = ParsedElement::Prompt {
+            time: "0".to_string(),
+            text: ">".to_string(),
+        };
+        processor.process_element(
+            &prompt,
+            &mut game_state,
+            &mut ui_state,
+            &mut std::collections::HashMap::new(),
+            &mut None,
+            &mut false,
+            &mut None,
+            &mut None,
+            &mut None,
+            None,
+        );
+
+        assert!(!processor.inventory_scan_in_flight());
+        let s1 = game_state.objects.status_of("1").unwrap();
+        assert_eq!(s1.registered, Some(true));
+        assert_eq!(s1.marked, Some(true));
+        let s2 = game_state.objects.status_of("2").unwrap();
+        assert_eq!(s2.registered, Some(false), "in reply, no marker = false");
+        assert_eq!(s2.marked, Some(false));
+    }
+
+    #[test]
+    fn discovery_routes_container_signal_bank_popup_stream_queue() {
+        // U3: no offer registry. A container sets the newly_registered
+        // signal; a non-blocklisted dialog (bank) becomes a popup; a
+        // streamWindow pushes a WindowDiscovery for AppCore to bind.
+        let mut processor = create_test_processor();
+        let mut game_state = GameState::new();
+        let mut ui_state = UiState::default();
+
+        let feed = [
+            ParsedElement::Container {
+                id: "77".to_string(),
+                title: "Backpack".to_string(),
+                target: Some("#77".to_string()),
+            },
+            ParsedElement::DialogOpen {
+                id: "bank".to_string(),
+                title: Some("Bank".to_string()),
+                save: true,
+            },
+            ParsedElement::StreamWindow {
+                id: "thoughts".to_string(),
+                subtitle: None,
+                title: Some("Thoughts".to_string()),
+            },
+        ];
+        for element in &feed {
+            processor.process_element(
+                element,
+                &mut game_state,
+                &mut ui_state,
+                &mut std::collections::HashMap::new(),
+                &mut None,
+                &mut false,
+                &mut None,
+                &mut None,
+                &mut None,
+                None,
+            );
+        }
+
+        // Container → registry + newly-registered signal.
+        assert!(game_state.objects.container("77").is_some());
+        assert_eq!(
+            processor.newly_registered_container,
+            Some(("77".to_string(), "Backpack".to_string()))
+        );
+        // U6: bank does NOT pop up by default (hidden-until-shown; the
+        // blocklist is gone — nothing pops unless its id is in shown_dialog_ids).
+        assert!(ui_state.active_dialog.is_none());
+        // Stream → a WindowDiscovery for AppCore to register.
+        let disc = &ui_state.pending_window_discoveries;
+        assert!(disc.iter().any(|d| d.id == "thoughts"
+            && d.kind == crate::data::WindowDiscoveryKind::Stream));
+
+        // But once the user shows "bank", its re-sent openDialog pops up.
+        ui_state.shown_dialog_ids.insert("bank".to_string());
+        processor.process_element(
+            &ParsedElement::DialogOpen {
+                id: "bank".to_string(),
+                title: Some("Bank".to_string()),
+                save: true,
+            },
+            &mut game_state,
+            &mut ui_state,
+            &mut std::collections::HashMap::new(),
+            &mut None,
+            &mut false,
+            &mut None,
+            &mut None,
+            &mut None,
+            None,
+        );
+        assert!(ui_state.active_dialog.as_ref().is_some_and(|d| d.id == "bank"));
+    }
+
+    #[test]
+    fn dialog_popup_gated_on_shown_dialog_ids() {
+        // U6: no blocklist — a dialog pops up ONLY if the user has shown it
+        // (its id in shown_dialog_ids). Empty set = nothing pops up.
+        let mut processor = create_test_processor();
+        let mut game_state = GameState::new();
+        let mut ui_state = UiState::default();
+        let open = |id: &str| ParsedElement::DialogOpen {
+            id: id.to_string(),
+            title: Some(id.to_string()),
+            save: false,
+        };
+
+        // Not shown → no popup.
+        processor.process_element(
+            &open("shop"),
+            &mut game_state,
+            &mut ui_state,
+            &mut std::collections::HashMap::new(),
+            &mut None,
+            &mut false,
+            &mut None,
+            &mut None,
+            &mut None,
+            None,
+        );
+        assert!(ui_state.active_dialog.is_none());
+
+        // Shown → pops up.
+        ui_state.shown_dialog_ids.insert("shop".to_string());
+        processor.process_element(
+            &open("shop"),
+            &mut game_state,
+            &mut ui_state,
+            &mut std::collections::HashMap::new(),
+            &mut None,
+            &mut false,
+            &mut None,
+            &mut None,
+            &mut None,
+            None,
+        );
+        assert!(ui_state.active_dialog.as_ref().is_some_and(|d| d.id == "shop"));
+    }
+
+    #[test]
+    fn blocklisted_combat_dialogdata_never_opens_popup() {
+        // Real shapes from a 2026-07-28 session log: the combat window is a
+        // RESIDENT openDialog (so no DialogOpen is emitted) whose dialogData
+        // then arrives both embedded and standalone. 'combat' is in the
+        // default blocklist, so none of it may create the generic popup.
+        let mut parser = crate::parser::XmlParser::new();
+        let mut processor = create_test_processor();
+        let mut game_state = GameState::new();
+        let mut ui_state = UiState::default();
+
+        let lines = [
+            "<openDialog type='dynamic' id='combat' title='Combat' location='right' target='combat' height='288' resident='true'><dialogData id='combat' clear='t'><image id='unsheathe' name='SwordBtn' cmd='_ready weapon' tooltip='Unsheathe Weapon' echo='ready weapon' align='n' top='3' left='-50' height='29' width='29'/></dialogData></openDialog>",
+            "<dialogData id='combat'><progressBar id='pbarStance' value='100' text='defensive (100%)' top='51' width='130' height='16' left='0' align='n' tooltip='Percent of stance contributing to defense'/></dialogData>",
+            "<dialogData id='combat'><cmdButton id='cmdDefStance' value='defense' cmd='_stance defensive' tooltip='Assume a Defensive Stance' echo='stance defensive' height='20' width='55' top='70' left='0' align='nw'/><cmdButton id='cmdTarget' value='target' cmd='target random' tooltip='Select a Random Target' height='20' width='55' top='93' left='0' align='nw'/></dialogData>",
+        ];
+        for line in &lines {
+            for element in parser.parse_line(line) {
+                processor.process_element(
+                    &element,
+                    &mut game_state,
+                    &mut ui_state,
+                    &mut std::collections::HashMap::new(),
+                    &mut None,
+                    &mut false,
+                    &mut None,
+                    &mut None,
+                    &mut None,
+                    None,
+                );
+            }
+        }
+
+        assert!(
+            ui_state.active_dialog.is_none(),
+            "blocklisted combat dialogData opened the generic popup: {:?}",
+            ui_state.active_dialog.as_ref().map(|d| &d.id)
+        );
+        // It was recorded as a DialogPanel discovery (Hidden by default).
+        let disc = ui_state
+            .pending_window_discoveries
+            .iter()
+            .find(|d| d.id == "combat");
+        assert!(
+            disc.is_some_and(|d| d.kind == crate::data::WindowDiscoveryKind::DialogPanel),
+            "combat should be a DialogPanel discovery"
+        );
+        // Even hidden, its full state accumulated in the store, so showing
+        // it later renders fully formed rather than from deltas.
+        let stored = ui_state.dialog_store.get("combat").expect("combat stored");
+        assert_eq!(stored.progress_bars.len(), 1, "stance bar stored");
+        assert_eq!(stored.buttons.len(), 2, "both stance/target buttons stored");
+    }
+
+    #[test]
+    fn combat_registers_as_resident_and_ingests_all_controls() {
+        // The real login-time combat panel (2026-01 log): resident
+        // openDialog + the full set of dialogData chunks. It must register
+        // as a RESIDENT dialog offer and accumulate every control type in
+        // the store (icons, links, spinbox, buttons, dropdowns, bar).
+        let mut parser = crate::parser::XmlParser::new();
+        let mut processor = create_test_processor();
+        let mut game_state = GameState::new();
+        let mut ui_state = UiState::default();
+
+        let lines = [
+            "<openDialog type='dynamic' id='combat' title='Combat' location='right' target='combat' height='288' resident='true'><dialogData id='combat' clear='t'><image id='unsheathe' name='SwordBtn' cmd='_ready weapon' tooltip='Unsheathe Weapon' align='n' top='3' left='-50' height='29' width='29'/><link id='lnConfigure' value='configure' cmd='_cmbtpl configure dialog' top='30' align='n' left='0'/></dialogData></openDialog>",
+            "<dialogData id='combat'><progressBar id='pbarStance' value='100' text='defensive (100%)' top='51' width='130' height='16' left='0' align='n'/></dialogData>",
+            "<dialogData id='combat'><cmdButton id='cmdDefStance' value='defense' cmd='_stance defensive' top='70' left='0' align='nw'/><cmdButton id='cmdOffStance' value='offense' cmd='_stance offensive' top='70' left='0' align='ne'/></dialogData>",
+            "<dialogData id='combat'><dropDownBox id='dDBStance' value='defensive' cmd='_stance %dDBStance%' content_text='offensive,defensive' content_value='offensive,defensive' top='70' anchor_left='cmdDefStance' anchor_right='cmdOffStance'/></dialogData>",
+            "<dialogData id='combat'><upDownEditBox id='uDEQuickstrike' min='-60' max='60' value='-1' top='231' left='0' width='50' height='26'/><cmdButton id='cmdQuickstrike' value='prepare to quickstrike' cmd='quickstrike %uDEQuickstrike%' top='234' left='53'/></dialogData>",
+            "<dialogData id='combat'><link id='lnSkin' value='skin' cmd='_skin' top='260' left='0'/><link id='mstrike' value='multistrike' cmd='mstrike'/></dialogData>",
+        ];
+        for line in &lines {
+            for element in parser.parse_line(line) {
+                processor.process_element(
+                    &element,
+                    &mut game_state,
+                    &mut ui_state,
+                    &mut std::collections::HashMap::new(),
+                    &mut None,
+                    &mut false,
+                    &mut None,
+                    &mut None,
+                    &mut None,
+                    None,
+                );
+            }
+        }
+
+        // Combat is recorded as a DialogPanel discovery (Hidden by default)
+        // and never pops up as a transient dialog.
+        let disc = ui_state
+            .pending_window_discoveries
+            .iter()
+            .find(|d| d.id == "combat")
+            .expect("combat discovery");
+        assert_eq!(disc.kind, crate::data::WindowDiscoveryKind::DialogPanel);
+        assert!(ui_state.active_dialog.is_none(), "no transient popup");
+
+        // Store accumulated the whole panel.
+        let s = ui_state.dialog_store.get("combat").expect("stored");
+        assert_eq!(s.images.len(), 1, "sword icon");
+        assert_eq!(s.buttons.len(), 3, "defense + offense + quickstrike");
+        assert_eq!(s.dropdowns.len(), 1, "stance");
+        assert_eq!(s.spinboxes.len(), 1, "quickstrike offset");
+        assert_eq!(s.progress_bars.len(), 1, "stance bar");
+        assert_eq!(s.links.len(), 3, "configure + skin + multistrike");
+        // %id% resolves the spinbox value in a button command.
+        assert_eq!(
+            s.command_with_placeholders("quickstrike %uDEQuickstrike%"),
+            "quickstrike -1"
+        );
+    }
+
+    #[test]
+    fn always_ingest_store_accumulates_blocklisted_dialog() {
+        // The core fix: the game sends combat's definition (here as a batch);
+        // combat is blocklisted so no popup appears, but the store ingests
+        // the whole panel so showing it later renders fully formed.
+        let mut parser = crate::parser::XmlParser::new();
+        let mut processor = create_test_processor();
+        let mut app = crate::core::AppCore::new_for_test();
+
+        let lines = [
+            "<dialogData id='combat' clear='t'><progressBar id='pbarStance' value='100' text='defensive (100%)' top='51'/></dialogData>",
+            "<dialogData id='combat'><cmdButton id='cmdDefStance' value='defense' cmd='_stance defensive' top='70' left='0' align='nw'/><cmdButton id='cmdAttack' value='attack' cmd='attack' top='93' left='55' align='ne'/><dropDownBox id='dDBStance' value='defensive' cmd='_stance %dDBStance%' content_text='offensive,defensive' content_value='offensive,defensive' top='70'/></dialogData>",
+        ];
+        for line in &lines {
+            for element in parser.parse_line(line) {
+                processor.process_element(
+                    &element,
+                    &mut app.game_state,
+                    &mut app.ui_state,
+                    &mut std::collections::HashMap::new(),
+                    &mut None,
+                    &mut false,
+                    &mut None,
+                    &mut None,
+                    &mut None,
+                    None,
+                );
+            }
+        }
+
+        // Blocklisted → no transient popup, but fully stored.
+        assert!(app.ui_state.active_dialog.is_none());
+        let stored = app.ui_state.dialog_store.get("combat").expect("stored");
+        assert_eq!(stored.buttons.len(), 2);
+        assert_eq!(stored.dropdowns.len(), 1);
+        assert_eq!(stored.progress_bars.len(), 1);
+    }
+
+    #[test]
+    fn shown_dialog_updates_replace_controls_by_id() {
+        // The always-ingest store replaces same-id controls (no pile-up) on
+        // every dialogData refresh — independent of whether it's shown.
+        // Assert against the store (the update-by-id happens there).
+        let mut parser = crate::parser::XmlParser::new();
+        let mut processor = create_test_processor();
+        let mut game_state = GameState::new();
+        let mut ui_state = UiState::default();
+
+        let chunk = "<dialogData id='combat'><cmdButton id='cmdTarget' value='target' cmd='target random' top='93' left='0'/><cmdButton id='cmdAttack' value='attack' cmd='attack' top='93' left='55'/><dropDownBox id='dDBStance' value='defensive' cmd='_stance %dDBStance%' content_text='offensive,defensive' content_value='offensive,defensive' top='70'/></dialogData>";
+        let updated = "<dialogData id='combat'><dropDownBox id='dDBStance' value='offensive' cmd='_stance %dDBStance%' content_text='offensive,defensive' content_value='offensive,defensive' top='70'/></dialogData>";
+        for line in [chunk, chunk, updated] {
+            for element in parser.parse_line(line) {
+                processor.process_element(
+                    &element,
+                    &mut game_state,
+                    &mut ui_state,
+                    &mut std::collections::HashMap::new(),
+                    &mut None,
+                    &mut false,
+                    &mut None,
+                    &mut None,
+                    &mut None,
+                    None,
+                );
+            }
+        }
+
+        let dialog = ui_state.dialog_store.get("combat").expect("stored");
+        // Re-sent controls replaced their same-id entries, no pile-up
+        // (the old extend produced target/attack duplicates live).
+        assert_eq!(dialog.buttons.len(), 2, "buttons: {:?}", dialog.buttons);
+        assert_eq!(dialog.dropdowns.len(), 1);
+        // The refresh updated the dropdown's current value...
+        assert_eq!(dialog.dropdowns[0].value, "offensive");
+        // ...which %id% substitution resolves in sibling commands.
+        assert_eq!(
+            dialog.command_with_placeholders("_stance %dDBStance%"),
+            "_stance offensive"
+        );
+    }
+
+    #[test]
+    fn container_feed_populates_registry_in_parallel() {
+        let mut processor = create_test_processor();
+        let mut game_state = GameState::new();
+        let mut ui_state = UiState::default();
+
+        // Real look-in-container sequence: <container> then
+        // <clearContainer> then header + item <inv> lines.
+        let feed = [
+            ParsedElement::Container {
+                id: "77".to_string(),
+                title: "Bandolier".to_string(),
+                target: Some("#77".to_string()),
+            },
+            ParsedElement::ClearContainer { id: "77".to_string() },
+            ParsedElement::ContainerItem {
+                container_id: "77".to_string(),
+                content: r#"In the <a exist="77" noun="bandolier">bandolier</a>:"#
+                    .to_string(),
+            },
+            ParsedElement::ContainerItem {
+                container_id: "77".to_string(),
+                content: r#" a <a exist="101" noun="crystal">quartz crystal</a>"#
+                    .to_string(),
+            },
+            ParsedElement::ContainerItem {
+                container_id: "77".to_string(),
+                content: r#" a <a exist="102" noun="sword">short sword</a>"#.to_string(),
+            },
+        ];
+        for element in &feed {
+            processor.process_element(
+                element,
+                &mut game_state,
+                &mut ui_state,
+                &mut std::collections::HashMap::new(),
+                &mut None,
+                &mut false,
+                &mut None,
+                &mut None,
+                &mut None,
+                None,
+            );
+        }
+
+        // Registry holds the two items, header skipped, ids intact.
+        let items = game_state.objects.items_in("77");
+        assert_eq!(items.len(), 2, "header excluded, both items kept");
+        assert_eq!(items[0].id, "101");
+        assert_eq!(items[0].name, "quartz crystal");
+        assert_eq!(items[1].id, "102");
+    }
+
+    #[test]
+    fn stow_container_feed_targets_object_in_registry() {
+        let mut processor = create_test_processor();
+        let mut game_state = GameState::new();
+        let mut ui_state = UiState::default();
+
+        let feed = [
+            ParsedElement::Container {
+                id: "stow".to_string(),
+                title: "My Shroud".to_string(),
+                target: Some("#691".to_string()),
+            },
+            ParsedElement::ClearContainer { id: "stow".to_string() },
+            ParsedElement::ContainerItem {
+                container_id: "stow".to_string(),
+                content: r#"In the <a exist="691" noun="shroud">shroud</a>:"#.to_string(),
+            },
+            ParsedElement::ContainerItem {
+                container_id: "stow".to_string(),
+                content: r#" a <a exist="742" noun="feather">disir feather</a>"#
+                    .to_string(),
+            },
+        ];
+        for element in &feed {
+            processor.process_element(
+                element,
+                &mut game_state,
+                &mut ui_state,
+                &mut std::collections::HashMap::new(),
+                &mut None,
+                &mut false,
+                &mut None,
+                &mut None,
+                &mut None,
+                None,
+            );
+        }
+
+        // Header (the shroud object) skipped via command_target, feather
+        // kept; the command target is the object id, not "#stow".
+        let items = game_state.objects.items_in("stow");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].id, "742");
+        assert_eq!(
+            game_state.objects.container("stow").unwrap().command_target(),
+            "691"
+        );
     }
 
     // ===========================================

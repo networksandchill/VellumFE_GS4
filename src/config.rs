@@ -32,8 +32,13 @@ mod templates;
 mod widgets;
 mod window_def;
 
-pub use colors::{ColorConfig, PaletteColor, SpellColorRange, SpellColorStyle, UiColors};
-pub use highlights::{EventAction, EventPattern, HighlightPattern, RedirectMode};
+pub use colors::{
+    ColorConfig, PaletteColor, PresetColor, PromptColor, SpellColorRange, SpellColorStyle,
+    UiColors,
+};
+pub use highlights::{
+    highlight_web_fields, EventAction, EventPattern, HighlightPattern, RedirectMode,
+};
 pub use hotbars::{
     EffectCategory, GradientDir, HotbarButton, HotbarButtonState, HotbarCmp, HotbarCondition,
     HotbarCountdownSource, HotbarDef, HotbarIcon, HotbarStyle, HotbarsConfig, IconMode, NameMatch,
@@ -41,12 +46,14 @@ pub use hotbars::{
 };
 pub use keybinds::{
     parse_key_string, validate_wheel_spans, AppKeybinds, KeyAction, KeyBindAction, MacroAction,
-    MenuKeybinds, RumbleConfig, RumblePattern, TuningConfig, WheelMeta, WheelSlice, WheelSpanIssue,
-    WHEEL_MIN_SPAN_DEG,
+    MenuKeybindField, MenuKeybinds, RumbleConfig, RumblePattern, TuningConfig, WheelMeta,
+    WheelSlice, WheelSpanIssue, WHEEL_MIN_SPAN_DEG,
 };
-pub use layout::{ContentAlign, Layout, LayoutConfig, LayoutMapping};
+pub use layout::{ContentAlign, Layout, LayoutConfig};
 pub use macros::{MacroButton, MacroGroup, MacroOption, MacrosConfig};
 pub use paths::{write_atomic, DialogPosition, SavedDialogPositions};
+#[cfg(test)]
+pub use paths::VELLUM_FE_DIR_TEST_LOCK;
 pub use settings::{
     ConnectionConfig, FocusConfig, Go2Config, HighlightsConfig, LoggingConfig, MapConfig,
     SoundConfig, StreamRoute, StreamsConfig, TargetListConfig, TtsConfig, TtsSubstitution,
@@ -57,14 +64,15 @@ pub use widgets::{
     apply_compiled_text_replacements, compile_text_replacements, default_minivitals_bar_order,
     ActiveEffectsWidgetData, BetrayerWidgetData, BorderSides, CommandInputWidgetData,
     CompassWidgetData, CompiledTextReplacement, ContainerWidgetData, CountdownWidgetData,
-    DashboardIndicatorDef, DashboardWidgetData, EncumbranceWidgetData, ExperienceWidgetData,
+    DashboardIndicatorDef, DashboardWidgetData, DialogPanelWidgetData, EncumbranceWidgetData,
+    ExperienceWidgetData,
     GS4ExperienceWidgetData, HandWidgetData, HotkeybarWidgetData, IndicatorWidgetData,
     InjuryDollWidgetData, InventoryWidgetData, ItemsWidgetData, MapWidgetData,
     MiniVitalsWidgetData, PerceptionWidgetData,
     PerformanceWidgetData, PlayersWidgetData, ProgressWidgetData, QuickbarDefinition,
     QuickbarEntryConfig, QuickbarWidgetData, QuickbarsConfig, RoomWidgetData, SortDirection,
     SpacerWidgetData, SpellsWidgetData, TabbedTextTab, TabbedTextWidgetData, TargetsWidgetData,
-    TextReplacement, TextWidgetData, WebUiWidgetData, WindowBase,
+    TextReplacement, TextWidgetData, WebUiWidgetData, WindowBase, WindowBinding, WindowVisibility,
 };
 pub use window_def::WindowDef;
 
@@ -74,6 +82,7 @@ const DEFAULT_CONFIG: &str = include_str!("../defaults/globals/config.toml");
 const DEFAULT_COLORS: &str = include_str!("../defaults/globals/colors.toml");
 const DEFAULT_HIGHLIGHTS: &str = include_str!("../defaults/globals/highlights.toml");
 const DEFAULT_KEYBINDS: &str = include_str!("../defaults/globals/keybinds.toml");
+const DEFAULT_CONTROLLER: &str = include_str!("../defaults/globals/controller.toml");
 const DEFAULT_HOTBARS: &str = include_str!("../defaults/globals/hotbars.toml");
 const DEFAULT_MACROS: &str = include_str!("../defaults/globals/macros.toml");
 const DEFAULT_CMDLIST: &str = include_str!("../defaults/globals/cmdlist1.xml");
@@ -102,6 +111,18 @@ pub enum WidgetCategory {
 }
 
 impl WidgetCategory {
+    /// All categories in a stable display order.
+    pub const ALL: [WidgetCategory; 8] = [
+        WidgetCategory::Status,
+        WidgetCategory::ProgressBar,
+        WidgetCategory::Countdown,
+        WidgetCategory::ActiveEffects,
+        WidgetCategory::Entity,
+        WidgetCategory::Hand,
+        WidgetCategory::TextWindow,
+        WidgetCategory::Other,
+    ];
+
     pub fn display_name(&self) -> &str {
         match self {
             Self::ActiveEffects => "Active Effects",
@@ -259,8 +280,6 @@ pub struct Config {
     pub logging: LoggingConfig,
     #[serde(default)]
     pub event_patterns: HashMap<String, EventPattern>,
-    #[serde(default)]
-    pub layout_mappings: Vec<LayoutMapping>,
     #[serde(skip)] // Don't serialize/deserialize this - it's set at runtime
     pub character: Option<String>, // Character name for character-specific saving
     #[serde(skip)] // Loaded from separate colors.toml file (includes color_palette)
@@ -332,25 +351,6 @@ fn default_focus_exclude() -> Vec<String> {
 
 fn default_betrayer_active_color() -> Option<String> {
     Some("#ff4040".to_string())
-}
-
-fn default_open_dialog_blocklist() -> Vec<String> {
-    vec![
-        "combat".to_string(),
-        "injuries".to_string(),
-        "stance".to_string(),
-        "befriend".to_string(),
-        "espMasterDialog".to_string(),
-        "espMasterData".to_string(),
-        "Buffs".to_string(),
-        "Debuffs".to_string(),
-        "Cooldowns".to_string(),
-        "mapMaster".to_string(),
-        "encum".to_string(),
-        "minivitals".to_string(),
-        "expr".to_string(),
-        "Active Spells".to_string(),
-    ]
 }
 
 fn default_dashboard_layout() -> String {

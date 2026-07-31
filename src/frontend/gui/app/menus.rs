@@ -657,15 +657,33 @@ impl VellumGuiApp {
         let command = menu_command.command;
 
         if let Some(category) = command.strip_prefix("__SUBMENU__") {
-            if let Some(items) = self.app_core.menu_categories.get(category).cloned() {
-                self.open_child_menu_for_layer(menu_command.layer, items);
-            } else {
+            // Right-click context menus stash their children in
+            // menu_categories; the .menu main-menu submenus (colors/
+            // highlights/keybinds/layouts/windows) are built on demand by
+            // build_submenu. Try the cache first, then fall back — without
+            // the fallback the whole .menu tree is dead in the GUI.
+            let items = self
+                .app_core
+                .menu_categories
+                .get(category)
+                .cloned()
+                .unwrap_or_else(|| self.app_core.build_submenu(category));
+            if items.is_empty() {
                 tracing::warn!("Missing GUI menu category: {}", category);
+            } else {
+                self.open_child_menu_for_layer(menu_command.layer, items);
             }
             return;
         }
 
         if let Some(submenu) = command.strip_prefix("menu:") {
+            // The GUI shows the show/hide list as its richer checkbox panel
+            // rather than a nested menu (the TUI uses the menu form).
+            if submenu == "knownwindows" {
+                self.open_known_windows_editor();
+                self.close_menus_to_normal();
+                return;
+            }
             let items = self.app_core.build_submenu(submenu);
             if items.is_empty() {
                 self.app_core
@@ -759,6 +777,16 @@ impl VellumGuiApp {
             return;
         }
 
+        // Windows list: flip this window's show/hide and close the menu
+        // like any other menu action. (U3: keyed on window name.)
+        if let Some(name) = command.strip_prefix("__TOGGLE_WINDOW__") {
+            let name = name.to_string();
+            self.app_core.toggle_known_window(&name);
+            self.close_menus_restore();
+            self.app_core.needs_render = true;
+            return;
+        }
+
         // Internal (double-underscore) menu commands must never reach the server.
         if command.starts_with("__") {
             self.app_core
@@ -767,10 +795,21 @@ impl VellumGuiApp {
             return;
         }
 
-        // A real command (context-menu verb) executed: return to interact
-        // mode if the menu was opened from it.
-        self.dispatch_raw_command(command);
-        self.close_menus_restore();
+        // A menu leaf command. Dot-commands (.settings, .colors, ...) are
+        // CLIENT commands — process them locally (open the editor), never
+        // send them to the game. Everything else is a context-menu game
+        // verb. This is why the .menu tree was dead in the GUI: its leaves
+        // are dot-commands and they were being sent to the network.
+        if command.starts_with('.') {
+            // Close the menu stack BEFORE dispatching: a dot-command may
+            // itself open a menu (.knownwindows) and closing afterwards
+            // wipes what it just opened.
+            self.close_menus_restore();
+            self.dispatch_command(command);
+        } else {
+            self.dispatch_raw_command(command);
+            self.close_menus_restore();
+        }
     }
 
     /// Render the four popup-menu layers against `ctx`'s current viewport.

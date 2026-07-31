@@ -276,7 +276,7 @@ impl super::TuiFrontend {
                         "scroll_current_window_up_one" | "scroll_current_window_down_one" |
                         "scroll_current_window_up_page" | "scroll_current_window_down_page" |
                         "scroll_current_window_home" | "scroll_current_window_end" |
-                        "scroll_all_windows_end"
+                        "scroll_all_windows_end" | "scroll_window_end"
                     ) || s.starts_with("scroll_window_end:")
                 );
 
@@ -351,6 +351,11 @@ impl super::TuiFrontend {
                             "scroll_all_windows_end" => {
                                 self.scroll_all_windows_to_bottom();
                                 tracing::debug!("Scrolled all text windows to bottom");
+                            }
+                            "scroll_window_end" => {
+                                // Bare form (no ":<names>") targets the focused window
+                                self.scroll_window(&focused_name, -100000);
+                                tracing::debug!("Scrolled '{}' to bottom via keybind", focused_name);
                             }
                             s if s.starts_with("scroll_window_end:") => {
                                 // Parameterized: scroll named window(s) to bottom,

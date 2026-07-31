@@ -167,10 +167,10 @@ impl AppCore {
                 });
             }
 
-            // Add the command text (in default color)
+            // Add the command text in the configured echo color
             segments.push(TextSegment {
                 text: command.clone(),
-                fg: Some("#ffffff".to_string()), // White text for command
+                fg: Some(self.config.colors.ui.command_echo_color.clone()),
                 bg: None,
                 bold: false,
                 mono: false,
@@ -765,6 +765,167 @@ impl AppCore {
 
     /// `.mapdb` — map data management from any frontend. Subcommands:
     /// `status` (default), `download`, `remove`, `repo <owner/repo>`.
+    /// The `.jinx` asset-manager command. Network operations run off-thread
+    /// (`jinx_worker`); `repo` list/add/rm/change edit `repos.toml` inline.
+    fn handle_jinx(&mut self, args: &[String]) {
+        use crate::core::jinx::worker::Request;
+
+        // Keep the worker's repo-seed gate current with the character's game.
+        // (parse_jinx_flags is a free fn below so it can be unit-tested.)
+        let game = self.game_type();
+        self.jinx_worker.set_game(game);
+
+        // Split flags (--repo=NAME, --force, --dry-run) from positional args.
+        let (flags, pos) = match parse_jinx_flags(args) {
+            Ok(parsed) => parsed,
+            Err(bad) => {
+                self.add_system_message(&format!("[jinx] unknown flag '{bad}'"));
+                return;
+            }
+        };
+        let JinxFlags { only_repo, force, dry_run } = flags;
+
+        let sub = pos.first().copied().unwrap_or("help");
+        match sub {
+            "help" | "?" => self.jinx_help(),
+
+            // --- repo management: inline, no network ---
+            "repo" => self.handle_jinx_repo(&pos[1..]),
+
+            // --- network commands: off-thread ---
+            "list" => {
+                let ack = self.jinx_worker.start(Request::List { only_repo });
+                self.add_system_message(&ack);
+            }
+            "search" => match pos.get(1) {
+                Some(pattern) => {
+                    let ack = self
+                        .jinx_worker
+                        .start(Request::Search { pattern: pattern.to_string() });
+                    self.add_system_message(&ack);
+                }
+                None => self.add_system_message("[jinx] usage: .jinx search <pattern>"),
+            },
+            "info" => match pos.get(1) {
+                Some(name) => {
+                    let ack = self.jinx_worker.start(Request::Info {
+                        name: name.to_string(),
+                        only_repo,
+                    });
+                    self.add_system_message(&ack);
+                }
+                None => self.add_system_message("[jinx] usage: .jinx info <name>"),
+            },
+            "install" => match pos.get(1) {
+                Some(name) => {
+                    let ack = self.jinx_worker.start(Request::Install {
+                        name: name.to_string(),
+                        only_repo,
+                        overwrite: force,
+                    });
+                    self.add_system_message(&ack);
+                }
+                None => self.add_system_message("[jinx] usage: .jinx install <name> [--repo=<r>]"),
+            },
+            "update" => match pos.get(1) {
+                // Update is install with overwrite; a bare `.jinx update`
+                // updates everything (auto-update).
+                Some(name) => {
+                    let ack = self.jinx_worker.start(Request::Install {
+                        name: name.to_string(),
+                        only_repo,
+                        overwrite: true,
+                    });
+                    self.add_system_message(&ack);
+                }
+                None => {
+                    let ack = self.jinx_worker.start(Request::AutoUpdate { dry_run });
+                    self.add_system_message(&ack);
+                }
+            },
+            "auto-update" => {
+                let ack = self.jinx_worker.start(Request::AutoUpdate { dry_run });
+                self.add_system_message(&ack);
+            }
+
+            other => {
+                self.add_system_message(&format!("[jinx] unknown command '{other}'"));
+                self.jinx_help();
+            }
+        }
+    }
+
+    /// `.jinx repo ...` — list/add/rm/change repository sources, edited inline
+    /// on `repos.toml` (no network). Seeding uses the character's game.
+    fn handle_jinx_repo(&mut self, args: &[&str]) {
+        let game = self.game_type();
+        let mut list = match crate::core::jinx::repo::RepoList::load_or_seed(game) {
+            Ok(l) => l,
+            Err(e) => {
+                self.add_system_message(&format!("[jinx] cannot load repos: {e}"));
+                return;
+            }
+        };
+        match args.first().copied().unwrap_or("list") {
+            "list" => {
+                for repo in &list.repos {
+                    self.add_system_message(&format!("  {} — {}", repo.name, repo.url));
+                }
+                if list.repos.is_empty() {
+                    self.add_system_message("[jinx] no repositories configured");
+                }
+            }
+            "add" => match (args.get(1), args.get(2)) {
+                (Some(name), Some(url)) => match list.add(name, url) {
+                    Ok(()) => match list.save() {
+                        Ok(()) => self.add_system_message(&format!("[jinx] added repo '{name}'")),
+                        Err(e) => self.add_system_message(&format!("[jinx] save failed: {e}")),
+                    },
+                    Err(e) => self.add_system_message(&format!("[jinx] {e}")),
+                },
+                _ => self.add_system_message("[jinx] usage: .jinx repo add <name> <https-url>"),
+            },
+            "rm" | "remove" => match args.get(1) {
+                Some(name) => match list.remove(name) {
+                    Ok(()) => match list.save() {
+                        Ok(()) => self.add_system_message(&format!("[jinx] removed repo '{name}'")),
+                        Err(e) => self.add_system_message(&format!("[jinx] save failed: {e}")),
+                    },
+                    Err(e) => self.add_system_message(&format!("[jinx] {e}")),
+                },
+                None => self.add_system_message("[jinx] usage: .jinx repo rm <name>"),
+            },
+            "change" => match (args.get(1), args.get(2)) {
+                (Some(name), Some(url)) => match list.change(name, url) {
+                    Ok(()) => match list.save() {
+                        Ok(()) => self.add_system_message(&format!("[jinx] repo '{name}' -> {url}")),
+                        Err(e) => self.add_system_message(&format!("[jinx] save failed: {e}")),
+                    },
+                    Err(e) => self.add_system_message(&format!("[jinx] {e}")),
+                },
+                _ => self.add_system_message("[jinx] usage: .jinx repo change <name> <https-url>"),
+            },
+            other => self.add_system_message(&format!(
+                "[jinx] unknown repo command '{other}' (list|add|rm|change)"
+            )),
+        }
+    }
+
+    fn jinx_help(&mut self) {
+        for line in [
+            "[jinx] asset manager — download skins, icons, layouts, game data",
+            "  .jinx list [--repo=<r>]        list available assets",
+            "  .jinx search <pattern>         search asset names",
+            "  .jinx info <name>              show details",
+            "  .jinx install <name> [--force] install an asset",
+            "  .jinx update [<name>]          update one asset, or all if omitted",
+            "  .jinx auto-update [--dry-run]  update every installed asset",
+            "  .jinx repo list|add|rm|change  manage repositories",
+        ] {
+            self.add_system_message(line);
+        }
+    }
+
     fn handle_mapdb(&mut self, args: &[String]) {
         use crate::core::mapdb_update::UpdateStatus;
         match args.first().map(String::as_str).unwrap_or("status") {
@@ -960,6 +1121,258 @@ impl AppCore {
         }
     }
 
+    /// `.foreach` entry point: parse, gate on the lease, resolve targets
+    /// against tracked containers, classify, and start (or dry-run list).
+    fn handle_foreach(&mut self, raw: &str) {
+        use crate::core::foreach;
+
+        if raw.trim().is_empty() {
+            self.add_system_message(
+                "[foreach] usage: .foreach [unique] [first N] [after N] [sorted] \
+                 [reversed] [attr=]value in <target>[,...]; command; command...",
+            );
+            self.add_system_message(
+                "[foreach] targets: a container name, or inv | worn | feet | floor. \
+                 attrs: type (default) | sellable | noun | name | quick; \
+                 'item'/'container' substitute in commands; no commands = list \
+                 matches. Containers must have been seen open (look in them once).",
+            );
+            return;
+        }
+
+        if self.foreach.is_running() {
+            let desc = self
+                .foreach
+                .task()
+                .map(|t| t.desc.clone())
+                .unwrap_or_default();
+            self.add_system_message(&format!(
+                "[foreach] already running ({desc}) - .stop to cancel it first."
+            ));
+            return;
+        }
+        if let Some(owner) = self.automation_blocked_by("foreach") {
+            self.add_system_message(&format!(
+                "[foreach] {} is driving - .stop to cancel it first.",
+                owner.desc
+            ));
+            return;
+        }
+
+        let spec = match foreach::parse(raw) {
+            Ok(spec) => spec,
+            Err(err) => {
+                self.add_system_message(&format!("[foreach] {err}"));
+                return;
+            }
+        };
+
+        // Classifier first (needs &mut self), then borrow the cache.
+        let data = self.gameobj_data();
+
+        let mut candidates: Vec<foreach::Candidate> = Vec::new();
+        let mut missing: Vec<String> = Vec::new();
+        for (target, optional) in &spec.targets {
+            use crate::core::foreach::Target;
+            // Gather (id, noun, name, container_id) for the target. For
+            // pseudo-targets the item isn't inside a container, so the
+            // `container` substitution falls back to the item's own id
+            // (harmless — `item` is what these commands use).
+            let rows: Vec<(String, String, String, String)> = match target {
+                Target::Container(query) => {
+                    let Some(container) = self.game_state.objects.find_container(query)
+                    else {
+                        if *optional {
+                            missing.push(query.clone());
+                            continue;
+                        }
+                        self.add_system_message(&format!(
+                            "[foreach] no tracked container matches '{query}' - look \
+                             in it once so VellumFE sees its contents, or suffix '?' \
+                             to skip it."
+                        ));
+                        let titles = self.game_state.objects.container_titles();
+                        if titles.is_empty() {
+                            self.add_system_message(
+                                "[foreach] (no containers tracked yet - look in one to start)",
+                            );
+                        } else {
+                            self.add_system_message(&format!(
+                                "[foreach] tracked: {}",
+                                titles.iter().take(12).cloned().collect::<Vec<_>>().join(", ")
+                            ));
+                        }
+                        return;
+                    };
+                    let ct = container.command_target();
+                    container
+                        .items
+                        .iter()
+                        .map(|i| (i.id.clone(), i.noun.clone(), i.name.clone(), ct.clone()))
+                        .collect()
+                }
+                Target::Inv => self
+                    .game_state
+                    .objects
+                    .carried()
+                    .iter()
+                    .map(|i| (i.id.clone(), i.noun.clone(), i.name.clone(), i.id.clone()))
+                    .collect(),
+                Target::Worn => self
+                    .game_state
+                    .objects
+                    .worn()
+                    .iter()
+                    .map(|i| (i.id.clone(), i.noun.clone(), i.name.clone(), i.id.clone()))
+                    .collect(),
+                Target::AtFeet => self
+                    .game_state
+                    .objects
+                    .at_feet()
+                    .iter()
+                    .map(|i| (i.id.clone(), i.noun.clone(), i.name.clone(), i.id.clone()))
+                    .collect(),
+                Target::Floor => self
+                    .game_state
+                    .objects
+                    .ground()
+                    .iter()
+                    .map(|i| (i.id.clone(), i.noun.clone(), i.name.clone(), i.id.clone()))
+                    .collect(),
+            };
+            for (id, noun, name, container_id) in rows {
+                let types = data
+                    .types_of(&name, &noun)
+                    .iter()
+                    .map(|t| t.to_string())
+                    .collect();
+                let sellable = data
+                    .sellable(&name, &noun)
+                    .map(|joined| joined.split(',').map(str::to_string).collect())
+                    .unwrap_or_default();
+                let status = self
+                    .game_state
+                    .objects
+                    .status_of(&id)
+                    .copied()
+                    .unwrap_or_default();
+                candidates.push(foreach::Candidate {
+                    id,
+                    noun,
+                    name,
+                    container_id,
+                    types,
+                    sellable,
+                    status,
+                });
+            }
+        }
+
+        // Marked/registered filter needs status only the INVENTORY FULL
+        // scan provides. If any candidate that otherwise matches lacks it,
+        // trigger a scan and ask the user to re-run (the scan is async; the
+        // result lands on the registry a moment later).
+        if spec.status.is_active() {
+            let need_scan = candidates.iter().any(|c| {
+                let type_ok = spec.value_matches_public(c);
+                let unknown = (spec.status.marked.is_some() && c.status.marked.is_none())
+                    || (spec.status.registered.is_some()
+                        && c.status.registered.is_none());
+                type_ok && unknown
+            });
+            if need_scan {
+                if let Some(cmd) = self.message_processor.start_inventory_scan() {
+                    // Inject the scan command into the outbound path (zero
+                    // delay = next drain).
+                    self.queue_timed_command(
+                        std::time::Duration::from_millis(0),
+                        cmd.to_string(),
+                    );
+                    self.add_system_message(
+                        "[foreach] fetching item status (INVENTORY FULL) - re-run \
+                         the command in a moment.",
+                    );
+                } else {
+                    self.add_system_message(
+                        "[foreach] an item-status scan is already in progress - \
+                         re-run shortly.",
+                    );
+                }
+                return;
+            }
+        }
+
+        let picked: Vec<foreach::Candidate> =
+            spec.select(&candidates).into_iter().cloned().collect();
+        for query in &missing {
+            self.add_system_message(&format!("[foreach] skipping '{query}?' (not tracked)"));
+        }
+        if picked.is_empty() {
+            self.add_system_message("[foreach] no matching items.");
+            return;
+        }
+
+        if spec.commands.is_empty() {
+            // Dry run: list what a command list would act on.
+            self.add_system_message(&format!(
+                "[foreach] {} matching item{}:",
+                picked.len(),
+                if picked.len() == 1 { "" } else { "s" }
+            ));
+            const SHOW: usize = 50;
+            for candidate in picked.iter().take(SHOW) {
+                let tags = if candidate.types.is_empty() {
+                    "-".to_string()
+                } else {
+                    candidate.types.join(",")
+                };
+                self.add_system_message(&format!(
+                    "  {}  ({})  #{}",
+                    candidate.name, tags, candidate.id
+                ));
+            }
+            if picked.len() > SHOW {
+                self.add_system_message(&format!("  ... and {} more", picked.len() - SHOW));
+            }
+            return;
+        }
+
+        let mut items = Vec::new();
+        for candidate in &picked {
+            let steps = {
+                let objects = &self.game_state.objects;
+                foreach::build_steps(&spec.commands, candidate, |query| {
+                    objects.find_container(query).map(|c| c.command_target())
+                })
+            };
+            match steps {
+                Ok(steps) => items.push(foreach::WorkItem {
+                    id: candidate.id.clone(),
+                    name: candidate.name.clone(),
+                    steps,
+                }),
+                Err(err) => {
+                    self.add_system_message(&format!("[foreach] {err}"));
+                    return;
+                }
+            }
+        }
+
+        let count = items.len();
+        let desc = raw.split(';').next().unwrap_or("").trim().to_string();
+        self.foreach
+            .set_task(foreach::ForeachTask::new(desc, items));
+        self.add_system_message(&format!(
+            "[foreach] running {} command{} over {} item{} - .stop cancels.",
+            spec.commands.len(),
+            if spec.commands.len() == 1 { "" } else { "s" },
+            count,
+            if count == 1 { "" } else { "s" }
+        ));
+        // Fire the first send now instead of on the next frame.
+        self.tick_foreach();
+    }
+
     fn handle_dot_command(&mut self, command: &str) -> Result<String> {
         let parts: Vec<&str> = command[1..].split_whitespace().collect();
         let cmd = parts.first().map(|s| s.to_lowercase()).unwrap_or_default();
@@ -1000,11 +1413,131 @@ impl AppCore {
                 self.handle_go2(&args);
             }
 
+            // Toggle categorized container-look display (sorter.lic's
+            // native cousin). Persisted like any UI setting.
+            "sorter" => {
+                let sub = parts.get(1).map(|s| s.to_lowercase());
+                let target = match sub.as_deref() {
+                    Some("on") => true,
+                    Some("off") => false,
+                    None => !self.config.ui.sorter_enabled,
+                    Some(other) => {
+                        self.add_system_message(&format!(
+                            "Usage: .sorter [on|off] (currently {}), got '{}'",
+                            if self.config.ui.sorter_enabled { "on" } else { "off" },
+                            other
+                        ));
+                        return Ok(String::new());
+                    }
+                };
+                self.config.ui.sorter_enabled = target;
+                self.message_processor.set_sorter_enabled(target);
+                match self.save_config() {
+                    Ok(()) => self.add_system_message(&format!(
+                        "Container-look sorting {}.",
+                        if target { "on" } else { "off" }
+                    )),
+                    Err(e) => self.add_system_message(&format!("Sorter toggle saved to session only: {e}")),
+                }
+            }
+
+            // Batch item commands over tracked containers (foreach.lic's
+            // native cousin). Needs raw text - ';' separates commands.
+            "foreach" => {
+                let raw = command[1..]
+                    .splitn(2, char::is_whitespace)
+                    .nth(1)
+                    .unwrap_or("")
+                    .to_string();
+                self.handle_foreach(&raw);
+            }
+
+            // Automation panic button: cancel whatever owns the connection
+            // (a go2 trip today; foreach chains later) and everything it
+            // drives. Feature-specific cancels (.go2 stop, Esc) still work.
+            "stop" => match self.stop_automation() {
+                Some(desc) => {
+                    self.add_system_message(&format!("Stopped: {}", desc));
+                }
+                None => {
+                    self.add_system_message("Nothing is running.");
+                }
+            },
+
             // Map data management from any frontend — on phones this is THE
             // way to get map data (no Settings > Map panel there).
             "mapdb" => {
                 let args: Vec<String> = parts[1..].iter().map(|s| s.to_string()).collect();
                 self.handle_mapdb(&args);
+            }
+
+            // Asset manager (the native jinx client): download and update
+            // skins, icon maps, layouts, and game data from federated repos.
+            // Network work runs off-thread (see jinx_worker); repo edits are
+            // instant and inline.
+            "jinx" => {
+                let args: Vec<String> = parts[1..].iter().map(|s| s.to_string()).collect();
+                self.handle_jinx(&args);
+            }
+
+            // Data-pack assets (gameobj-data.xml, ...): source tier + age.
+            // `.data reload` re-resolves mid-session, e.g. after Lich's
+            // `;repo` refreshed its copy. Settings panel surface is owed;
+            // these dot-commands are the agreed v1 interface.
+            "data" => {
+                let sub = parts.get(1).map(|s| s.to_lowercase()).unwrap_or_default();
+                match sub.as_str() {
+                    "" | "status" => {
+                        for line in crate::core::data_pack::status_lines(
+                            self.config.map.lich_dir.as_deref(),
+                        ) {
+                            self.add_system_message(&line);
+                        }
+                        let data = self.gameobj_data();
+                        self.add_system_message(&format!(
+                            "gameobj classifier: {} types, {} sellable{}",
+                            data.type_count(),
+                            data.sellable_count(),
+                            if data.skipped.is_empty() {
+                                String::new()
+                            } else {
+                                format!(
+                                    ", {} incompatible regex(es) skipped",
+                                    data.skipped.len()
+                                )
+                            }
+                        ));
+                    }
+                    "reload" => {
+                        let types = self.reload_data_pack();
+                        self.add_system_message(&format!(
+                            "Data pack re-resolved: gameobj classifier reloaded \
+                             ({types} types)."
+                        ));
+                    }
+                    // `.data update <name>` is a domain-specific alias over the
+                    // asset manager: download the named game-data file from a
+                    // repo (off-thread), landing it in the local-store tier the
+                    // data pack already reads. The post-install effect reloads.
+                    "update" => match parts.get(2) {
+                        Some(name) => {
+                            self.jinx_worker.set_game(self.game_type());
+                            let ack = self.jinx_worker.start(
+                                crate::core::jinx::worker::Request::Install {
+                                    name: name.to_string(),
+                                    only_repo: None,
+                                    overwrite: true,
+                                },
+                            );
+                            self.add_system_message(&ack);
+                        }
+                        None => self
+                            .add_system_message("Usage: .data update <name> (e.g. gameobj-data.xml)"),
+                    },
+                    _ => {
+                        self.add_system_message("Usage: .data [status|reload|update <name>]");
+                    }
+                }
             }
 
             // Web frontend: reload macros.toml (+ the phone-edited local
@@ -1226,6 +1759,10 @@ impl AppCore {
             "keybinds" | "kb" => {
                 return Ok("action:keybinds".to_string());
             }
+            // Menu keybinds (nav/action keys active while a menu has focus)
+            "menukeybinds" | "menukb" => {
+                return Ok("action:menukeybinds".to_string());
+            }
             // Controller bindings editor (GUI)
             "controller" => {
                 return Ok("action:controller".to_string());
@@ -1438,19 +1975,6 @@ impl AppCore {
                 self.needs_render = true;
             }
 
-            // Container discovery mode
-            "containers" => {
-                self.ui_state.container_discovery_mode = !self.ui_state.container_discovery_mode;
-                let status = if self.ui_state.container_discovery_mode {
-                    "ON"
-                } else {
-                    "OFF"
-                };
-                self.add_system_message(&format!("Container discovery {}", status));
-                if self.ui_state.container_discovery_mode {
-                    self.add_system_message("LOOK IN containers to create windows for them");
-                }
-            }
             "hidecontainers" => {
                 // No args = close all, with arg = close matching container
                 let args = parts.get(1..).unwrap_or(&[]).join(" ");
@@ -1491,6 +2015,139 @@ impl AppCore {
 
         // Don't send anything to server
         Ok(String::new())
+    }
+}
+
+/// Parsed `.jinx` flags, split from the positional args.
+#[derive(Debug)]
+struct JinxFlags {
+    only_repo: Option<String>,
+    force: bool,
+    dry_run: bool,
+}
+
+/// Split `.jinx` args into flags and positionals. Returns `Err(flag)` for an
+/// unrecognized `--flag`. A free function so it's unit-testable without an
+/// `AppCore`.
+fn parse_jinx_flags(args: &[String]) -> Result<(JinxFlags, Vec<&str>), String> {
+    let mut flags = JinxFlags {
+        only_repo: None,
+        force: false,
+        dry_run: false,
+    };
+    let mut pos: Vec<&str> = Vec::new();
+    for arg in args {
+        if let Some(rest) = arg.strip_prefix("--repo=") {
+            flags.only_repo = Some(rest.to_string());
+        } else if arg == "--force" {
+            flags.force = true;
+        } else if arg == "--dry-run" {
+            flags.dry_run = true;
+        } else if arg.starts_with("--") {
+            return Err(arg.clone());
+        } else {
+            pos.push(arg);
+        }
+    }
+    Ok((flags, pos))
+}
+
+#[cfg(test)]
+mod jinx_command_tests {
+    use super::*;
+
+    fn args(s: &str) -> Vec<String> {
+        s.split_whitespace().map(String::from).collect()
+    }
+
+    #[test]
+    fn flags_split_from_positionals() {
+        let a = args("install parchment --repo=skins --force");
+        let (flags, pos) = parse_jinx_flags(&a).unwrap();
+        assert_eq!(pos, ["install", "parchment"]);
+        assert_eq!(flags.only_repo.as_deref(), Some("skins"));
+        assert!(flags.force);
+        assert!(!flags.dry_run);
+    }
+
+    #[test]
+    fn dry_run_and_bare_positionals() {
+        let a = args("auto-update --dry-run");
+        let (flags, pos) = parse_jinx_flags(&a).unwrap();
+        assert_eq!(pos, ["auto-update"]);
+        assert!(flags.dry_run);
+        assert!(flags.only_repo.is_none());
+
+        let b = args("list");
+        let (_, pos) = parse_jinx_flags(&b).unwrap();
+        assert_eq!(pos, ["list"]);
+    }
+
+    #[test]
+    fn unknown_flag_is_rejected() {
+        let a = args("install x --bogus");
+        let err = parse_jinx_flags(&a).unwrap_err();
+        assert_eq!(err, "--bogus");
+    }
+}
+
+#[cfg(test)]
+mod command_echo_tests {
+    use super::*;
+    use crate::config::PromptColor;
+    use crate::data::{WindowContent, WindowState};
+
+    #[test]
+    fn sent_command_echo_uses_configured_color_and_respects_prompt_styles_and_toggle() {
+        let mut core = AppCore::new_for_test();
+        core.config.colors.ui.command_echo_color = "#123456".to_string();
+        core.config.colors.prompt_colors = vec![
+            PromptColor {
+                character: "R".to_string(),
+                fg: Some("#aa0000".to_string()),
+                bg: None,
+                color: None,
+            },
+            PromptColor {
+                character: ">".to_string(),
+                fg: Some("#00aa00".to_string()),
+                bg: None,
+                color: None,
+            },
+        ];
+        core.message_processor.apply_config(core.config.clone());
+        core.game_state.last_prompt = "R>".to_string();
+
+        let mut main_window = WindowState::new_text("main", 100);
+        if let WindowContent::Text(content) = &mut main_window.content {
+            content.streams = vec!["main".to_string()];
+        }
+        core.ui_state.windows.insert("main".to_string(), main_window);
+        core.message_processor
+            .update_text_stream_subscribers(&core.ui_state);
+
+        core.send_command("look".to_string()).unwrap();
+
+        let WindowContent::Text(content) = &core.ui_state.windows["main"].content else {
+            panic!("main should be a text window");
+        };
+        assert_eq!(content.lines.len(), 1);
+        let segments = &content.lines[0].segments;
+        assert_eq!(segments.len(), 3);
+        assert_eq!(segments[0].text, "R");
+        assert_eq!(segments[0].fg.as_deref(), Some("#aa0000"));
+        assert_eq!(segments[1].text, ">");
+        assert_eq!(segments[1].fg.as_deref(), Some("#00aa00"));
+        assert_eq!(segments[2].text, "look");
+        assert_eq!(segments[2].fg.as_deref(), Some("#123456"));
+
+        core.config.ui.command_echo = false;
+        core.send_command("glance".to_string()).unwrap();
+
+        let WindowContent::Text(content) = &core.ui_state.windows["main"].content else {
+            panic!("main should be a text window");
+        };
+        assert_eq!(content.lines.len(), 1);
     }
 }
 
@@ -2315,5 +2972,155 @@ mod tests {
         let command = "";
         let formatted = format!("{}\n", command);
         assert_eq!(formatted, "\n");
+    }
+}
+
+#[cfg(test)]
+mod foreach_tests {
+    use crate::core::AppCore;
+
+    fn core_with_bandolier() -> AppCore {
+        use crate::core::game_objects::GameItem;
+        let mut core = AppCore::new_for_test();
+        let objects = &mut core.game_state.objects;
+        objects.register_container("77".to_string(), "Bandolier".to_string(), Some("#77".to_string()));
+        objects.add_container_item("77", GameItem::new("101", "crystal", "quartz crystal"));
+        objects.add_container_item("77", GameItem::new("102", "sword", "slim short sword"));
+        core
+    }
+
+    #[test]
+    fn menu_commands_do_not_recurse_infinitely() {
+        // Repro for the menu-Enter stack overflow: drive send_command with
+        // exactly what a menu-Enter dispatches. If any recurses, this test
+        // stack-overflows and names the frame.
+        let mut core = AppCore::new_for_test();
+        for cmd in [
+            ".menu",
+            ".windows",
+            "", // empty-menu placeholder command
+            "__SUBMENU__windows",
+            "__TOGGLE_WINDOW__stow",
+            "menu:windows",
+            "menu:knownwindows",
+        ] {
+            let _ = core.send_command(cmd.to_string());
+        }
+    }
+
+    #[test]
+    fn foreach_end_to_end_over_tracked_container() {
+        let mut core = core_with_bandolier();
+        let _ = core.handle_dot_command(".foreach gem in bandolier; sell item");
+
+        // Runs under the lease as root owner...
+        assert!(core.foreach.is_running());
+        assert_eq!(core.automation_owner().unwrap().kind, "foreach");
+        // ...matched only the gem (bundled classifier), and the start
+        // tick fired the implicit get with the exist id.
+        assert_eq!(core.take_outbound(), vec!["get #101".to_string()]);
+
+        // .stop cancels the run through the lease.
+        let _ = core.handle_dot_command(".stop");
+        assert!(!core.foreach.is_running());
+        assert!(core.automation_owner().is_none());
+    }
+
+    #[test]
+    fn foreach_stow_uses_object_target_not_stream_id() {
+        // Regression: stow's stream id is "stow" but game commands need
+        // the shroud's object id (from the <container> target attribute).
+        use crate::core::game_objects::GameItem;
+        let mut core = AppCore::new_for_test();
+        {
+            let objects = &mut core.game_state.objects;
+            objects.register_container(
+                "stow".to_string(),
+                "My Shroud".to_string(),
+                Some("#225766691".to_string()),
+            );
+            objects
+                .add_container_item("stow", GameItem::new("333", "crystal", "quartz crystal"));
+        }
+        // 'container' must substitute to the object id, never "#stow".
+        let _ = core.handle_dot_command(".foreach gem in shroud; put item in container");
+        assert!(core.foreach.is_running());
+        assert_eq!(
+            core.take_outbound(),
+            vec!["put #333 in #225766691".to_string()]
+        );
+    }
+
+    #[test]
+    fn foreach_worn_and_floor_pseudo_targets() {
+        use crate::core::game_objects::GameItem;
+        let mut core = AppCore::new_for_test();
+        {
+            let o = &mut core.game_state.objects;
+            // A gem worn (odd, but exercises worn), a non-gem worn.
+            o.set_worn(vec![
+                GameItem::new("10", "sapphire", "blue sapphire"),
+                GameItem::new("11", "cloak", "wool cloak"),
+            ]);
+            // A gem on the ground.
+            o.set_ground(vec![GameItem::new("20", "crystal", "quartz crystal")]);
+        }
+
+        // worn target: only the gem matches; item substitution uses its id.
+        let _ = core.handle_dot_command(".foreach gem in worn; get item");
+        assert!(core.foreach.is_running());
+        assert_eq!(core.take_outbound(), vec!["get #10".to_string()]);
+        let _ = core.handle_dot_command(".stop");
+
+        // floor target reads registry ground.
+        let _ = core.handle_dot_command(".foreach gem in floor; get item");
+        assert!(core.foreach.is_running());
+        assert_eq!(core.take_outbound(), vec!["get #20".to_string()]);
+        let _ = core.handle_dot_command(".stop");
+    }
+
+    #[test]
+    fn foreach_marked_filter_triggers_scan_then_filters() {
+        use crate::core::game_objects::{GameItem, ItemStatus};
+        let mut core = AppCore::new_for_test();
+        {
+            let o = &mut core.game_state.objects;
+            o.register_container("77".to_string(), "Bandolier".to_string(), Some("#77".to_string()));
+            o.add_container_item("77", GameItem::new("101", "crystal", "quartz crystal"));
+            o.add_container_item("77", GameItem::new("102", "crystal", "smoky quartz crystal"));
+        }
+
+        // Status unknown → the filter triggers an INVENTORY FULL scan and
+        // defers, rather than running on incomplete data.
+        let _ = core.handle_dot_command(".foreach marked gem in bandolier; get item");
+        assert!(!core.foreach.is_running(), "deferred pending scan");
+        assert_eq!(core.take_outbound(), vec!["inventory full".to_string()]);
+
+        // Simulate the scan result landing on the registry.
+        core.game_state.objects.set_status(
+            "101".to_string(),
+            ItemStatus { marked: Some(true), registered: Some(false) },
+        );
+        core.game_state.objects.set_status(
+            "102".to_string(),
+            ItemStatus { marked: Some(false), registered: Some(false) },
+        );
+
+        // Re-run: now status is known, only the marked gem runs.
+        let _ = core.handle_dot_command(".foreach marked gem in bandolier; get item");
+        assert!(core.foreach.is_running());
+        assert_eq!(core.take_outbound(), vec!["get #101".to_string()]);
+    }
+
+    #[test]
+    fn foreach_rejects_unknown_container_and_dry_runs() {
+        let mut core = core_with_bandolier();
+        let _ = core.handle_dot_command(".foreach gem in knapsack; sell item");
+        assert!(!core.foreach.is_running(), "unknown container must not start");
+
+        // Dry run (no commands) lists matches without starting anything.
+        let _ = core.handle_dot_command(".foreach in bandolier");
+        assert!(!core.foreach.is_running());
+        assert!(core.take_outbound().is_empty());
     }
 }

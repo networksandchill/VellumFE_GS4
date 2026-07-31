@@ -36,8 +36,13 @@ center, and right sidebar. Toggle zones from the top toolbar.
 - **Move a window**: drag its title bar (free placement in the center), or
   **Alt+drag** the window body to move it between zones.
 - **Resize**: drag any window edge or corner.
-- **Add/hide windows**: the **Windows** menu in the toolbar — add from
-  categorized templates, toggle visibility, or reassign a window's zone.
+- **The Windows manager**: the **Windows** button in the toolbar opens one
+  window listing everything the client knows about — layout widgets, game
+  dialogs, streams, and containers — grouped by category and collapsible.
+  Each row has a **show/hide checkbox** and a **Zone** selector; **➕ Add
+  window…** creates a new one (custom windows open the editor). Hidden
+  windows stay hidden even when the game re-sends them (there is no dialog
+  blocklist — hiding is the control).
 - **Right-click** a window body for its context menu — including **Edit
   Window…**, which opens the window editor; title bars can be hidden
   per-window. Overlapping windows in the center area offer **Send to
@@ -171,8 +176,11 @@ avoid doubled inputs).
 Everything else is yours to bind with **`.controller`**: each button
 maps to a keybind action or macro, with a "press a button" capture in
 the editor (`look` on South and interact mode on Start ship as
-defaults). Bindings live in the `[controller]` table of the global
-keybinds.toml and apply to all characters.
+defaults). Bindings live in the `[controller]` table of
+[controller.toml](../configuration/controller-toml.md). A **Save to:**
+switch at the top of the editor picks global (all characters) or the
+active character's own override file; loading merges character over
+global, so a class can keep only its own diffs.
 
 Beyond plain bindings:
 

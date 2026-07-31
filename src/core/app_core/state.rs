@@ -104,6 +104,9 @@ pub struct AppCore {
     pub map: crate::core::map_service::MapService,
     /// Downloads released mapdbs from GitHub (Settings > Map).
     pub map_updater: crate::core::mapdb_update::MapDbUpdater,
+    /// The asset manager (`.jinx`): off-thread install/update against
+    /// federated repos, polled each frame like `map_updater`.
+    pub jinx_worker: crate::core::jinx::worker::JinxWorker,
     /// Native go2: the walk executor and its outbound command queue.
     pub travel: crate::core::travel::TravelService,
     /// Macro sleep segments (`look\rs2\rhide`): commands waiting out
@@ -182,6 +185,13 @@ pub struct AppCore {
     /// (keybinds.toml or an earlier hotbar button). Editors surface these.
     pub hotbar_key_conflicts: Vec<crate::core::app_core::keybinds::HotbarKeyConflict>,
 
+    /// Item classifier from the data pack, built on first use.
+    /// `.data reload` drops it so the next use re-resolves sources.
+    pub gameobj_data: Option<std::sync::Arc<crate::core::gameobj_data::GameObjData>>,
+
+    /// `.foreach` batch runner (automation lease root when active).
+    pub foreach: crate::core::foreach::ForeachService,
+
     // === Dialog Position Persistence ===
     /// Saved dialog positions loaded from widget_state.toml
     /// Updated when dialogs with save='t' are dragged/resized
@@ -189,6 +199,38 @@ pub struct AppCore {
 }
 
 impl AppCore {
+    /// Item classifier (gameobj-data.xml), built on first use from the
+    /// data pack: Lich folder > local store > bundled snapshot.
+    pub fn gameobj_data(&mut self) -> std::sync::Arc<crate::core::gameobj_data::GameObjData> {
+        if self.gameobj_data.is_none() {
+            let resolved = crate::core::data_pack::resolve(
+                &crate::core::data_pack::GAMEOBJ_DATA,
+                self.config.map.lich_dir.as_deref(),
+            );
+            let data = crate::core::gameobj_data::GameObjData::parse(&resolved.content);
+            tracing::info!(
+                "gameobj-data loaded from {}: {} types, {} sellable, {} skipped regexes",
+                resolved.source.label(),
+                data.type_count(),
+                data.sellable_count(),
+                data.skipped.len()
+            );
+            self.gameobj_data = Some(std::sync::Arc::new(data));
+        }
+        self.gameobj_data
+            .clone()
+            .expect("gameobj_data initialized above")
+    }
+
+    /// Drop and rebuild the item classifier from the data pack, in both
+    /// AppCore and the message processor (the sorter's copy). Returns the
+    /// reloaded type count. Shared by `.data reload` and Settings > Data.
+    pub fn reload_data_pack(&mut self) -> usize {
+        self.gameobj_data = None;
+        self.message_processor.reset_gameobj_cache();
+        self.gameobj_data().type_count()
+    }
+
     /// Create a new AppCore instance
     /// Disk-free constructor for unit tests: default config, empty layout,
     /// no cmdlist/sound, TTS disabled. Never touches VELLUM_FE_DIR.
@@ -218,6 +260,7 @@ impl AppCore {
                 temp.join("map_overrides.json"),
             ),
             map_updater: crate::core::mapdb_update::MapDbUpdater::new(temp.join("mapdb")),
+            jinx_worker: crate::core::jinx::worker::JinxWorker::new(None),
             travel: Default::default(),
             timed_commands: Vec::new(),
             remote_map_cache: None,
@@ -262,6 +305,8 @@ impl AppCore {
             base_layout_name: None,
             keybind_map,
             hotbar_key_conflicts: Vec::new(),
+            gameobj_data: None,
+            foreach: Default::default(),
             saved_dialog_positions,
         }
     }
@@ -345,6 +390,7 @@ impl AppCore {
             map_updater: crate::core::mapdb_update::MapDbUpdater::new(
                 crate::core::mapdb_update::download_dir(&map_base),
             ),
+            jinx_worker: crate::core::jinx::worker::JinxWorker::new(None),
             travel: Default::default(),
             timed_commands: Vec::new(),
             remote_map_cache: None,
@@ -389,6 +435,8 @@ impl AppCore {
             base_layout_name: None,
             keybind_map,
             hotbar_key_conflicts,
+            gameobj_data: None,
+            foreach: Default::default(),
             saved_dialog_positions,
         };
 
@@ -545,6 +593,8 @@ impl AppCore {
             self.add_system_message(&format!("[map] {text}"));
         }
         self.tick_travel();
+        self.tick_foreach();
+        self.poll_jinx();
         // Browse replies waiting on the layout worker.
         self.service_pending_map_views();
         // A layout that finished generating between game lines still needs
@@ -554,6 +604,79 @@ impl AppCore {
         {
             self.last_remote_map_revision = self.map.revision;
             self.flush_remote_state();
+        }
+    }
+
+    /// Drain the asset-manager worker: print each line to the game text and
+    /// apply any post-install effect. Called once per frame from `poll_map`,
+    /// alongside the map worker it mirrors.
+    pub fn poll_jinx(&mut self) {
+        let updates = self.jinx_worker.poll();
+        for update in updates {
+            self.add_system_message(&update.line);
+            if let Some(effect) = update.effect {
+                self.apply_jinx_effect(effect);
+            }
+        }
+    }
+
+    /// Apply a post-install side effect on the main thread (reloads touch
+    /// `AppCore` and can't run on the worker). Reloads that already exist run
+    /// live; kinds whose reload plumbing isn't built yet say so plainly rather
+    /// than silently leaving a stale in-memory copy.
+    fn apply_jinx_effect(&mut self, effect: crate::core::jinx::worker::Effect) {
+        use crate::core::jinx::worker::Effect;
+        match effect {
+            Effect::Installed { name, kind } => match name.as_str() {
+                // gameobj-data.xml re-resolves live: drop the cache and the
+                // next classify() reads the freshly installed global/data copy.
+                "gameobj-data.xml" => {
+                    let types = self.reload_data_pack();
+                    self.add_system_message(&format!(
+                        "[jinx] gameobj classifier reloaded ({types} types)"
+                    ));
+                }
+                // effect-list.xml re-reads live: spell_table prefers the
+                // freshly installed global/data copy and swaps its table.
+                "effect-list.xml" => {
+                    let count = crate::core::spell_table::reload();
+                    self.add_system_message(&format!(
+                        "[jinx] spell table reloaded ({count} spells)"
+                    ));
+                }
+                // mapdb.json landed in the map dir; resolve_source now
+                // recognizes a plain mapdb.json (below any versioned release),
+                // so re-resolving the source loads it live.
+                "mapdb.json" => {
+                    self.refresh_map_source();
+                    self.add_system_message("[jinx] map database reloaded");
+                }
+                _ => match kind.as_str() {
+                    // A skin's files land under skins/<name>/; list_skins and
+                    // load_manifest read that dir live, so the new skin is
+                    // immediately selectable. Activation stays user-driven
+                    // (accessibility-first: never auto-restyle). Suggest the
+                    // exact .setskin command, using the skin's dir name (the
+                    // archive extension stripped).
+                    "skin" => {
+                        let skin_name = name.rsplit_once('.').map_or(name.as_str(), |(s, _)| s);
+                        self.add_system_message(&format!(
+                            "[jinx] skin installed — activate with .setskin {skin_name}"
+                        ));
+                    }
+                    "iconmap" | "image" | "icon" => self.add_system_message(&format!(
+                        "[jinx] {name} installed to the icon pool"
+                    )),
+                    // A doll base image lands in the doll pool; a skin points
+                    // its [injury_doll] base at it (paths may be absolute).
+                    "doll" => self.add_system_message(&format!(
+                        "[jinx] {name} installed to the doll pool"
+                    )),
+                    _ => {
+                        tracing::info!("jinx installed {name} ({kind}); no reload hook");
+                    }
+                },
+            },
         }
     }
 
@@ -617,11 +740,45 @@ impl AppCore {
         }
     }
 
+    /// Advance the `.foreach` runner. Called from the same two places as
+    /// `tick_travel` (per network line + per frontend frame).
+    pub fn tick_foreach(&mut self) {
+        if !self.foreach.is_running() {
+            return;
+        }
+        let ctx = crate::core::foreach::ForeachContext {
+            rt_remaining: self.game_state.roundtime_remaining() as f64,
+            now_ms: self.foreach.now_ms(),
+            dead: self.game_state.status.dead,
+        };
+        let events = self.foreach.tick(&ctx);
+        for event in events {
+            match event {
+                crate::core::foreach::ForeachEvent::Status(text) => {
+                    self.add_system_message(&format!("[foreach] {text}"));
+                }
+                crate::core::foreach::ForeachEvent::Done { items } => {
+                    self.add_system_message(&format!(
+                        "[foreach] done - {items} item{} processed.",
+                        if items == 1 { "" } else { "s" }
+                    ));
+                }
+                crate::core::foreach::ForeachEvent::Failed(reason) => {
+                    self.add_system_message(&format!("[foreach] {reason}"));
+                }
+                crate::core::foreach::ForeachEvent::Send(_) => {
+                    unreachable!("queued by the service")
+                }
+            }
+        }
+    }
+
     /// Commands automation wants sent to the game; frontends drain this
     /// through the same path as typed commands. Includes macro sleep
     /// segments whose pause has elapsed.
     pub fn take_outbound(&mut self) -> Vec<String> {
         let mut commands = self.travel.take_outbound();
+        commands.extend(self.foreach.take_outbound());
         let now = std::time::Instant::now();
         let mut i = 0;
         while i < self.timed_commands.len() {
@@ -642,6 +799,15 @@ impl AppCore {
 
     /// Plan and begin a trip to a mapdb room id.
     pub fn start_travel(&mut self, destination: u32) {
+        // Lease gate: a different automation root (e.g. a running foreach)
+        // must be stopped first; a go2-owned chain retargets as always.
+        if let Some(owner) = self.automation_blocked_by("go2") {
+            self.add_system_message(&format!(
+                "[go2] {} is driving - .stop to cancel it first.",
+                owner.desc
+            ));
+            return;
+        }
         let Some(db) = self.map.mapdb().cloned() else {
             self.add_system_message(
                 "[go2] map database not loaded - configure it in Settings > Map",
@@ -1128,7 +1294,7 @@ impl AppCore {
             }
         } else {
             for window_def in &self.layout.windows {
-                if !window_def.base().visible {
+                if !window_def.base().visibility.is_shown() {
                     continue;
                 }
                 let name = window_def.name();
@@ -1200,6 +1366,7 @@ impl AppCore {
             crate::data::WidgetType::Betrayer => "betrayer",
             crate::data::WidgetType::Items => "items",
             crate::data::WidgetType::WebUi => "webui",
+            crate::data::WidgetType::DialogPanel => "dialogpanel",
         };
         focusable.contains(kind)
     }
@@ -1736,7 +1903,7 @@ impl AppCore {
         // Create windows based on layout (only visible ones)
         for window_def in &self.layout.windows {
             // Skip hidden windows
-            if !window_def.base().visible {
+            if !window_def.base().visibility.is_shown() {
                 tracing::debug!("Skipping hidden window '{}' during init", window_def.name());
                 continue;
             }
@@ -2659,9 +2826,10 @@ impl AppCore {
         }
 
         self.sync_map_room();
-        // Walk executor reacts to whatever this line changed (room, RT,
+        // Automation reacts to whatever this line changed (room, RT,
         // status); the per-frame tick covers pure time-based waits.
         self.tick_travel();
+        self.tick_foreach();
 
         Ok(())
     }
@@ -2825,7 +2993,6 @@ impl AppCore {
             ".lockwindows".to_string(),
             ".lockall".to_string(),
             // Containers
-            ".containers".to_string(),
             ".hidecontainers".to_string(),
             // Menu system
             ".menu".to_string(),
@@ -2975,9 +3142,13 @@ impl AppCore {
         self.add_system_message("  .reload [category]      - Reload config from disk (highlights|keybinds|hotbars|settings|colors)");
         self.add_system_message("  .room                   - Show how the current room resolved against the mapdb");
         self.add_system_message("  .mapdb [download|remove|repo <r>] - Manage downloaded map data (status by default)");
+        self.add_system_message("  .data [status|reload]   - Shared game-data assets: source + age (Lich folder > local > bundled)");
         self.add_system_message("  .go2 <target>           - Travel there (room id, uid, tag, saved name, or text search)");
         self.add_system_message("  .go2 stop|status        - Cancel / show the active trip");
         self.add_system_message("  .go2 save <name> [id]   - Save a target (.go2 targets lists, .go2 back returns)");
+        self.add_system_message("  .sorter [on|off]        - Categorize 'look in container' output by item type");
+        self.add_system_message("  .foreach ... in <bag>; cmd; cmd - Batch commands over matching container items (.foreach for usage)");
+        self.add_system_message("  .stop                   - Stop whatever automation is driving (go2 trip, foreach run)");
         self.add_system_message("");
 
         // Layout commands
@@ -3299,8 +3470,8 @@ impl AppCore {
         // Find ALL windows with this name and mark as hidden (handles duplicates)
         let mut found_count = 0;
         for window_def in self.layout.windows.iter_mut() {
-            if window_def.name() == name && window_def.base().visible {
-                window_def.base_mut().visible = false;
+            if window_def.name() == name && window_def.base().visibility.is_shown() {
+                window_def.base_mut().visibility = crate::config::WindowVisibility::Hidden;
                 found_count += 1;
             }
         }
@@ -3360,26 +3531,112 @@ impl AppCore {
 
     /// Process pending window additions from openDialog events.
     /// Called by the frontend each frame with terminal dimensions.
+    /// Whether a layout window equivalent to `template_name` already exists,
+    /// regardless of its display name. Dialog-driven singleton widgets
+    /// (experience/stance/encum/minivitals/injuries/buffs/…) get placed by
+    /// the user under an auto-generated `custom-*` name, so a bare
+    /// `w.name() == template_name` check misses them and the game re-adds a
+    /// duplicate on every dialog re-send. Match on the template's WIDGET
+    /// TYPE instead — plus the distinguishing data field for the two types
+    /// that legitimately allow multiple instances (Progress `id`,
+    /// ActiveEffects `category`), so a Buffs window doesn't shadow Debuffs
+    /// and a stance bar doesn't shadow an unrelated progress bar.
+    fn layout_has_equivalent_window(&self, template_name: &str) -> bool {
+        self.layout_equivalent_window_name(template_name).is_some()
+    }
+
+    /// The NAME of an existing layout window equivalent to `template_name`
+    /// (see layout_has_equivalent_window for the identity rules), or None.
+    fn layout_equivalent_window_name(&self, template_name: &str) -> Option<String> {
+        use crate::config::WindowDef;
+        let template = crate::config::Config::get_window_template(template_name)?;
+        let tmpl_type = template.widget_type();
+        self.layout
+            .windows
+            .iter()
+            .find(|w| {
+                if w.widget_type() != tmpl_type {
+                    return false;
+                }
+                match (&template, *w) {
+                    // Disambiguate the shared types by their identity field.
+                    (WindowDef::Progress { data: t, .. }, WindowDef::Progress { data: w, .. }) => {
+                        t.id == w.id
+                    }
+                    (
+                        WindowDef::ActiveEffects { data: t, .. },
+                        WindowDef::ActiveEffects { data: w, .. },
+                    ) => t.category.eq_ignore_ascii_case(&w.category),
+                    // All other singleton types: one per layout, type is enough.
+                    _ => true,
+                }
+            })
+            .map(|w| w.name().to_string())
+    }
+
     pub fn process_pending_window_additions(&mut self, terminal_width: u16, terminal_height: u16) {
-        // Drain pending additions
+        use crate::config::WindowBinding;
+        // Drain pending additions. As of U2 these are DIALOG IDS (e.g.
+        // "expr", "stance"), not template names — so we can bind the created
+        // window to its game feed.
         let pending: Vec<String> = self.ui_state.pending_window_additions.drain(..).collect();
 
-        for name in pending {
-            // Check if window already exists and is visible
-            let already_visible = self
-                .layout
-                .windows
-                .iter()
-                .any(|w| w.name() == name && w.base().visible);
+        for dialog_id in pending {
+            let template_name = crate::config::Config::dialog_id_to_template(&dialog_id).to_string();
 
-            if already_visible {
-                // Window exists in layout - just make sure it's in UI state
-                if !self.ui_state.windows.contains_key(&name) {
-                    // Create UI state for existing layout window
-                    if let Some(window_def) = self.layout.windows.iter().find(|w| w.name() == name) {
-                        let window_def_clone = window_def.clone();
-                        self.add_new_window(&window_def_clone, terminal_width, terminal_height);
-                        tracing::info!("Created UI state for existing layout window '{}'", name);
+            // Already have a window bound to this feed? The game only ever
+            // needs one home per feed to create — refresh flows to all bound
+            // windows via the normal data path, so just ensure UI state
+            // exists for any shown bound window and move on (no duplicate).
+            if self.layout.has_window_bound_to(&dialog_id) {
+                let bound_shown: Vec<String> = self
+                    .layout
+                    .windows
+                    .iter()
+                    .filter(|w| {
+                        w.base().binding.as_ref().is_some_and(|b| b.id() == dialog_id)
+                            && w.base().visibility.is_shown()
+                    })
+                    .map(|w| w.name().to_string())
+                    .collect();
+                for name in bound_shown {
+                    if !self.ui_state.windows.contains_key(&name) {
+                        if let Some(def) = self.layout.windows.iter().find(|w| w.name() == name) {
+                            let def = def.clone();
+                            self.add_new_window(&def, terminal_width, terminal_height);
+                            self.needs_render = true;
+                            self.ui_state.needs_widget_reset = true;
+                        }
+                    }
+                }
+                continue;
+            }
+
+            // No bound window yet. A user may have an EQUIVALENT widget placed
+            // under a renamed custom-* name (U0) — adopt it by tagging the
+            // binding, so future feeds resolve by id and we never duplicate.
+            if let Some(existing_name) = self.layout_equivalent_window_name(&template_name) {
+                if let Some(def) = self
+                    .layout
+                    .windows
+                    .iter_mut()
+                    .find(|w| w.name() == existing_name)
+                {
+                    def.base_mut().binding = Some(WindowBinding::Dialog(dialog_id.clone()));
+                }
+                // Ensure UI state if it's shown.
+                let shown = self
+                    .layout
+                    .windows
+                    .iter()
+                    .find(|w| w.name() == existing_name)
+                    .map(|w| w.base().visibility.is_shown())
+                    .unwrap_or(false);
+                if shown && !self.ui_state.windows.contains_key(&existing_name) {
+                    if let Some(def) = self.layout.windows.iter().find(|w| w.name() == existing_name)
+                    {
+                        let def = def.clone();
+                        self.add_new_window(&def, terminal_width, terminal_height);
                         self.needs_render = true;
                         self.ui_state.needs_widget_reset = true;
                     }
@@ -3387,28 +3644,32 @@ impl AppCore {
                 continue;
             }
 
-            // Add window to layout from template
-            if let Err(e) = self.layout.add_window(&name) {
-                tracing::warn!("Failed to auto-add window '{}' from dialog: {}", name, e);
+            // Genuinely new: add the templated window, bound to this feed.
+            // (U2a keeps the current visible-spawn behavior; U2b gates on
+            // visibility so a hidden binding suppresses the auto-spawn.)
+            if let Err(e) = self.layout.add_window(&template_name) {
+                tracing::warn!("Failed to auto-add window '{}': {}", template_name, e);
                 continue;
             }
-
-            // Get the window definition and create UI state. Templates with
-            // auto-generated names (spacers, `*_custom` blanks) don't match
-            // the template name; the window just added is the last entry.
-            let window_def = self
+            let created = self
                 .layout
                 .windows
                 .iter()
-                .find(|w| w.name() == name)
-                .or_else(|| self.layout.windows.last());
-            if let Some(window_def) = window_def {
-                let window_def_clone = window_def.clone();
-                self.add_new_window(&window_def_clone, terminal_width, terminal_height);
-                tracing::info!("Auto-added window '{}' from openDialog", name);
-                self.needs_render = true;
-                // Signal frontend to rebuild widget caches so new window is rendered
-                self.ui_state.needs_widget_reset = true;
+                .rev()
+                .find(|w| w.widget_type() == template_name || w.name() == template_name)
+                .or_else(|| self.layout.windows.last())
+                .map(|w| w.name().to_string());
+            if let Some(name) = created {
+                if let Some(def) = self.layout.windows.iter_mut().find(|w| w.name() == name) {
+                    def.base_mut().binding = Some(WindowBinding::Dialog(dialog_id.clone()));
+                }
+                if let Some(def) = self.layout.windows.iter().find(|w| w.name() == name) {
+                    let def = def.clone();
+                    self.add_new_window(&def, terminal_width, terminal_height);
+                    tracing::info!("Auto-added bound window '{}' from openDialog '{}'", name, dialog_id);
+                    self.needs_render = true;
+                    self.ui_state.needs_widget_reset = true;
+                }
             }
         }
     }
@@ -3487,6 +3748,288 @@ impl AppCore {
         );
     }
 
+    /// Create an ephemeral dockable panel window for a resident dialog
+    /// (combat, befriend, ...). Positioned like an ephemeral container
+    /// window; content renders from ui_state.dialog_store by `dialog_id`.
+    pub fn create_dialog_panel_window(
+        &mut self,
+        dialog_id: &str,
+        title: &str,
+        terminal_width: u16,
+        terminal_height: u16,
+    ) {
+        use crate::data::{WidgetType, WindowContent, WindowPosition, WindowState};
+
+        let window_name = format!("panel_{}", dialog_id.replace(' ', "_").to_lowercase());
+        if self.ui_state.windows.contains_key(&window_name) {
+            return;
+        }
+
+        // Panels are tall and narrow (combat is ~190x288 px → ~24x18 cells).
+        let (w, h) = (26u16, 20u16);
+        let (x, y) = if let Some(saved) = self.saved_dialog_positions.dialogs.get(dialog_id) {
+            (
+                saved.x.min(terminal_width.saturating_sub(w)),
+                saved.y.min(terminal_height.saturating_sub(h)),
+            )
+        } else {
+            // Default toward the right edge, the game's usual hint.
+            (terminal_width.saturating_sub(w + 1), 1)
+        };
+
+        let window = WindowState {
+            name: window_name.clone(),
+            widget_type: WidgetType::DialogPanel,
+            content: WindowContent::DialogPanel {
+                dialog_id: dialog_id.to_string(),
+            },
+            position: WindowPosition {
+                x: crate::data::geometry::Col::new(x),
+                y: crate::data::geometry::Row::new(y),
+                width: crate::data::geometry::Width::new(w),
+                height: crate::data::geometry::Height::new(h),
+            },
+            visible: true,
+            focused: false,
+            content_align: None,
+            ephemeral: true,
+        };
+        self.ui_state.set_window(window_name.clone(), window);
+        self.ui_state.ephemeral_windows.insert(window_name);
+        self.add_system_message(&format!("Opened {} panel", title));
+        self.needs_render = true;
+    }
+
+    /// Apply a user show/hide choice from the "known windows" list: record
+    /// the policy on the offer and create or close the corresponding
+    /// window. Currently wires container offers to ephemeral container
+    /// windows; dialog/stream offers record policy for now (their window
+    /// wiring lands as those consumption paths migrate).
+    /// U3: show or hide a known window by NAME (from enumerate_known_windows),
+    /// with no offer registry. Dispatches on where the window lives:
+    /// - a persistent LAYOUT window (incl. bound streams / dialog panels):
+    ///   flip visibility via show_window / hide_window.
+    /// - a session-only EPHEMERAL window (container, ad-hoc panel): create
+    ///   or remove the runtime window.
+    /// - the bank-style POPUP: materialize from / clear active_dialog.
+    pub fn set_known_window_shown(
+        &mut self,
+        name: &str,
+        shown: bool,
+        terminal_width: u16,
+        terminal_height: u16,
+    ) {
+        // Persistent layout window? (streams, dialog panels, plain widgets)
+        if let Some(win) = self.layout.windows.iter().find(|w| w.name() == name) {
+            // Keep the dialog-popup allow-set in sync: a dialog-bound window
+            // being shown/hidden decides whether its openDialog may pop up.
+            if let Some(crate::config::WindowBinding::Dialog(id)) = win.base().binding.clone() {
+                if shown {
+                    self.ui_state.shown_dialog_ids.insert(id);
+                } else {
+                    self.ui_state.shown_dialog_ids.remove(&id);
+                }
+            }
+            if shown {
+                self.show_window(name, terminal_width, terminal_height);
+            } else {
+                self.hide_window(name);
+            }
+            return;
+        }
+
+        // Ephemeral runtime window already present (container/panel): just
+        // toggle its presence.
+        if let Some(win) = self.ui_state.windows.get(name) {
+            // A container also drops out of the session "shown" set so it
+            // doesn't re-open on the next sighting.
+            let container_title = match &win.content {
+                crate::data::WindowContent::Container { container_title } => {
+                    Some(container_title.clone())
+                }
+                _ => None,
+            };
+            if !shown {
+                self.ui_state.remove_window(name);
+                self.ui_state.ephemeral_windows.remove(name);
+                if let Some(t) = container_title {
+                    self.ui_state.shown_container_titles.remove(&t);
+                }
+                self.needs_render = true;
+            }
+            // (Re-showing an already-present ephemeral window is a no-op.)
+            return;
+        }
+
+        // Not yet materialized. Three possibilities to conjure when shown:
+        if shown {
+            // A dialog-store entry → a dialog/panel we can show.
+            if self.ui_state.dialog_store.contains_key(name) {
+                self.create_dialog_panel_window(name, name, terminal_width, terminal_height);
+                self.needs_render = true;
+                return;
+            }
+            // A sighted registry container (window name is title-derived) →
+            // remember the opt-in and open it.
+            let container_title = self
+                .game_state
+                .objects
+                .containers()
+                .find(|c| c.title.replace(' ', "_").to_lowercase() == name)
+                .map(|c| c.title.clone());
+            if let Some(title) = container_title {
+                self.ui_state.shown_container_titles.insert(title.clone());
+                self.create_ephemeral_container_window(&title, terminal_width, terminal_height);
+                self.needs_render = true;
+            }
+        }
+    }
+
+    /// Realize game-offered windows after a batch of server messages, once
+    /// terminal dimensions are known (called from every frontend's tick).
+    /// Replaces the old all-or-nothing container discovery mode: a sighted
+    /// container auto-(re)opens only if its offer policy says Shown, and
+    /// openDialog-templated widgets queued by the message processor get
+    /// added to the layout.
+    pub fn realize_offered_windows(&mut self, terminal_width: u16, terminal_height: u16) {
+        // Drain game-window discoveries the message processor observed into
+        // the layout (it can't reach the layout itself). U3: streams and
+        // resident dialog panels become bound, Hidden-by-default layout
+        // entries — known forever, not auto-shown. Idempotent per binding.
+        let discoveries: Vec<crate::data::WindowDiscovery> =
+            self.ui_state.pending_window_discoveries.drain(..).collect();
+        for d in discoveries {
+            self.register_window_discovery(d);
+        }
+
+        if let Some((_id, title)) = self.message_processor.newly_registered_container.take() {
+            // U3: a sighted container (re)opens only if the user opted it in
+            // this session (via the Windows list). Ephemeral, wiped on relog.
+            if self.ui_state.shown_container_titles.contains(&title) {
+                self.create_ephemeral_container_window(&title, terminal_width, terminal_height);
+            }
+        }
+        self.process_pending_window_additions(terminal_width, terminal_height);
+    }
+
+    /// Register a game-window discovery into the layout as a bound entry.
+    /// Streams and resident dialog panels become persistent Hidden layout
+    /// windows (known forever); the visibility default respects the config
+    /// blocklist. No-op if a window is already bound to this id.
+    fn register_window_discovery(&mut self, d: crate::data::WindowDiscovery) {
+        use crate::config::{WindowBinding, WindowVisibility, WindowDef};
+        use crate::data::WindowDiscoveryKind;
+
+        if self.layout.has_window_bound_to(&d.id) {
+            return;
+        }
+
+        // ADOPT an existing window instead of creating a duplicate:
+        // - a stream whose id a text/inventory window already subscribes to
+        //   (the default layout ships thoughts/speech/society/inv/... windows
+        //   that predate binding — tag them so the discovery doesn't make a
+        //   second "thoughts" beside the shipped "Thoughts").
+        if d.kind == WindowDiscoveryKind::Stream {
+            // A single-stream window already showing this id: ADOPT it (tag
+            // the binding) so it becomes the one true home for the stream.
+            let single = self.layout.windows.iter_mut().find(|w| match w {
+                WindowDef::Text { data, .. } => data.streams.iter().any(|s| s == &d.id),
+                WindowDef::Inventory { data, .. } | WindowDef::Reserve { data, .. } => {
+                    data.streams.iter().any(|s| s == &d.id)
+                }
+                _ => false,
+            });
+            if let Some(w) = single {
+                if w.base().binding.is_none() {
+                    w.base_mut().binding = Some(WindowBinding::Stream(d.id.clone()));
+                    self.mark_layout_modified();
+                }
+                return;
+            }
+            // A MULTI-stream window (tabbedtext) already routes this stream
+            // through a tab: don't create a duplicate, and don't bind the
+            // whole window (it carries many streams). The tab handles it.
+            let in_tab = self.layout.windows.iter().any(|w| match w {
+                WindowDef::TabbedText { data, .. } => data.tabs.iter().any(|t| {
+                    t.streams.iter().any(|s| s == &d.id)
+                        || t.stream.as_deref() == Some(d.id.as_str())
+                }),
+                _ => false,
+            });
+            if in_tab {
+                return;
+            }
+        }
+
+        // Pick the template + binding for this discovery kind.
+        let (binding, template) = match d.kind {
+            WindowDiscoveryKind::Stream => {
+                // Streams bind to a blank text window that subscribes to
+                // the id ("text_custom" is the addable blank-text template).
+                (WindowBinding::Stream(d.id.clone()), "text_custom")
+            }
+            WindowDiscoveryKind::DialogPanel => {
+                (WindowBinding::Dialog(d.id.clone()), "dialogpanel")
+            }
+            // Popups (bank) aren't layout widgets; they're handled by the
+            // active_dialog popup path. Skip layout registration for now
+            // (U5 gives bank a first-class row).
+            WindowDiscoveryKind::DialogPopup => return,
+        };
+
+        // ADOPT a window already NAMED for this feed. Resident panels (the
+        // shipped "room" room-widget, compass, ...) consume their feed by
+        // widget type rather than a `streams` subscription, so the scan
+        // above misses them. Registering here would create a SECOND window
+        // with the same name — and on load the duplicate's geometry
+        // overwrites the real window's, parking it at 0,0.
+        if let Some(w) = self.layout.windows.iter_mut().find(|w| w.name() == d.id) {
+            if w.base().binding.is_none() {
+                w.base_mut().binding = Some(binding);
+                self.mark_layout_modified();
+                tracing::info!("Discovery '{}' adopted the existing window of that name", d.id);
+            }
+            return;
+        }
+
+        if let Some(name) = self.layout.register_discovered_window(binding, template) {
+            // A new discovery changes the layout — mark it so the autosave
+            // (or .savelayout) persists it, making the window known forever.
+            self.mark_layout_modified();
+            // Set a friendly title + Shown/Hidden default.
+            if let Some(def) = self.layout.windows.iter_mut().find(|w| w.name() == name) {
+                if !d.title.is_empty() {
+                    def.base_mut().title = Some(d.title.clone());
+                }
+                // Blocklisted → stay Hidden (already the register default);
+                // otherwise a freshly discovered window is Hidden too (U3:
+                // hidden-by-default), but this is where a future policy
+                // (e.g. resident streams shown) would flip it.
+                def.base_mut().visibility = WindowVisibility::Hidden;
+                // Wire the widget to its game feed by id.
+                match (d.kind, def) {
+                    // A stream text window subscribes to the stream id.
+                    (
+                        WindowDiscoveryKind::Stream,
+                        crate::config::WindowDef::Text { data, .. },
+                    ) => {
+                        if !data.streams.contains(&d.id) {
+                            data.streams.push(d.id.clone());
+                        }
+                    }
+                    // A dialog panel renders from the dialog store by id.
+                    (
+                        WindowDiscoveryKind::DialogPanel,
+                        crate::config::WindowDef::DialogPanel { data, .. },
+                    ) => {
+                        data.dialog_id = d.id.clone();
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
     /// Close all ephemeral container windows
     pub fn close_all_ephemeral_windows(&mut self) {
         let names: Vec<_> = self.ui_state.ephemeral_windows.iter().cloned().collect();
@@ -3507,7 +4050,10 @@ impl AppCore {
 
     /// Close ephemeral container window by title (case-insensitive partial match)
     pub fn close_ephemeral_window_by_title(&mut self, title: &str) {
-        let title_lower = title.to_lowercase();
+        // Window names are built as lowercase-with-underscores (see
+        // create_ephemeral_container_window), so normalize the needle the
+        // same way or multi-word titles like "My Pack" never match.
+        let title_lower = title.to_lowercase().replace(' ', "_");
 
         // Find matching ephemeral windows
         let matches: Vec<_> = self
@@ -3727,7 +4273,8 @@ impl AppCore {
             max_rows: None,
             min_cols: None,
             max_cols: None,
-            visible: true,
+            visibility: crate::config::WindowVisibility::Shown,
+            binding: None,
             content_align: None,
             tts_speak: false,
             text_size: None,
@@ -3854,7 +4401,8 @@ impl AppCore {
             max_rows: None,
             min_cols: None,
             max_cols: None,
-            visible: true,
+            visibility: crate::config::WindowVisibility::Shown,
+            binding: None,
             content_align: None,
             tts_speak: false,
             text_size: None,
@@ -4218,9 +4766,17 @@ impl AppCore {
         ]
     }
 
-    /// Build windows submenu
+    /// Build windows submenu. U6: "Show/Hide windows" is the primary
+    /// manager (every known window, toggle each); Add creates new ones;
+    /// Edit tweaks geometry/settings. ("Hide window" is subsumed by the
+    /// Show/Hide list — you untick a row there.)
     pub fn build_windows_submenu(&self) -> Vec<crate::data::ui_state::PopupMenuItem> {
         vec![
+            crate::data::ui_state::PopupMenuItem {
+                text: "Show/Hide windows >".to_string(),
+                command: "menu:knownwindows".to_string(),
+                disabled: false,
+            },
             crate::data::ui_state::PopupMenuItem {
                 text: "Add window >".to_string(),
                 command: "menu:addwindow".to_string(),
@@ -4229,17 +4785,6 @@ impl AppCore {
             crate::data::ui_state::PopupMenuItem {
                 text: "Edit window >".to_string(),
                 command: "menu:editwindow".to_string(),
-                disabled: false,
-            },
-            // "Edit Performance" removed - now use right-click on overlay to toggle metrics
-            crate::data::ui_state::PopupMenuItem {
-                text: "Hide window >".to_string(),
-                command: "menu:hidewindow".to_string(),
-                disabled: false,
-            },
-            crate::data::ui_state::PopupMenuItem {
-                text: "List windows >".to_string(),
-                command: ".windows".to_string(),
                 disabled: false,
             },
         ]
@@ -4309,6 +4854,7 @@ impl AppCore {
             "layouts" => self.build_layouts_submenu(),
             "themes" => self.build_themes_submenu(),
             "windows" => self.build_windows_submenu(),
+            "knownwindows" => self.build_known_windows_menu(),
             _ => Vec::new(),
         }
     }
@@ -4888,22 +5434,26 @@ impl AppCore {
         match crate::config::Config::load_keybinds(self.config.character.as_deref()) {
             Ok(keybinds) => {
                 self.config.keybinds = keybinds;
+                let character = self.config.character.clone();
+                let character = character.as_deref();
                 self.config.controller_binds =
-                    crate::config::Config::load_controller_binds().unwrap_or_default();
+                    crate::config::Config::load_controller_binds(character).unwrap_or_default();
                 self.config.controller_shift_binds =
-                    crate::config::Config::load_controller_binds_layer(true).unwrap_or_default();
+                    crate::config::Config::load_controller_binds_layer(true, character)
+                        .unwrap_or_default();
                 self.config.controller_wheel =
-                    crate::config::Config::load_controller_wheel().unwrap_or_default();
+                    crate::config::Config::load_controller_wheel(character).unwrap_or_default();
                 self.config.controller_wheels =
-                    crate::config::Config::load_controller_wheels().unwrap_or_default();
+                    crate::config::Config::load_controller_wheels(character).unwrap_or_default();
                 self.config.controller_wheels_meta =
-                    crate::config::Config::load_controller_wheels_meta().unwrap_or_default();
+                    crate::config::Config::load_controller_wheels_meta(character)
+                        .unwrap_or_default();
                 self.config.controller_overlay =
-                    crate::config::Config::load_controller_overlay().unwrap_or_default();
+                    crate::config::Config::load_controller_overlay(character).unwrap_or_default();
                 self.config.controller_rumble =
-                    crate::config::Config::load_controller_rumble().unwrap_or_default();
+                    crate::config::Config::load_controller_rumble(character).unwrap_or_default();
                 self.config.controller_tuning =
-                    crate::config::Config::load_controller_tuning().unwrap_or_default();
+                    crate::config::Config::load_controller_tuning(character).unwrap_or_default();
                 // Rebuild keybind map for O(1) lookups (re-merges hotbar keys)
                 self.rebuild_keybind_map();
                 // Web clients render the wheel from a shipped copy.
@@ -4958,7 +5508,6 @@ impl AppCore {
                         self.config.ui = new_config.ui;
                         self.config.sound = new_config.sound;
                         self.config.event_patterns = new_config.event_patterns;
-                        self.config.layout_mappings = new_config.layout_mappings;
                         self.config.streams = new_config.streams;
                         self.config.target_list = new_config.target_list;
                         self.parser
@@ -5129,7 +5678,7 @@ impl AppCore {
                     .filter(|name| {
                         self.layout
                             .get_window(name)
-                            .map(|w| !w.base().visible)
+                            .map(|w| !w.base().visibility.is_shown())
                             .unwrap_or(true)
                     })
                     .map(|name| {
@@ -5158,7 +5707,7 @@ impl AppCore {
                 .filter(|name| {
                     self.layout
                         .get_window(name)
-                        .map(|w| !w.base().visible)
+                        .map(|w| !w.base().visibility.is_shown())
                         .unwrap_or(true)
                 })
                 .collect();
@@ -5223,7 +5772,146 @@ impl AppCore {
         }
     }
 
-    /// Build "Hide Window" menu showing widget categories (only categories with visible windows)
+    /// U3: the unified list of every window the client knows about, from
+    /// the layout (persistent, possibly game-bound) plus session-only
+    /// ephemeral windows (containers, dialog panels). This replaces the
+    /// separate offer registry as the source for the Windows list.
+    pub fn enumerate_known_windows(&self) -> Vec<crate::core::known_windows::KnownWindow> {
+        use crate::config::WindowBinding;
+        use crate::core::known_windows::{KnownWindow, KnownWindowKind};
+
+        let mut out: Vec<KnownWindow> = Vec::new();
+
+        // Persistent layout windows. Bound ones are game-discovered
+        // dialogs/streams; unbound ones are template/custom widgets. Skip
+        // the essentials that can't be hidden (main stream, command input).
+        for w in &self.layout.windows {
+            let base = w.base();
+            let name = base.name.clone();
+            if name == "main" || w.widget_type() == "command_input" {
+                continue;
+            }
+            let kind = match &base.binding {
+                Some(WindowBinding::Stream(_)) => KnownWindowKind::Stream,
+                Some(WindowBinding::Dialog(_)) => KnownWindowKind::Dialog,
+                Some(WindowBinding::Container(_)) => KnownWindowKind::Container,
+                None => KnownWindowKind::Layout,
+            };
+            out.push(KnownWindow {
+                name: name.clone(),
+                title: base.title.clone().unwrap_or(name),
+                kind,
+                widget_type: w.widget_type().to_string(),
+                shown: base.visibility.is_shown(),
+                ephemeral: false,
+            });
+        }
+
+        // Session-only ephemeral windows (containers, dialog panels) —
+        // these live in ui_state, not the layout.
+        for name in &self.ui_state.ephemeral_windows {
+            let Some(win) = self.ui_state.windows.get(name) else {
+                continue;
+            };
+            let (kind, wt) = match win.widget_type {
+                crate::data::WidgetType::Container => {
+                    (KnownWindowKind::Container, "container")
+                }
+                crate::data::WidgetType::DialogPanel => {
+                    (KnownWindowKind::Dialog, "dialogpanel")
+                }
+                _ => (KnownWindowKind::Layout, "text"),
+            };
+            let title = match &win.content {
+                crate::data::WindowContent::Container { container_title } => {
+                    container_title.clone()
+                }
+                _ => name.clone(),
+            };
+            out.push(KnownWindow {
+                name: name.clone(),
+                title,
+                kind,
+                widget_type: wt.to_string(),
+                shown: win.visible,
+                ephemeral: true,
+            });
+        }
+
+        // Sighted-but-not-open containers from the GameObjects registry, so
+        // the user can opt one in the first time. The toggle key is the
+        // ephemeral window name a container would get.
+        for container in self.game_state.objects.containers() {
+            if container.title.is_empty() {
+                continue;
+            }
+            let win_name = container.title.replace(' ', "_").to_lowercase();
+            if self.ui_state.windows.contains_key(&win_name) {
+                continue; // already listed above as an open ephemeral window
+            }
+            out.push(KnownWindow {
+                name: win_name,
+                title: container.title.clone(),
+                kind: KnownWindowKind::Container,
+                widget_type: "container".to_string(),
+                shown: false,
+                ephemeral: true,
+            });
+        }
+
+        out
+    }
+
+    /// Build the unified Windows list menu: every known window (from the
+    /// layout + ephemeral runtime), each row `[x]`/`[ ]` for its shown
+    /// state, grouped by kind. Selecting a row emits `__TOGGLE_WINDOW__<name>`
+    /// to flip it. U3: reads enumerate_known_windows — no offer registry.
+    pub fn build_known_windows_menu(&self) -> Vec<crate::data::ui_state::PopupMenuItem> {
+        use crate::core::known_windows::KnownWindowKind;
+        let known = self.enumerate_known_windows();
+        if known.is_empty() {
+            return vec![crate::data::ui_state::PopupMenuItem {
+                text: "(no windows known yet)".to_string(),
+                command: String::new(),
+                disabled: true,
+            }];
+        }
+        let mut items = Vec::new();
+        for kind in KnownWindowKind::MENU_ORDER {
+            let mut group: Vec<_> = known.iter().filter(|k| k.kind == kind).collect();
+            if group.is_empty() {
+                continue;
+            }
+            group.sort_by(|a, b| a.title.cmp(&b.title));
+            for k in group {
+                let mark = if k.shown { "[x]" } else { "[ ]" };
+                items.push(crate::data::ui_state::PopupMenuItem {
+                    text: format!("{} {} ({})", mark, k.title, kind.label()),
+                    command: format!("__TOGGLE_WINDOW__{}", k.name),
+                    disabled: false,
+                });
+            }
+        }
+        items
+    }
+
+    /// U3: toggle a known window's shown state by NAME (from the unified
+    /// Windows list). Flips shown↔hidden via set_known_window_shown.
+    pub fn toggle_known_window(&mut self, name: &str) {
+        let currently_shown = self
+            .enumerate_known_windows()
+            .iter()
+            .find(|k| k.name == name)
+            .map(|k| k.shown)
+            .unwrap_or(false);
+        let (w, h) = (
+            self.layout.terminal_width.unwrap_or(80),
+            self.layout.terminal_height.unwrap_or(24),
+        );
+        self.set_known_window_shown(name, !currently_shown, w, h);
+    }
+
+
     pub fn build_hide_window_menu(&self) -> Vec<crate::data::ui_state::PopupMenuItem> {
         let categories_map = crate::config::Config::get_visible_templates_by_category(&self.layout, true);
 
@@ -5528,7 +6216,7 @@ impl AppCore {
         let hidden = self
             .layout
             .get_window(name)
-            .is_some_and(|w| !w.base().visible);
+            .is_some_and(|w| !w.base().visibility.is_shown());
         if hidden {
             format!("{} (hidden)", display)
         } else {
@@ -5637,7 +6325,8 @@ mod tests {
             max_rows: None,
             min_cols: None,
             max_cols: None,
-            visible: true,
+            visibility: crate::config::WindowVisibility::Shown,
+            binding: None,
             content_align: None,
             tts_speak: false,
             text_size: None,
@@ -5651,7 +6340,7 @@ mod tests {
         // A hidden spacer must appear in the edit picker's template map when
         // include_hidden is set, and stay out of the visible-only map.
         let mut base = test_window_base("spacer_1");
-        base.visible = false;
+        base.visibility = crate::config::WindowVisibility::Hidden;
         let layout = Layout {
             windows: vec![WindowDef::Spacer {
                 base,
@@ -5815,10 +6504,10 @@ mod tests {
     fn test_generate_spacer_name_with_hidden_spacers() {
         // RED: Hidden spacers should be considered (widgets can be hidden, not deleted)
         let mut visible_base = test_window_base("spacer_1");
-        visible_base.visible = true;
+        visible_base.visibility = crate::config::WindowVisibility::Shown;
 
         let mut hidden_base = test_window_base("spacer_2");
-        hidden_base.visible = false;
+        hidden_base.visibility = crate::config::WindowVisibility::Hidden;
 
         let visible_spacer = WindowDef::Spacer {
             base: visible_base,
@@ -5965,6 +6654,467 @@ mod tests {
         assert_eq!(p.y.get(), 0);
         assert_eq!(p.width.get(), 10); // 4 raised to min_cols
         assert_eq!(p.height.get(), 20); // 30 capped at max_rows
+    }
+
+    #[test]
+    fn known_windows_menu_reflects_state_and_toggle_flips_it() {
+        use crate::data::{WindowDiscovery, WindowDiscoveryKind};
+        let mut core = core_with_layout(vec![]);
+        core.layout.terminal_width = Some(80);
+        core.layout.terminal_height = Some(24);
+
+        // Discover a stream → bound, Hidden layout entry named "thoughts".
+        core.ui_state.pending_window_discoveries.push(WindowDiscovery {
+            id: "thoughts".to_string(),
+            title: "Thoughts".to_string(),
+            kind: WindowDiscoveryKind::Stream,
+            save: false,
+        });
+        core.realize_offered_windows(80, 24);
+
+        // Fresh discovery: hidden → "[ ]" and a __TOGGLE_WINDOW__ command.
+        let menu = core.build_known_windows_menu();
+        let row = menu
+            .iter()
+            .find(|i| i.command == "__TOGGLE_WINDOW__thoughts")
+            .unwrap();
+        assert!(row.text.starts_with("[ ]"), "row: {}", row.text);
+        assert!(row.text.contains("Thoughts"));
+
+        // Toggle shows it (creates UI state).
+        core.toggle_known_window("thoughts");
+        assert!(core.ui_state.windows.contains_key("thoughts"));
+        let menu = core.build_known_windows_menu();
+        let row = menu
+            .iter()
+            .find(|i| i.command == "__TOGGLE_WINDOW__thoughts")
+            .unwrap();
+        assert!(row.text.starts_with("[x]"), "row: {}", row.text);
+
+        // Toggle again hides it.
+        core.toggle_known_window("thoughts");
+        assert!(!core.ui_state.windows.contains_key("thoughts"));
+    }
+
+    fn renamed_widget(display_name: &str, template_name: &str) -> WindowDef {
+        // A widget the user placed via the Windows list: built from a
+        // template (so category/id fields are set) but the editor renamed
+        // it to a custom-* display name, losing the template name.
+        let mut def = crate::config::Config::get_window_template(template_name)
+            .unwrap_or_else(|| panic!("no template '{}'", template_name));
+        def.base_mut().name = display_name.to_string();
+        def
+    }
+
+    #[test]
+    fn dialog_readd_does_not_duplicate_a_renamed_singleton_widget() {
+        // The bug: game re-sends the expr dialog; the user's placed widget
+        // is "custom-gs4_experience-1", so the old exact-name check missed
+        // it and spawned a duplicate on every re-send. U2: the pending
+        // queue carries the DIALOG ID ("expr"); the equivalent renamed
+        // widget gets ADOPTED (binding tagged) so re-sends resolve by id.
+        let mut core = core_with_layout(vec![renamed_widget(
+            "custom-gs4_experience-1",
+            "gs4_experience",
+        )]);
+        assert_eq!(core.layout.windows.len(), 1);
+
+        // Simulate several dialog re-sends (expr -> gs4_experience template).
+        for _ in 0..3 {
+            core.ui_state.pending_window_additions.push("expr".to_string());
+            core.process_pending_window_additions(80, 24);
+        }
+
+        // Still exactly one gs4_experience window — no duplicate spawned...
+        let count = core
+            .layout
+            .windows
+            .iter()
+            .filter(|w| w.widget_type() == "gs4_experience")
+            .count();
+        assert_eq!(count, 1, "duplicate gs4_experience window spawned");
+        // ...and it was adopted: now bound to "expr".
+        assert!(
+            core.layout.has_window_bound_to("expr"),
+            "the renamed widget should have been adopted and bound to expr"
+        );
+    }
+
+    #[test]
+    fn first_sight_creates_a_bound_window() {
+        // No existing widget: the first expr feed creates a gs4_experience
+        // window bound to "expr", and a re-send doesn't duplicate it.
+        let mut core = core_with_layout(vec![]);
+        core.ui_state.pending_window_additions.push("expr".to_string());
+        core.process_pending_window_additions(80, 24);
+
+        assert!(core.layout.has_window_bound_to("expr"));
+        assert_eq!(
+            core.layout.windows.iter().filter(|w| w.widget_type() == "gs4_experience").count(),
+            1
+        );
+
+        // Re-send: still one.
+        core.ui_state.pending_window_additions.push("expr".to_string());
+        core.process_pending_window_additions(80, 24);
+        assert_eq!(
+            core.layout.windows.iter().filter(|w| w.widget_type() == "gs4_experience").count(),
+            1
+        );
+    }
+
+    #[test]
+    fn one_feed_delivers_to_multiple_bound_windows() {
+        // Nisugi's rule: 3 windows bound to "expr" all count as "exists"
+        // (no new spawn) and windows_bound_to lists all of them for delivery.
+        let mut core = core_with_layout(vec![]);
+        for i in 0..3 {
+            let mut def = crate::config::Config::get_window_template("gs4_experience").unwrap();
+            def.base_mut().name = format!("xp{}", i);
+            def.base_mut().binding =
+                Some(crate::config::WindowBinding::Dialog("expr".to_string()));
+            core.layout.windows.push(def);
+        }
+        // A feed for expr must NOT spawn a 4th window.
+        core.ui_state.pending_window_additions.push("expr".to_string());
+        core.process_pending_window_additions(80, 24);
+        assert_eq!(core.layout.windows.len(), 3, "should not create a 4th");
+        // All three are addressable for delivery.
+        assert_eq!(core.layout.windows_bound_to("expr").len(), 3);
+    }
+
+    #[test]
+    fn set_known_window_shown_flips_layout_visibility() {
+        use crate::config::WindowVisibility;
+        use crate::data::{WindowDiscovery, WindowDiscoveryKind};
+        let mut core = core_with_layout(vec![]);
+        core.layout.terminal_width = Some(80);
+        core.layout.terminal_height = Some(24);
+
+        // Discover a stream (bound, Hidden layout entry).
+        core.ui_state.pending_window_discoveries.push(WindowDiscovery {
+            id: "thoughts".to_string(),
+            title: "Thoughts".to_string(),
+            kind: WindowDiscoveryKind::Stream,
+            save: false,
+        });
+        core.realize_offered_windows(80, 24);
+        let vis = |c: &AppCore| {
+            c.layout
+                .windows
+                .iter()
+                .find(|w| w.name() == "thoughts")
+                .unwrap()
+                .base()
+                .visibility
+        };
+        assert_eq!(vis(&core), WindowVisibility::Hidden);
+
+        // Show it by name → visibility flips to Shown + UI state created.
+        core.set_known_window_shown("thoughts", true, 80, 24);
+        assert_eq!(vis(&core), WindowVisibility::Shown);
+        assert!(core.ui_state.windows.contains_key("thoughts"));
+
+        // Hide it → back to Hidden, removed from UI state.
+        core.set_known_window_shown("thoughts", false, 80, 24);
+        assert_eq!(vis(&core), WindowVisibility::Hidden);
+        assert!(!core.ui_state.windows.contains_key("thoughts"));
+    }
+
+    #[test]
+    fn showing_a_dialog_window_syncs_shown_dialog_ids() {
+        // U6: showing/hiding a dialog-bound window flips its id in
+        // shown_dialog_ids, which the message processor's popup gate reads.
+        use crate::config::WindowBinding;
+        let mut core = core_with_layout(vec![]);
+        core.layout.terminal_width = Some(80);
+        core.layout.terminal_height = Some(24);
+        let mut bank = crate::config::Config::get_window_template("stance").unwrap();
+        bank.base_mut().name = "bank".to_string();
+        bank.base_mut().binding = Some(WindowBinding::Dialog("bank".to_string()));
+        bank.base_mut().visibility = crate::config::WindowVisibility::Hidden;
+        core.layout.windows.push(bank);
+
+        assert!(!core.ui_state.shown_dialog_ids.contains("bank"));
+        core.set_known_window_shown("bank", true, 80, 24);
+        assert!(core.ui_state.shown_dialog_ids.contains("bank"));
+        core.set_known_window_shown("bank", false, 80, 24);
+        assert!(!core.ui_state.shown_dialog_ids.contains("bank"));
+    }
+
+    #[test]
+    fn rediscovery_of_a_persisted_window_is_idempotent() {
+        // U4: after a persisted discovered window reloads (simulated: a
+        // bound Hidden layout entry already present), the game re-announcing
+        // it must NOT create a duplicate, and must NOT force it visible.
+        use crate::config::{WindowBinding, WindowVisibility};
+        use crate::data::{WindowDiscovery, WindowDiscoveryKind};
+        let mut core = core_with_layout(vec![]);
+        // Simulate a reloaded layout: combat already bound + Hidden.
+        let mut combat = crate::config::Config::get_window_template("stance").unwrap();
+        combat.base_mut().name = "combat".to_string();
+        combat.base_mut().binding = Some(WindowBinding::Dialog("combat".to_string()));
+        combat.base_mut().visibility = WindowVisibility::Hidden;
+        core.layout.windows.push(combat);
+        assert_eq!(core.layout.windows.len(), 1);
+
+        // The game re-announces combat this session.
+        core.ui_state.pending_window_discoveries.push(WindowDiscovery {
+            id: "combat".to_string(),
+            title: "Combat".to_string(),
+            kind: WindowDiscoveryKind::DialogPanel,
+            save: false,
+        });
+        core.realize_offered_windows(80, 24);
+
+        // No duplicate; still Hidden.
+        assert_eq!(core.layout.windows_bound_to("combat").len(), 1);
+        assert_eq!(
+            core.layout.windows.iter().find(|w| w.name() == "combat").unwrap().base().visibility,
+            WindowVisibility::Hidden
+        );
+    }
+
+    #[test]
+    fn stream_discovery_adopts_existing_subscriber_no_duplicate() {
+        use crate::config::{WindowBinding, WindowDef};
+        use crate::data::{WindowDiscovery, WindowDiscoveryKind};
+
+        // A single-stream text window already subscribes to "thoughts"
+        // (like the default layout's thoughts window, unbound).
+        let mut thoughts = crate::config::Config::get_window_template("text_custom").unwrap();
+        thoughts.base_mut().name = "Thoughts".to_string();
+        if let WindowDef::Text { data, .. } = &mut thoughts {
+            data.streams.push("thoughts".to_string());
+        }
+        let mut core = core_with_layout(vec![thoughts]);
+
+        core.ui_state.pending_window_discoveries.push(WindowDiscovery {
+            id: "thoughts".to_string(),
+            title: "Thoughts".to_string(),
+            kind: WindowDiscoveryKind::Stream,
+            save: false,
+        });
+        core.realize_offered_windows(80, 24);
+
+        // No duplicate — the existing window was adopted (bound), not cloned.
+        assert_eq!(core.layout.windows.len(), 1, "no duplicate thoughts window");
+        assert_eq!(
+            core.layout.windows[0].base().binding,
+            Some(WindowBinding::Stream("thoughts".to_string()))
+        );
+    }
+
+    #[test]
+    fn stream_discovery_skips_when_a_tab_already_routes_it() {
+        use crate::config::WindowDef;
+        use crate::data::{WindowDiscovery, WindowDiscoveryKind};
+
+        // A tabbedtext window has a tab subscribing to "thoughts".
+        let mut tabbed = crate::config::Config::get_window_template("tabbedtext_custom").unwrap();
+        tabbed.base_mut().name = "chat".to_string();
+        if let WindowDef::TabbedText { data, .. } = &mut tabbed {
+            data.tabs.push(crate::config::TabbedTextTab {
+                name: "Thoughts".to_string(),
+                stream: Some("thoughts".to_string()),
+                streams: vec!["thoughts".to_string()],
+                ..Default::default()
+            });
+        }
+        let mut core = core_with_layout(vec![tabbed]);
+
+        core.ui_state.pending_window_discoveries.push(WindowDiscovery {
+            id: "thoughts".to_string(),
+            title: "Thoughts".to_string(),
+            kind: WindowDiscoveryKind::Stream,
+            save: false,
+        });
+        core.realize_offered_windows(80, 24);
+
+        // No new window: the tab already routes it (whole tabbed window not
+        // bound, since it carries many streams).
+        assert_eq!(core.layout.windows.len(), 1, "no duplicate for tab-routed stream");
+        assert!(core.layout.windows[0].base().binding.is_none());
+    }
+
+    #[test]
+    fn stream_discovery_adopts_a_resident_panel_of_the_same_name() {
+        use crate::config::WindowBinding;
+        use crate::data::{WindowDiscovery, WindowDiscoveryKind};
+        // The shipped "room" widget consumes the room feed by widget type,
+        // not a `streams` subscription, so the subscriber scan misses it.
+        // Discovery must adopt it rather than add a second window named
+        // "room" — the duplicate parked the real one at 0,0 on load.
+        let mut room = crate::config::Config::get_window_template("room").expect("room template");
+        room.base_mut().name = "room".to_string();
+        let mut core = core_with_layout(vec![room]);
+
+        core.ui_state.pending_window_discoveries.push(WindowDiscovery {
+            id: "room".to_string(),
+            title: "Room".to_string(),
+            kind: WindowDiscoveryKind::Stream,
+            save: false,
+        });
+        core.realize_offered_windows(80, 24);
+
+        assert_eq!(core.layout.windows.len(), 1, "no duplicate 'room' window");
+        assert_eq!(core.layout.windows[0].widget_type(), "room", "kept the room widget");
+        assert_eq!(
+            core.layout.windows[0].base().binding,
+            Some(WindowBinding::Stream("room".to_string())),
+            "the existing window adopted the feed"
+        );
+    }
+
+    #[test]
+    fn window_discoveries_register_as_bound_hidden_layout_entries() {
+        use crate::config::{WindowBinding, WindowVisibility};
+        use crate::data::{WindowDiscovery, WindowDiscoveryKind};
+        let mut core = core_with_layout(vec![]);
+
+        // A stream and a resident dialog panel are discovered.
+        core.ui_state.pending_window_discoveries.push(WindowDiscovery {
+            id: "thoughts".to_string(),
+            title: "Thoughts".to_string(),
+            kind: WindowDiscoveryKind::Stream,
+            save: false,
+        });
+        core.ui_state.pending_window_discoveries.push(WindowDiscovery {
+            id: "combat".to_string(),
+            title: "Combat".to_string(),
+            kind: WindowDiscoveryKind::DialogPanel,
+            save: false,
+        });
+        core.realize_offered_windows(80, 24);
+
+        // Both became bound, Hidden layout entries (known forever, not shown).
+        assert!(core.layout.has_window_bound_to("thoughts"));
+        assert!(core.layout.has_window_bound_to("combat"));
+        for id in ["thoughts", "combat"] {
+            let w = core
+                .layout
+                .windows
+                .iter()
+                .find(|w| w.base().binding.as_ref().is_some_and(|b| b.id() == id))
+                .unwrap();
+            assert_eq!(w.base().visibility, WindowVisibility::Hidden, "{id} hidden");
+        }
+        // The stream window subscribes to its stream id.
+        let stream_win = core
+            .layout
+            .windows
+            .iter()
+            .find(|w| w.base().binding == Some(WindowBinding::Stream("thoughts".to_string())))
+            .unwrap();
+        if let crate::config::WindowDef::Text { data, .. } = stream_win {
+            assert!(data.streams.contains(&"thoughts".to_string()));
+        } else {
+            panic!("stream discovery should be a text window");
+        }
+
+        // Idempotent: re-discovering doesn't add duplicates.
+        core.ui_state.pending_window_discoveries.push(WindowDiscovery {
+            id: "thoughts".to_string(),
+            title: "Thoughts".to_string(),
+            kind: WindowDiscoveryKind::Stream,
+            save: false,
+        });
+        core.realize_offered_windows(80, 24);
+        assert_eq!(core.layout.windows_bound_to("thoughts").len(), 1);
+    }
+
+    #[test]
+    fn enumerate_known_windows_covers_layout_and_ephemeral() {
+        use crate::core::known_windows::KnownWindowKind;
+        // A bound (discovered) hidden dialog window, an unbound plain
+        // widget, and the un-hideable essentials.
+        let mut core = core_with_layout(vec![]);
+        let mut combat = crate::config::Config::get_window_template("stance").unwrap();
+        combat.base_mut().name = "combat".to_string();
+        combat.base_mut().title = Some("Combat".to_string());
+        combat.base_mut().binding =
+            Some(crate::config::WindowBinding::Dialog("combat".to_string()));
+        combat.base_mut().visibility = crate::config::WindowVisibility::Hidden;
+        core.layout.windows.push(combat);
+        core.layout.windows.push(positioned_text_def("main", 0, 0, 40, 10)); // essential
+        core.layout.windows.push(positioned_text_def("my_notes", 0, 0, 20, 5)); // plain
+
+        let known = core.enumerate_known_windows();
+        // "main" is filtered out (essential).
+        assert!(!known.iter().any(|k| k.name == "main"));
+        // The bound combat window is classified as a Dialog, hidden.
+        let combat = known.iter().find(|k| k.name == "combat").expect("combat listed");
+        assert_eq!(combat.kind, KnownWindowKind::Dialog);
+        assert!(!combat.shown);
+        assert_eq!(combat.title, "Combat");
+        // The unbound widget is a plain Layout window.
+        let notes = known.iter().find(|k| k.name == "my_notes").expect("notes listed");
+        assert_eq!(notes.kind, KnownWindowKind::Layout);
+        assert!(notes.shown);
+    }
+
+    #[test]
+    fn dialog_readd_disambiguates_active_effects_by_category() {
+        // Buffs and Debuffs share the ActiveEffects widget type. Having a
+        // Buffs window must NOT suppress auto-adding Debuffs.
+        let buffs = renamed_widget("custom-buffs", "buffs");
+        let mut core = core_with_layout(vec![buffs]);
+
+        // Buffs re-send: recognized, no add.
+        core.ui_state.pending_window_additions.push("buffs".to_string());
+        core.process_pending_window_additions(80, 24);
+        assert_eq!(
+            core.layout.windows.iter().filter(|w| w.widget_type() == "active_effects").count(),
+            1
+        );
+
+        // Debuffs first sight: NOT shadowed by Buffs → added.
+        core.ui_state.pending_window_additions.push("debuffs".to_string());
+        core.process_pending_window_additions(80, 24);
+        assert_eq!(
+            core.layout.windows.iter().filter(|w| w.widget_type() == "active_effects").count(),
+            2,
+            "debuffs was wrongly suppressed by the buffs window"
+        );
+    }
+
+    #[test]
+    fn container_show_hide_and_sighting_via_session_set() {
+        // U3: containers are ephemeral session windows. A sighted container
+        // auto-(re)opens only if the user opted it in (shown_container_titles);
+        // showing/hiding by name adds/removes it. Multi-word titles work.
+        let mut core = AppCore::new_for_test();
+        core.layout.terminal_width = Some(80);
+        core.layout.terminal_height = Some(24);
+        // The registry knows the container (so it's listable), title has a space.
+        core.game_state.objects.register_container(
+            "268435466".to_string(),
+            "My Pack".to_string(),
+            Some("#268435466".to_string()),
+        );
+
+        // Sighted while not opted in → no window.
+        core.message_processor.newly_registered_container =
+            Some(("268435466".to_string(), "My Pack".to_string()));
+        core.realize_offered_windows(80, 24);
+        assert!(!core.ui_state.windows.contains_key("my_pack"));
+
+        // Show it by (window) name → opted in + window created.
+        core.set_known_window_shown("my_pack", true, 80, 24);
+        assert!(core.ui_state.windows.contains_key("my_pack"));
+        assert!(core.ui_state.shown_container_titles.contains("My Pack"));
+
+        // Hide it → window closes, opt-in cleared (multi-word title works).
+        core.set_known_window_shown("my_pack", false, 80, 24);
+        assert!(!core.ui_state.windows.contains_key("my_pack"));
+        assert!(!core.ui_state.shown_container_titles.contains("My Pack"));
+
+        // Opt in, then a re-sight re-opens it automatically.
+        core.ui_state.shown_container_titles.insert("My Pack".to_string());
+        core.message_processor.newly_registered_container =
+            Some(("268435466".to_string(), "My Pack".to_string()));
+        core.realize_offered_windows(80, 24);
+        assert!(core.ui_state.windows.contains_key("my_pack"));
     }
 }
 

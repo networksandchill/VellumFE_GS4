@@ -175,6 +175,16 @@ pub enum WindowDef {
         data: ContainerWidgetData,
     },
 
+    /// Resident dialog panel (combat, befriend, ...) rendered from the
+    /// accumulated dialog store by id.
+    #[serde(rename = "dialogpanel")]
+    DialogPanel {
+        #[serde(flatten)]
+        base: WindowBase,
+        #[serde(flatten)]
+        data: DialogPanelWidgetData,
+    },
+
     #[serde(rename = "spacer")]
     Spacer {
         #[serde(flatten)]
@@ -533,6 +543,10 @@ impl WindowDef {
                 base,
                 data: WebUiWidgetData::default(),
             },
+            "dialogpanel" | "dialog_panel" => WindowDef::DialogPanel {
+                base,
+                data: DialogPanelWidgetData::default(),
+            },
             _ => return None,
         };
         Some(def)
@@ -561,6 +575,7 @@ impl WindowDef {
             WindowDef::Players { base, .. } => &base.name,
             WindowDef::Items { base, .. } => &base.name,
             WindowDef::Container { base, .. } => &base.name,
+            WindowDef::DialogPanel { base, .. } => &base.name,
             WindowDef::Spacer { base, .. } => &base.name,
             WindowDef::Quickbar { base, .. } => &base.name,
             WindowDef::Hotkeybar { base, .. } => &base.name,
@@ -598,6 +613,7 @@ impl WindowDef {
             WindowDef::Players { .. } => "players",
             WindowDef::Items { .. } => "items",
             WindowDef::Container { .. } => "container",
+            WindowDef::DialogPanel { .. } => "dialogpanel",
             WindowDef::Spacer { .. } => "spacer",
             WindowDef::Quickbar { .. } => "quickbar",
             WindowDef::Hotkeybar { .. } => "hotkeybar",
@@ -635,6 +651,7 @@ impl WindowDef {
             WindowDef::Players { base, .. } => base,
             WindowDef::Items { base, .. } => base,
             WindowDef::Container { base, .. } => base,
+            WindowDef::DialogPanel { base, .. } => base,
             WindowDef::Spacer { base, .. } => base,
             WindowDef::Quickbar { base, .. } => base,
             WindowDef::Hotkeybar { base, .. } => base,
@@ -672,6 +689,7 @@ impl WindowDef {
             WindowDef::Players { base, .. } => base,
             WindowDef::Items { base, .. } => base,
             WindowDef::Container { base, .. } => base,
+            WindowDef::DialogPanel { base, .. } => base,
             WindowDef::Spacer { base, .. } => base,
             WindowDef::Quickbar { base, .. } => base,
             WindowDef::Hotkeybar { base, .. } => base,
@@ -714,7 +732,8 @@ mod blank_tests {
             max_rows: None,
             min_cols: None,
             max_cols: None,
-            visible: true,
+            visibility: WindowVisibility::Shown,
+            binding: None,
             content_align: None,
             tts_speak: false,
             text_size: None,

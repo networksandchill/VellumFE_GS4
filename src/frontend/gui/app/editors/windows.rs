@@ -74,13 +74,17 @@ struct RoomFields {
     show_exits: bool,
 }
 
-/// gs4_experience field toggles (shared with the TUI via GS4ExperienceWidgetData).
+/// gs4_experience field toggles + bar colors (shared with the TUI via
+/// GS4ExperienceWidgetData). Colors are edited as free text (empty = None,
+/// falling back to the theme/default), matching the color_field idiom.
 struct ExperienceFields {
     show_level: bool,
     show_mind_bar: bool,
     show_exp_bar: bool,
     show_total_exp: bool,
     show_ascension_exp: bool,
+    mind_bar_color: String,
+    exp_bar_color: String,
 }
 
 /// Encumbrance display toggles (shared via EncumbranceWidgetData).
@@ -329,6 +333,8 @@ impl VellumGuiApp {
                         show_exp_bar: data.show_exp_bar,
                         show_total_exp: data.show_total_exp,
                         show_ascension_exp: data.show_ascension_exp,
+                        mind_bar_color: data.mind_bar_color.clone().unwrap_or_default(),
+                        exp_bar_color: data.exp_bar_color.clone().unwrap_or_default(),
                     });
                 }
                 crate::config::WindowDef::Encumbrance { data, .. } => {
@@ -643,6 +649,12 @@ impl VellumGuiApp {
                 data.show_exp_bar = experience.show_exp_bar;
                 data.show_total_exp = experience.show_total_exp;
                 data.show_ascension_exp = experience.show_ascension_exp;
+                let opt = |s: &str| {
+                    let t = s.trim();
+                    if t.is_empty() { None } else { Some(t.to_string()) }
+                };
+                data.mind_bar_color = opt(&experience.mind_bar_color);
+                data.exp_bar_color = opt(&experience.exp_bar_color);
                 self.app_core.layout_modified_since_save = true;
             }
         }
@@ -753,7 +765,9 @@ impl VellumGuiApp {
         // after the UI closure (the closure only borrows self immutably).
         let mut changed_global: Vec<&'static str> = Vec::new();
         // Snapshot outside the closure: the closure borrows self immutably.
-        let seen_streams = if state.supports_streams {
+        // Available for single-stream text windows AND tabbed windows (each
+        // tab picks streams from it).
+        let seen_streams = if state.supports_streams || state.tabs.is_some() {
             self.app_core.message_processor.seen_streams()
         } else {
             Vec::new()
@@ -945,6 +959,12 @@ impl VellumGuiApp {
                                          experience feed).",
                                     );
                             });
+                            ui.end_row();
+                            ui.label("Mind bar color");
+                            super::color_field(ui, &mut experience.mind_bar_color);
+                            ui.end_row();
+                            ui.label("Exp bar color");
+                            super::color_field(ui, &mut experience.exp_bar_color);
                             ui.end_row();
                         }
                         if let Some(encum) = state.encum.as_mut() {
@@ -1222,19 +1242,43 @@ impl VellumGuiApp {
                             for (index, tab) in tabs.iter_mut().enumerate() {
                                 ui.add(
                                     egui::TextEdit::singleline(&mut tab.name)
-                                        .desired_width(90.0),
+                                        .desired_width(130.0),
                                 );
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut tab.streams)
-                                        .desired_width(160.0),
-                                );
+                                ui.horizontal(|ui| {
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut tab.streams)
+                                            .desired_width(210.0)
+                                            .hint_text("stream ids, comma-separated"),
+                                    );
+                                    // Pick a seen stream to add to THIS tab.
+                                    if !seen_streams.is_empty() {
+                                        ui.menu_button("+", |ui| {
+                                            ui.set_min_width(180.0);
+                                            for (id, label) in &seen_streams {
+                                                let text = match label {
+                                                    Some(label) => format!("{} ({})", id, label),
+                                                    None => id.clone(),
+                                                };
+                                                if ui.button(text).clicked() {
+                                                    append_stream_id(&mut tab.streams, id);
+                                                    ui.close();
+                                                }
+                                            }
+                                        })
+                                        .response
+                                        .on_hover_text("Add a seen stream to this tab");
+                                    }
+                                });
                                 ui.checkbox(&mut tab.ignore_activity, "")
                                     .on_hover_text("Don't mark this tab unread on activity.");
                                 ui.checkbox(&mut tab.show_timestamps, "")
                                     .on_hover_text("Show per-line timestamps on this tab.");
                                 ui.horizontal(|ui| {
+                                    // Geometric triangles render in the bundled
+                                    // fonts; the ↑/↓ arrow block is tofu.
                                     if ui
-                                        .add_enabled(index > 0, egui::Button::new("↑").small())
+                                        .add_enabled(index > 0, egui::Button::new("▲").small())
+                                        .on_hover_text("Move up")
                                         .clicked()
                                     {
                                         move_op = Some((index, true));
@@ -1242,8 +1286,9 @@ impl VellumGuiApp {
                                     if ui
                                         .add_enabled(
                                             index + 1 < tab_count,
-                                            egui::Button::new("↓").small(),
+                                            egui::Button::new("▼").small(),
                                         )
+                                        .on_hover_text("Move down")
                                         .clicked()
                                     {
                                         move_op = Some((index, false));

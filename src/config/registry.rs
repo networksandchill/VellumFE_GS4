@@ -115,8 +115,7 @@ pub struct SettingDef {
 /// neither registered nor under one of these.
 pub const EXEMPT_PREFIXES: &[&str] = &[
     "event_patterns",             // pattern map; highlights editor territory
-    "layout_mappings",            // structured layout routing
-    "menu_keybinds",              // keybinds editor territory
+    "menu_keybinds",              // 26-field struct; .menukeybinds editor (TUI menu_keybind_editor + GUI editors/menu_keybinds)
     "quickbars",                  // quickbar definitions (config template docs)
     "ui.layout",                  // legacy empty section
     "target_list.status_abbrev",  // abbreviation map; targets editor later
@@ -351,13 +350,13 @@ static REGISTRY: LazyLock<Vec<SettingDef>> = LazyLock::new(|| {
             "Render :grin:-style shortcodes in incoming text as emoji", ui.emoji_shortcodes),
         bool_entry!("ui.color_emoji", "Color Emoji", "UI",
             "Draw emoji in color in the GUI (monochrome when off)", ui.color_emoji),
+        bool_entry!("ui.sorter_enabled", "Sort Container Looks", "UI",
+            "Categorize 'look in container' output by item type (.sorter)", ui.sorter_enabled),
         text_entry!("ui.terminal_title", "Terminal Title", "UI",
             "Terminal title template ({character}, {room}, {health}, ...); empty leaves the title alone",
             ui.terminal_title),
         opt_text_entry!("ui.betrayer_active_color", "Betrayer Active Color", "UI",
             "Highlight color for active Betrayer panel items", ui.betrayer_active_color),
-        list_entry!("ui.open_dialog_blocklist", "Dialog Blocklist", "UI",
-            "openDialog windows prevented from auto-opening", ui.open_dialog_blocklist),
         enum_entry!("ui.progress_bar_style", "Progress Bar Style", "UI",
             "Bar look: pill (rounded end caps, needs a Nerd Font) or flat",
             &["pill", "flat"], ui.progress_bar_style),

@@ -11,6 +11,8 @@ mod highlights;
 mod hotbars;
 mod indicators;
 mod keybinds;
+mod known_windows;
+mod menu_keybinds;
 mod settings;
 mod themes;
 mod windows;
@@ -24,6 +26,8 @@ pub(super) use highlights::HighlightEditorState;
 pub(super) use hotbars::HotbarEditorState;
 pub(super) use indicators::IndicatorTemplatesEditorState;
 pub(super) use keybinds::KeybindEditorState;
+pub(super) use known_windows::KnownWindowsEditorState;
+pub(super) use menu_keybinds::MenuKeybindEditorState;
 pub(super) use settings::SettingsEditorState;
 pub(super) use themes::{ThemeBrowserState, ThemeEditorState};
 pub(super) use windows::WindowEditorState;
@@ -54,6 +58,7 @@ impl VellumGuiApp {
         self.render_settings_editor(ctx);
         self.render_highlight_editor(ctx);
         self.render_keybind_editor(ctx);
+        self.render_menu_keybind_editor(ctx);
         #[cfg(feature = "gamepad")]
         self.render_controller_editor(ctx);
         self.render_hotbar_editor(ctx);
@@ -63,6 +68,7 @@ impl VellumGuiApp {
         self.render_indicator_templates_editor(ctx);
         self.render_window_editor(ctx);
         self.render_custom_windows_editor(ctx);
+        self.render_known_windows_editor(ctx);
         self.render_doll_calibration(ctx);
     }
 }

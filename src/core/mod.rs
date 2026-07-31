@@ -6,20 +6,27 @@
 
 pub mod app_core;
 pub mod bounty_parser;
+pub mod data_pack;
 pub mod emoji;
 pub mod evidence;
+pub mod foreach;
+pub mod game_objects;
+pub mod gameobj_data;
 pub mod ghost_rooms;
 pub mod highlight_engine;
 pub mod hotbar;
 pub mod input_router;
+pub mod jinx;
 pub mod layout_engine;
 pub mod map_service;
 pub mod mapdb;
 pub mod mapdb_update;
 pub mod menu_actions;
+pub mod known_windows;
 pub mod messages;
 pub mod pathing;
 pub mod remote;
+pub mod sorter;
 pub mod spell_table;
 pub mod travel;
 pub mod state;

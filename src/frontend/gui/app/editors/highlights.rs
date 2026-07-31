@@ -264,6 +264,12 @@ impl VellumGuiApp {
                 names.sort();
 
                 let row_count = names.len();
+                // Character overrides (vs global) for the [C]/[G] row tags,
+                // loaded once per render rather than per row.
+                let char_highlights = Config::load_character_highlights_only(
+                    self.app_core.config.character.as_deref(),
+                )
+                .unwrap_or_default();
                 egui::ScrollArea::vertical()
                     .id_salt("highlight_browser_scroll")
                     .auto_shrink([false, false])
@@ -273,11 +279,19 @@ impl VellumGuiApp {
                                 continue;
                             };
                             ui.horizontal(|ui| {
+                                let is_character = char_highlights.contains_key(name);
+                                let scope = if is_character { "[C]" } else { "[G]" };
+                                ui.label(egui::RichText::new(scope).weak().monospace())
+                                    .on_hover_text(if is_character {
+                                        "This character's override"
+                                    } else {
+                                        "Global (all characters)"
+                                    });
                                 if ui.small_button("Edit").clicked() {
-                                    let is_global =
-                                        !self.highlight_is_character_override(name);
                                     open_form = Some(HighlightFormState::from_pattern(
-                                        name, pattern, is_global,
+                                        name,
+                                        pattern,
+                                        !is_character,
                                     ));
                                 }
                                 if ui.small_button("Delete").clicked() {
@@ -331,17 +345,8 @@ impl VellumGuiApp {
         // Render the form on top of the browser when active.
         if let Some(mut form) = state.form.take() {
             // "(none)" + built-ins + user-defined patterns from the
-            // controller editor's Rumble tab.
-            let mut rumble_options: Vec<String> =
-                vec!["short".to_string(), "long".to_string(), "double".to_string()];
-            rumble_options.extend(
-                self.app_core
-                    .config
-                    .controller_rumble
-                    .patterns
-                    .iter()
-                    .map(|p| p.name.clone()),
-            );
+            // controller editor's Rumble tab (shared source with the TUI form).
+            let rumble_options: Vec<String> = self.app_core.config.controller_rumble.pattern_names();
             let mut form_open = true;
             let mut submitted = false;
             let mut cancelled = false;

@@ -89,6 +89,7 @@ enum FieldRef {
     // Checkboxes
     ShowTitle,
     Locked,
+    TtsSpeak,
     TransparentBg,
     ShowBorder,
     BorderTop,
@@ -153,6 +154,9 @@ enum FieldRef {
     // GS4Experience widget fields
     GS4ExpShowLevel,
     GS4ExpShowExpBar,
+    GS4ExpShowMindBar,
+    GS4ExpShowTotalExp,
+    GS4ExpShowAscensionExp,
     GS4ExpMindBarColor,
     GS4ExpExpBarColor,
     // MiniVitals widget fields
@@ -191,6 +195,7 @@ impl FieldRef {
             FieldRef::BorderStyle => 11,
             FieldRef::ShowTitle => 12,
             FieldRef::Locked => 13,
+            FieldRef::TtsSpeak => 121,
             FieldRef::TransparentBg => 14,
             FieldRef::ShowBorder => 15,
             FieldRef::BorderTop => 16,
@@ -263,6 +268,9 @@ impl FieldRef {
             FieldRef::EncumColorCritical => 108,
             FieldRef::GS4ExpShowLevel => 97,
             FieldRef::GS4ExpShowExpBar => 98,
+            FieldRef::GS4ExpShowMindBar => 118,
+            FieldRef::GS4ExpShowTotalExp => 119,
+            FieldRef::GS4ExpShowAscensionExp => 120,
             FieldRef::GS4ExpMindBarColor => 109,
             FieldRef::GS4ExpExpBarColor => 110,
             FieldRef::MiniVitalsNumbersOnly => 99,
@@ -1446,6 +1454,9 @@ pub struct WindowEditor {
     // GS4Experience widget
     gs4_exp_show_level: bool,
     gs4_exp_show_exp_bar: bool,
+    gs4_exp_show_mind_bar: bool,
+    gs4_exp_show_total_exp: bool,
+    gs4_exp_show_ascension_exp: bool,
     gs4_exp_mind_bar_color_input: TextArea<'static>,
     gs4_exp_exp_bar_color_input: TextArea<'static>,
 
@@ -1668,6 +1679,10 @@ impl WindowEditor {
                     fields.push(FieldRef::Streams);
                     fields.push(FieldRef::BufferSize);
                 }
+                // Speak new lines aloud (TTS opt-in). Text windows carry the
+                // lines TTS reads, so the toggle belongs here (mirrors the GUI,
+                // which gates tts_speak to text-carrying windows).
+                fields.push(FieldRef::TtsSpeak);
                 fields.push(FieldRef::Wordwrap);
                 fields.push(FieldRef::Timestamps);
                 fields.push(FieldRef::TextCompact);
@@ -1681,6 +1696,9 @@ impl WindowEditor {
             }
             WindowDef::Quickbar { .. } => {}
             WindowDef::Hotkeybar { .. } => {}
+            // Dialog panels have no editable content fields; the game
+            // defines their controls. Only geometry (base) applies.
+            WindowDef::DialogPanel { .. } => {}
             WindowDef::TabbedText { .. } => {
                 fields.push(FieldRef::TabBarPosition);
                 fields.push(FieldRef::TabSeparator);
@@ -1776,9 +1794,12 @@ impl WindowEditor {
                 // No special fields beyond base settings
             }
             WindowDef::GS4Experience { .. } => {
-                // GS4 Experience widget - show_level and show_exp_bar toggles, bar colors
+                // GS4 Experience widget - visibility toggles + bar colors
                 fields.push(FieldRef::GS4ExpShowLevel);
                 fields.push(FieldRef::GS4ExpShowExpBar);
+                fields.push(FieldRef::GS4ExpShowMindBar);
+                fields.push(FieldRef::GS4ExpShowTotalExp);
+                fields.push(FieldRef::GS4ExpShowAscensionExp);
                 fields.push(FieldRef::GS4ExpMindBarColor);
                 fields.push(FieldRef::GS4ExpExpBarColor);
             }
@@ -2220,17 +2241,23 @@ impl WindowEditor {
         let (
             gs4_exp_show_level,
             gs4_exp_show_exp_bar,
+            gs4_exp_show_mind_bar,
+            gs4_exp_show_total_exp,
+            gs4_exp_show_ascension_exp,
             gs4_exp_mind_bar_color,
             gs4_exp_exp_bar_color,
         ) = if let crate::config::WindowDef::GS4Experience { data, .. } = &window_def {
             (
                 data.show_level,
                 data.show_exp_bar,
+                data.show_mind_bar,
+                data.show_total_exp,
+                data.show_ascension_exp,
                 data.mind_bar_color.clone().unwrap_or_else(|| "#00FFFF".to_string()),
                 data.exp_bar_color.clone().unwrap_or_default(), // Empty = theme background
             )
         } else {
-            (true, true, "#00FFFF".to_string(), String::new())
+            (true, true, true, false, false, "#00FFFF".to_string(), String::new())
         };
 
         let mut gs4_exp_mind_bar_color_input = Self::create_textarea();
@@ -2389,6 +2416,9 @@ impl WindowEditor {
             encum_color_critical_input,
             gs4_exp_show_level,
             gs4_exp_show_exp_bar,
+            gs4_exp_show_mind_bar,
+            gs4_exp_show_total_exp,
+            gs4_exp_show_ascension_exp,
             gs4_exp_mind_bar_color_input,
             gs4_exp_exp_bar_color_input,
             minivitals_numbers_only,
@@ -2460,7 +2490,8 @@ impl WindowEditor {
             max_rows: None,
             min_cols: None,
             max_cols: None,
-            visible: true,
+            visibility: crate::config::WindowVisibility::Shown,
+            binding: None,
             content_align: None,
             tts_speak: false,
             text_size: None,
@@ -2737,6 +2768,9 @@ impl WindowEditor {
             encum_color_critical_input: Self::create_textarea(),
             gs4_exp_show_level: true,
             gs4_exp_show_exp_bar: true,
+            gs4_exp_show_mind_bar: true,
+            gs4_exp_show_total_exp: false,
+            gs4_exp_show_ascension_exp: false,
             gs4_exp_mind_bar_color_input: Self::create_textarea(),
             gs4_exp_exp_bar_color_input: Self::create_textarea(),
             minivitals_numbers_only: false,
@@ -3186,6 +3220,7 @@ impl WindowEditor {
             Some(
                 FieldRef::ShowTitle
                     | FieldRef::Locked
+                    | FieldRef::TtsSpeak
                     | FieldRef::TransparentBg
                     | FieldRef::ShowBorder
                     | FieldRef::BorderTop
@@ -3206,6 +3241,9 @@ impl WindowEditor {
                     | FieldRef::EncumShowLabel
                     | FieldRef::GS4ExpShowLevel
                     | FieldRef::GS4ExpShowExpBar
+                    | FieldRef::GS4ExpShowMindBar
+                    | FieldRef::GS4ExpShowTotalExp
+                    | FieldRef::GS4ExpShowAscensionExp
                     | FieldRef::MiniVitalsNumbersOnly
                     | FieldRef::MiniVitalsCurrentOnly
                     | FieldRef::BetrayerShowItems
@@ -3647,6 +3685,10 @@ impl WindowEditor {
                 let current = self.window_def.base().locked;
                 self.window_def.base_mut().locked = !current;
             }
+            121 => {
+                let current = self.window_def.base().tts_speak;
+                self.window_def.base_mut().tts_speak = !current;
+            }
             14 => {
                 let current = self.window_def.base().transparent_background;
                 self.window_def.base_mut().transparent_background = !current;
@@ -3797,6 +3839,31 @@ impl WindowEditor {
                             self.window_def
                                 .base_mut()
                                 .apply_optional_content_row(self.gs4_exp_show_exp_bar, prev_show);
+                            self.refresh_size_inputs();
+                        }
+                        FieldRef::GS4ExpShowMindBar => {
+                            let prev_show = self.gs4_exp_show_mind_bar;
+                            self.gs4_exp_show_mind_bar = !self.gs4_exp_show_mind_bar;
+                            self.window_def
+                                .base_mut()
+                                .apply_optional_content_row(self.gs4_exp_show_mind_bar, prev_show);
+                            self.refresh_size_inputs();
+                        }
+                        FieldRef::GS4ExpShowTotalExp => {
+                            let prev_show = self.gs4_exp_show_total_exp;
+                            self.gs4_exp_show_total_exp = !self.gs4_exp_show_total_exp;
+                            self.window_def
+                                .base_mut()
+                                .apply_optional_content_row(self.gs4_exp_show_total_exp, prev_show);
+                            self.refresh_size_inputs();
+                        }
+                        FieldRef::GS4ExpShowAscensionExp => {
+                            let prev_show = self.gs4_exp_show_ascension_exp;
+                            self.gs4_exp_show_ascension_exp = !self.gs4_exp_show_ascension_exp;
+                            self.window_def.base_mut().apply_optional_content_row(
+                                self.gs4_exp_show_ascension_exp,
+                                prev_show,
+                            );
                             self.refresh_size_inputs();
                         }
                         FieldRef::MiniVitalsNumbersOnly => {
@@ -4655,6 +4722,9 @@ impl WindowEditor {
         if let crate::config::WindowDef::GS4Experience { data, .. } = &mut self.window_def {
             data.show_level = self.gs4_exp_show_level;
             data.show_exp_bar = self.gs4_exp_show_exp_bar;
+            data.show_mind_bar = self.gs4_exp_show_mind_bar;
+            data.show_total_exp = self.gs4_exp_show_total_exp;
+            data.show_ascension_exp = self.gs4_exp_show_ascension_exp;
             data.mind_bar_color = self.gs4_exp_mind_bar_color_input
                 .lines()
                 .get(0)
@@ -6289,6 +6359,19 @@ impl WindowEditor {
                         is_focus(FieldRef::TextCompact, self.focused_field),
                     );
                     self.field_click_areas.push((special_row, left_x, FieldRef::TextCompact));
+                    // Speak new lines (TTS opt-in), right column of the same row.
+                    self.render_checkbox_compact(
+                        FieldRef::TtsSpeak.legacy_field_id(),
+                        "Speak (TTS)",
+                        self.window_def.base().tts_speak,
+                        right_x,
+                        special_row,
+                        column_width,
+                        buf,
+                        theme,
+                        is_focus(FieldRef::TtsSpeak, self.focused_field),
+                    );
+                    self.field_click_areas.push((special_row, right_x, FieldRef::TtsSpeak));
                 }
             }
             WindowDef::Inventory { .. } | WindowDef::Reserve { .. } => {
@@ -7051,31 +7134,69 @@ impl WindowEditor {
                     is_focus(FieldRef::GS4ExpShowExpBar, self.focused_field),
                 );
                 self.field_click_areas.push((special_row, right_x, FieldRef::GS4ExpShowExpBar));
-                // Row 2: Bar colors
+                // Row 2: Mind bar + Total exp toggles
+                self.render_checkbox_compact(
+                    FieldRef::GS4ExpShowMindBar.legacy_field_id(),
+                    "Show Mind Bar",
+                    self.gs4_exp_show_mind_bar,
+                    left_x,
+                    special_row + 1,
+                    column_width,
+                    buf,
+                    theme,
+                    is_focus(FieldRef::GS4ExpShowMindBar, self.focused_field),
+                );
+                self.field_click_areas.push((special_row + 1, left_x, FieldRef::GS4ExpShowMindBar));
+                self.render_checkbox_compact(
+                    FieldRef::GS4ExpShowTotalExp.legacy_field_id(),
+                    "Show Total Exp",
+                    self.gs4_exp_show_total_exp,
+                    right_x,
+                    special_row + 1,
+                    column_width,
+                    buf,
+                    theme,
+                    is_focus(FieldRef::GS4ExpShowTotalExp, self.focused_field),
+                );
+                self.field_click_areas.push((special_row + 1, right_x, FieldRef::GS4ExpShowTotalExp));
+                // Row 3: Ascension exp toggle
+                self.render_checkbox_compact(
+                    FieldRef::GS4ExpShowAscensionExp.legacy_field_id(),
+                    "Show Ascension Exp",
+                    self.gs4_exp_show_ascension_exp,
+                    left_x,
+                    special_row + 2,
+                    column_width,
+                    buf,
+                    theme,
+                    is_focus(FieldRef::GS4ExpShowAscensionExp, self.focused_field),
+                );
+                self.field_click_areas.push((special_row + 2, left_x, FieldRef::GS4ExpShowAscensionExp));
+                // Row 4: Bar colors
                 self.render_color_field(
                     FieldRef::GS4ExpMindBarColor.legacy_field_id(),
                     "Mind",
                     &self.gs4_exp_mind_bar_color_input,
                     left_x,
-                    special_row + 1,
+                    special_row + 3,
                     8,
                     buf,
                     theme,
                     is_focus(FieldRef::GS4ExpMindBarColor, self.focused_field),
                 );
-                self.field_click_areas.push((special_row + 1, left_x, FieldRef::GS4ExpMindBarColor));
+                self.field_click_areas.push((special_row + 3, left_x, FieldRef::GS4ExpMindBarColor));
                 self.render_color_field(
                     FieldRef::GS4ExpExpBarColor.legacy_field_id(),
                     "Exp",
                     &self.gs4_exp_exp_bar_color_input,
                     right_x,
-                    special_row + 1,
+                    special_row + 3,
                     8,
                     buf,
                     theme,
                     is_focus(FieldRef::GS4ExpExpBarColor, self.focused_field),
                 );
-                self.field_click_areas.push((special_row + 1, right_x, FieldRef::GS4ExpExpBarColor));
+                self.field_click_areas.push((special_row + 3, right_x, FieldRef::GS4ExpExpBarColor));
             }
             WindowDef::Encumbrance { .. } => {
                 // Row 1: Show label checkbox
@@ -7530,6 +7651,122 @@ mod tests {
     use super::*;
     use crate::config::{Layout, SpacerWidgetData};
 
+    /// A throwaway WindowBase for field-order tests.
+    fn test_base(name: &str) -> crate::config::WindowBase {
+        crate::config::WindowBase {
+            name: name.to_string(),
+            row: crate::data::geometry::Row::new(0),
+            col: crate::data::geometry::Col::new(0),
+            rows: crate::data::geometry::Height::new(5),
+            cols: crate::data::geometry::Width::new(20),
+            show_border: true,
+            border_style: "single".to_string(),
+            border_sides: crate::config::BorderSides::default(),
+            border_color: None,
+            show_title: true,
+            title: None,
+            background_color: None,
+            text_color: None,
+            transparent_background: false,
+            locked: false,
+            min_rows: None,
+            max_rows: None,
+            min_cols: None,
+            max_cols: None,
+            visibility: crate::config::WindowVisibility::Shown,
+            binding: None,
+            content_align: None,
+            tts_speak: false,
+            text_size: None,
+            font_family: None,
+            title_position: "top-left".to_string(),
+        }
+    }
+
+    /// Hardening guard for the id-threaded window editor: every FieldRef in a
+    /// widget's navigation order must have a UNIQUE legacy_field_id. A
+    /// duplicate id is the fragility bug class — two fields would then fight
+    /// over the same click/focus target, and a copy-paste slip when adding a
+    /// field wouldn't be caught anywhere else.
+    #[test]
+    fn field_order_has_no_duplicate_ids() {
+        let widgets: Vec<WindowDef> = vec![
+            WindowDef::Text {
+                base: test_base("main"),
+                data: crate::config::TextWidgetData {
+                    streams: vec![],
+                    buffer_size: 1000,
+                    wordwrap: true,
+                    show_timestamps: false,
+                    timestamp_position: None,
+                    compact: false,
+                },
+            },
+            WindowDef::GS4Experience {
+                base: test_base("exp"),
+                data: crate::config::GS4ExperienceWidgetData::default(),
+            },
+        ];
+        for w in &widgets {
+            let fields = super::WindowEditor::build_field_order_for(w);
+            let mut seen = std::collections::HashMap::new();
+            for f in &fields {
+                let id = f.legacy_field_id();
+                if let Some(prev) = seen.insert(id, *f) {
+                    panic!(
+                        "duplicate legacy_field_id {} shared by {:?} and {:?} in {} widget",
+                        id, prev, f, w.widget_type()
+                    );
+                }
+            }
+        }
+    }
+
+    /// The GS4 experience editor must reach every field of
+    /// GS4ExperienceWidgetData — the parity gap this closed. If a field is
+    /// added to the struct but not threaded into the editor, this fails.
+    #[test]
+    fn gs4_experience_field_order_is_complete() {
+        let w = WindowDef::GS4Experience {
+            base: test_base("exp"),
+            data: crate::config::GS4ExperienceWidgetData::default(),
+        };
+        let fields = super::WindowEditor::build_field_order_for(&w);
+        for expected in [
+            FieldRef::GS4ExpShowLevel,
+            FieldRef::GS4ExpShowExpBar,
+            FieldRef::GS4ExpShowMindBar,
+            FieldRef::GS4ExpShowTotalExp,
+            FieldRef::GS4ExpShowAscensionExp,
+            FieldRef::GS4ExpMindBarColor,
+            FieldRef::GS4ExpExpBarColor,
+        ] {
+            assert!(
+                fields.contains(&expected),
+                "GS4 experience editor missing field {:?}",
+                expected
+            );
+        }
+    }
+
+    /// Text windows expose the per-window TTS opt-in (tts_speak parity).
+    #[test]
+    fn text_window_offers_tts_speak() {
+        let w = WindowDef::Text {
+            base: test_base("main"),
+            data: crate::config::TextWidgetData {
+                streams: vec![],
+                buffer_size: 1000,
+                wordwrap: true,
+                show_timestamps: false,
+                timestamp_position: None,
+                compact: false,
+            },
+        };
+        let fields = super::WindowEditor::build_field_order_for(&w);
+        assert!(fields.contains(&FieldRef::TtsSpeak));
+    }
+
     #[test]
     fn test_new_window_spacer_auto_naming_empty_layout() {
         // RED: Test that new_window_with_layout generates auto-name for spacer in empty layout
@@ -7572,7 +7809,8 @@ mod tests {
                 max_rows: None,
                 min_cols: None,
                 max_cols: None,
-                visible: true,
+                visibility: crate::config::WindowVisibility::Shown,
+                binding: None,
                 content_align: None,
                 tts_speak: false,
                 text_size: None,

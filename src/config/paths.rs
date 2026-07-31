@@ -5,6 +5,14 @@
 
 use super::*;
 
+/// One process-wide lock for tests that set the global `VELLUM_FE_DIR` env
+/// var. Every such test across every module must serialize on THIS lock, not
+/// a per-module one — separate mutexes guarding the same global don't mutually
+/// exclude, so tests would race (and one panic would poison only its own lock,
+/// cascading failures). Guard the whole set/use/remove with it.
+#[cfg(test)]
+pub static VELLUM_FE_DIR_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Write a user config file safely: write to a sibling `.tmp` file, back up
 /// the existing file to `<name>.bak`, then rename over the target. A crash
 /// mid-write can no longer truncate user data, and the previous version is
@@ -134,6 +142,22 @@ impl Config {
         Ok(Self::global_dir()?.join("icons"))
     }
 
+    /// Get the data-pack local store (gameobj-data.xml and friends; see
+    /// `core::data_pack`)
+    /// Returns: ~/.vellum-fe/global/data/
+    pub fn global_data_dir() -> Result<PathBuf> {
+        Ok(Self::global_dir()?.join("data"))
+    }
+
+    /// Get the shared injury-doll base-image pool. Standalone doll base
+    /// images (installed by `.jinx`) drop in here; a skin's
+    /// `[injury_doll] base` can reference one by absolute path (skin art
+    /// paths may be absolute, so a doll from the pool works in any skin).
+    /// Returns: ~/.vellum-fe/global/dolls/
+    pub fn global_dolls_dir() -> Result<PathBuf> {
+        Ok(Self::global_dir()?.join("dolls"))
+    }
+
     /// Get path to common (global) highlights file
     /// Returns: ~/.vellum-fe/global/highlights.toml
     pub fn common_highlights_path() -> Result<PathBuf> {
@@ -144,6 +168,24 @@ impl Config {
     /// Returns: ~/.vellum-fe/global/keybinds.toml
     pub fn common_keybinds_path() -> Result<PathBuf> {
         Ok(Self::global_dir()?.join("keybinds.toml"))
+    }
+
+    /// Get path to common (global) controller file. Controller config lives
+    /// in its own file so it can be shared/version-controlled as one unit and
+    /// a malformed edit can't take keyboard input down with it. The global
+    /// file is the base layer; a character can override entries in their own
+    /// `profiles/<name>/controller.toml` (see `controller_path`).
+    /// Returns: ~/.vellum-fe/global/controller.toml
+    pub fn common_controller_path() -> Result<PathBuf> {
+        Ok(Self::global_dir()?.join("controller.toml"))
+    }
+
+    /// Get path to a character's controller override file. Missing = the
+    /// character just uses the global layer. A class/character that drives
+    /// the pad differently keeps only its diffs here.
+    /// Returns: ~/.vellum-fe/profiles/{character}/controller.toml
+    pub fn controller_path(character: Option<&str>) -> Result<PathBuf> {
+        Ok(Self::profile_dir(character)?.join("controller.toml"))
     }
 
     /// Get path to common (global) hotbars file

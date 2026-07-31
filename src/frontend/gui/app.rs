@@ -278,6 +278,7 @@ pub struct VellumGuiApp {
     settings_editor: Option<editors::SettingsEditorState>,
     highlight_editor: Option<editors::HighlightEditorState>,
     keybind_editor: Option<editors::KeybindEditorState>,
+    menu_keybind_editor: Option<editors::MenuKeybindEditorState>,
     #[cfg(feature = "gamepad")]
     controller_editor: Option<editors::ControllerEditorState>,
     hotbar_editor: Option<editors::HotbarEditorState>,
@@ -287,6 +288,7 @@ pub struct VellumGuiApp {
     indicator_templates_editor: Option<editors::IndicatorTemplatesEditorState>,
     window_editor: Option<editors::WindowEditorState>,
     custom_windows_editor: Option<editors::CustomWindowsEditorState>,
+    known_windows_editor: Option<editors::KnownWindowsEditorState>,
     doll_calibration: Option<editors::DollCalibrationState>,
     /// Editor window Id to raise to the top on the next frame. Set when a
     /// settings command (`.controller`, `.settings`, …) is re-issued while
@@ -584,6 +586,7 @@ impl VellumGuiApp {
             settings_editor: None,
             highlight_editor: None,
             keybind_editor: None,
+            menu_keybind_editor: None,
             #[cfg(feature = "gamepad")]
             controller_editor: None,
             hotbar_editor: None,
@@ -593,6 +596,7 @@ impl VellumGuiApp {
             indicator_templates_editor: None,
             window_editor: None,
             custom_windows_editor: None,
+            known_windows_editor: None,
             doll_calibration: None,
             pending_editor_raise: None,
             search_bar_needs_focus: false,
@@ -990,21 +994,16 @@ impl VellumGuiApp {
         }
     }
 
-    fn windows_for_menu(&self) -> Vec<(TabKey, String, bool, bool, GuiShellZone)> {
-        let detached_tabs = self.detached_tab_keys();
-        let mut entries: Vec<(TabKey, String, bool, bool, GuiShellZone)> = self
-            .available_tabs
+    /// Find the live tab whose window matches `window_name` (bridges the
+    /// core known-windows list, keyed by name, to the GUI zone system,
+    /// keyed by TabKey). None for windows that aren't currently a live tab.
+    pub(super) fn find_tab_key_by_name(&self, window_name: &str) -> Option<TabKey> {
+        self.available_tabs
             .iter()
-            .map(|(key, tab)| {
-                let hidden = self.hidden_tabs.contains(key);
-                let detached = detached_tabs.contains(key);
-                let zone = self.zone_for_tab(key);
-                (key.clone(), tab.id.title.clone(), hidden, detached, zone)
-            })
-            .collect();
-        entries.sort_by_key(|(_, title, _, _, _)| title.to_ascii_lowercase());
-        entries
+            .find(|(_, tab)| tab.window_name == window_name)
+            .map(|(key, _)| key.clone())
     }
+
 
     /// Drop group members that no longer exist, groups that shrink below
     /// two members, and duplicate memberships (first group wins).
@@ -2251,34 +2250,14 @@ impl VellumGuiApp {
         }
 
         // Post-processing the TUI runtime also performs after server data:
-        // content-driven resizes, container discovery windows, and windows
-        // queued by openDialog events (stance, inventory, experience, ...).
+        // content-driven resizes, plus realizing game-offered windows
+        // (containers whose offer the user has Shown, openDialog-templated
+        // widgets like stance/inventory/experience).
         if received_text {
             self.app_core.adjust_content_driven_windows();
             let (layout_width, layout_height) = self.core_layout_size;
-            if self.app_core.ui_state.container_discovery_mode {
-                if let Some((id, title)) = self
-                    .app_core
-                    .message_processor
-                    .newly_registered_container
-                    .take()
-                {
-                    tracing::info!(
-                        "Container discovery: creating window for '{}' (id={})",
-                        title,
-                        id
-                    );
-                    self.app_core.create_ephemeral_container_window(
-                        &title,
-                        layout_width,
-                        layout_height,
-                    );
-                }
-            } else {
-                self.app_core.message_processor.newly_registered_container = None;
-            }
             self.app_core
-                .process_pending_window_additions(layout_width, layout_height);
+                .realize_offered_windows(layout_width, layout_height);
 
             // A `;ui handshake` reply arrived on the game stream: connect
             // (or reconnect) the WebUI bridge with the fresh port + token.
@@ -2297,6 +2276,14 @@ impl VellumGuiApp {
         // Flush coalesced state deltas to web clients once per batch
         // (no-op unless [web] is enabled)
         self.app_core.flush_remote_state();
+
+        // Send commands queued by dialog-panel widgets this frame
+        // (they render from an immutable AppCore borrow).
+        let panel_commands: Vec<String> =
+            self.app_core.ui_state.pending_panel_commands.borrow_mut().drain(..).collect();
+        for command in panel_commands {
+            self.dispatch_raw_command(command);
+        }
 
         // Play sounds queued by highlight processing.
         for sound in self.app_core.game_state.drain_sound_queue() {
@@ -3172,6 +3159,10 @@ impl VellumGuiApp {
             "scroll_current_window_down_one" => (0, 48.0),
             "scroll_current_window_home" => (1, 0.0),
             "scroll_current_window_end" => (2, 0.0),
+            // The GUI drives one scroll view, so the all-windows and
+            // by-name forms both land on it.
+            "scroll_all_windows_end" | "scroll_window_end" => (2, 0.0),
+            s if s.starts_with("scroll_window_end:") => (2, 0.0),
             _ => return false,
         };
         ctx.data_mut(|d| {
@@ -3741,10 +3732,11 @@ impl VellumGuiApp {
                 match self
                     .app_core
                     .game_state
-                    .container_cache
-                    .find_by_title(container_title)
+                    .objects
+                    .find_container(container_title)
                 {
-                    Some(container) => format!("#{}", container.id),
+                    // command_target is stow-correct (plain id = "#stow").
+                    Some(container) => format!("#{}", container.command_target()),
                     None => "drop".to_string(),
                 }
             }
@@ -3916,6 +3908,10 @@ impl VellumGuiApp {
             self.open_keybind_editor();
             return true;
         }
+        if action == "action:menukeybinds" {
+            self.open_menu_keybind_editor();
+            return true;
+        }
         if action == "action:controller" {
             #[cfg(feature = "gamepad")]
             self.open_controller_editor();
@@ -4021,11 +4017,15 @@ impl VellumGuiApp {
             self.open_custom_windows_editor();
             return true;
         }
+        if action == "action:knownwindows" {
+            self.open_known_windows_editor();
+            return true;
+        }
         if action == "action:addwindow" {
             let mut items = self.app_core.build_add_window_menu();
-            // Surface the custom-window authoring panel at the top of the Add
-            // Widget menu so creating a stream-fed window is discoverable
-            // (GUI-local; the shared core menu builder stays untouched).
+            // Surface the custom-window authoring panel at the top of the
+            // Add Widget menu (GUI-local; the shared core menu builder stays
+            // untouched). The show/hide list lives under Windows > Show/Hide.
             items.insert(
                 0,
                 PopupMenuItem {
@@ -4273,9 +4273,7 @@ impl eframe::App for VellumGuiApp {
         }
 
         let detached_before_frame = self.detached_tab_keys();
-        let mut visibility_toggles: Vec<TabKey> = Vec::new();
-        let mut window_additions: Vec<String> = Vec::new();
-        let mut zone_assignments: Vec<(TabKey, GuiShellZone)> = Vec::new();
+        let mut open_windows_manager = false;
         let mut zone_actions = GuiWindowActions::default();
         let mut visible_zone_rects: Vec<(GuiShellZone, Rect)> = Vec::new();
         let mut zone_window_rects: Vec<GuiZoneWindowRect> = Vec::new();
@@ -4349,60 +4347,12 @@ impl eframe::App for VellumGuiApp {
                         self.layout_dirty = true;
                     }
 
-                    ui.menu_button("Windows", |ui| {
-                        ui.menu_button("Add Window", |ui| {
-                            let groups = self.app_core.addable_window_templates();
-                            if groups.is_empty() {
-                                ui.label("All windows already added");
-                                return;
-                            }
-                            for (category, entries) in groups {
-                                ui.menu_button(category, |ui| {
-                                    for (template_name, display_name) in entries {
-                                        if ui.button(display_name).clicked() {
-                                            window_additions.push(template_name.clone());
-                                            ui.close();
-                                        }
-                                    }
-                                });
-                            }
-                        });
-                        ui.separator();
-
-                        let windows = self.windows_for_menu();
-                        if windows.is_empty() {
-                            ui.label("No windows available");
-                            return;
-                        }
-
-                        for (key, title, is_hidden, is_detached, zone) in windows {
-                            ui.horizontal(|ui| {
-                                let mut visible = !is_hidden;
-                                let mut label = title.clone();
-                                if is_detached {
-                                    label.push_str(" (detached)");
-                                }
-                                if ui.checkbox(&mut visible, label).changed() {
-                                    visibility_toggles.push(key.clone());
-                                }
-
-                                ui.menu_button(format!("Zone: {}", zone.label()), |ui| {
-                                    for target in GuiShellZone::all() {
-                                        let is_current = target == zone;
-                                        let target_label = if is_current {
-                                            format!("{} (current)", target.label())
-                                        } else {
-                                            target.label().to_string()
-                                        };
-                                        if ui.selectable_label(is_current, target_label).clicked() {
-                                            zone_assignments.push((key.clone(), target));
-                                            ui.close();
-                                        }
-                                    }
-                                });
-                            });
-                        }
-                    });
+                    // U6: the "Windows" button opens the single Windows
+                    // manager (show/hide + zone + add-window, grouped by
+                    // category) instead of an inline menu.
+                    if ui.button("Windows").clicked() {
+                        open_windows_manager = true;
+                    }
                 });
             });
 
@@ -4697,22 +4647,8 @@ impl eframe::App for VellumGuiApp {
         self.render_window_move_overlay(&ctx, &visible_zone_rects, &zone_window_rects);
         self.handle_link_drag_drop(&ctx, &zone_window_rects);
 
-        for key in visibility_toggles {
-            if self.hidden_tabs.contains(&key) {
-                self.restore_tab(key);
-            } else {
-                self.hide_tab(key);
-            }
-        }
-        // Same path as the popup menu's add-window items: it resolves the
-        // auto-generated names custom templates get (the core pending-queue
-        // lookup misses those and silently adds nothing) and drops blank
-        // `*_custom` widgets straight into the window editor.
-        for name in window_additions {
-            self.add_window_from_template(&name);
-        }
-        for (key, zone) in zone_assignments {
-            self.set_tab_zone(key, zone);
+        if open_windows_manager {
+            self.open_known_windows_editor();
         }
         if let Some(drop_result) = zone_drop_result {
             self.apply_zone_drop(drop_result);
@@ -4817,7 +4753,11 @@ impl eframe::App for VellumGuiApp {
         // exempt so the captured key doesn't also type into the input.
         if let Some(input_id) = self.command_input_id {
             let nothing_focused = ctx.memory(|memory| memory.focused().is_none());
-            if nothing_focused && !self.keybind_capture_armed() && !self.hotbar_capture_armed() {
+            if nothing_focused
+                && !self.keybind_capture_armed()
+                && !self.menu_keybind_capture_armed()
+                && !self.hotbar_capture_armed()
+            {
                 ctx.memory_mut(|memory| memory.request_focus(input_id));
             }
         }
@@ -5431,7 +5371,8 @@ mod tests {
             max_rows: None,
             min_cols: None,
             max_cols: None,
-            visible: true,
+            visibility: crate::config::WindowVisibility::Shown,
+            binding: None,
             content_align: None,
             tts_speak: false,
             text_size: None,

@@ -126,8 +126,10 @@ pub struct GameState {
     /// Room metadata codes from the `<roommeta>` tag
     pub room_meta: RoomMetaState,
 
-    /// Container cache for bag/container contents
-    pub container_cache: ContainerCache,
+    /// Unified game-object registry: items (containers/worn/hands/at-feet/
+    /// ground), creatures, players. The single source for game objects;
+    /// see `core::game_objects`.
+    pub objects: crate::core::game_objects::GameObjects,
 
     /// DragonRealms experience/skill component state
     pub dr_experience: DRExperienceState,
@@ -498,30 +500,6 @@ pub struct RoomObject {
     pub id: String,
 }
 
-/// Container cache for inventory containers (bags, backpacks, etc.)
-#[derive(Clone, Debug, Default)]
-pub struct ContainerCache {
-    /// Map of container ID to container data
-    pub containers: HashMap<String, ContainerData>,
-    /// Container IDs in insertion order, used for oldest-first eviction
-    insertion_order: VecDeque<String>,
-}
-
-/// Data for a single container
-#[derive(Clone, Debug)]
-pub struct ContainerData {
-    /// Container ID
-    pub id: String,
-    /// Container title (e.g., "Bandolier")
-    pub title: String,
-    /// Lowercased title, precomputed so title lookups don't allocate per call
-    pub title_lower: String,
-    /// Items in the container (raw content lines with links preserved)
-    pub items: Vec<String>,
-    /// Generation counter for change detection
-    pub generation: u64,
-}
-
 impl TargetListState {
     /// Clear the current target
     pub fn clear(&mut self) {
@@ -877,114 +855,6 @@ impl BetrayerState {
         self.generation += 1;
     }
 }
-
-/// Maximum number of containers kept in the cache. Network data creates an
-/// entry per unique container ID, so cap growth and evict oldest-first.
-const MAX_CONTAINERS: usize = 1000;
-
-impl ContainerCache {
-    /// Register a new container or update its metadata
-    pub fn register_container(&mut self, id: String, title: String) {
-        if let Some(entry) = self.containers.get_mut(&id) {
-            // Update title if it changed
-            if entry.title != title {
-                entry.title_lower = title.to_lowercase();
-                entry.title = title;
-                entry.generation += 1;
-            }
-        } else {
-            self.evict_if_full();
-            self.insertion_order.push_back(id.clone());
-            self.containers.insert(
-                id.clone(),
-                ContainerData {
-                    id,
-                    title_lower: title.to_lowercase(),
-                    title,
-                    items: Vec::new(),
-                    generation: 0,
-                },
-            );
-        }
-    }
-
-    /// Evict oldest containers until below the cap
-    fn evict_if_full(&mut self) {
-        while self.containers.len() >= MAX_CONTAINERS {
-            match self.insertion_order.pop_front() {
-                Some(oldest) => {
-                    self.containers.remove(&oldest);
-                }
-                None => break,
-            }
-        }
-    }
-
-    /// Clear all items in a container (called on clearContainer tag)
-    pub fn clear_container(&mut self, id: &str) {
-        if let Some(container) = self.containers.get_mut(id) {
-            container.items.clear();
-            container.generation += 1;
-        }
-    }
-
-    /// Add an item to a container
-    pub fn add_item(&mut self, container_id: &str, content: String) {
-        if let Some(container) = self.containers.get_mut(container_id) {
-            container.items.push(content);
-            container.generation += 1;
-        } else {
-            // Container not registered yet - create it with unknown title
-            self.evict_if_full();
-            self.insertion_order.push_back(container_id.to_string());
-            let container = ContainerData {
-                id: container_id.to_string(),
-                title: String::new(),
-                title_lower: String::new(),
-                items: vec![content],
-                generation: 1,
-            };
-            self.containers.insert(container_id.to_string(), container);
-        }
-    }
-
-    /// Get a container by ID
-    pub fn get(&self, id: &str) -> Option<&ContainerData> {
-        self.containers.get(id)
-    }
-
-    /// Get all known container IDs
-    pub fn container_ids(&self) -> Vec<String> {
-        self.containers.keys().cloned().collect()
-    }
-
-    /// Find a container by its title (case-insensitive partial match)
-    /// Returns the first matching container's data
-    pub fn find_by_title(&self, title: &str) -> Option<&ContainerData> {
-        let title_lower = title.to_lowercase();
-        // First try exact match (case-insensitive)
-        for container in self.containers.values() {
-            if container.title_lower == title_lower {
-                return Some(container);
-            }
-        }
-        // Then try partial match
-        for container in self.containers.values() {
-            if container.title_lower.contains(&title_lower) {
-                return Some(container);
-            }
-        }
-        None
-    }
-
-    /// Get all known containers sorted by title
-    pub fn list_containers(&self) -> Vec<&ContainerData> {
-        let mut containers: Vec<_> = self.containers.values().collect();
-        containers.sort_by(|a, b| a.title_lower.cmp(&b.title_lower));
-        containers
-    }
-}
-
 impl GameState {
     pub fn new() -> Self {
         Self {
@@ -1016,7 +886,7 @@ impl GameState {
             room_players: Vec::new(),
             room_players_generation: 0,
             room_meta: RoomMetaState::default(),
-            container_cache: ContainerCache::default(),
+            objects: crate::core::game_objects::GameObjects::default(),
             dr_experience: DRExperienceState::default(),
             gs4_experience: GS4ExperienceState::default(),
             encumbrance: EncumbranceState::default(),
@@ -1163,61 +1033,6 @@ mod tests {
     fn test_is_body_part_normal_creature_and_missing_noun() {
         assert!(!body_part_creature("a muddy hog", Some("hog")).is_body_part());
         assert!(!body_part_creature("a severed arm", None).is_body_part());
-    }
-
-    // ========== ContainerCache tests ==========
-
-    #[test]
-    fn test_container_cache_evicts_oldest_at_cap() {
-        let mut cache = ContainerCache::default();
-        for i in 0..(MAX_CONTAINERS + 10) {
-            cache.register_container(format!("id{}", i), format!("title{}", i));
-        }
-        assert_eq!(cache.containers.len(), MAX_CONTAINERS);
-        // Oldest entries were evicted, newest survive
-        assert!(cache.get("id0").is_none());
-        assert!(cache.get("id9").is_none());
-        assert!(cache.get("id10").is_some());
-        assert!(cache.get(&format!("id{}", MAX_CONTAINERS + 9)).is_some());
-    }
-
-    #[test]
-    fn test_container_cache_add_item_evicts_at_cap() {
-        let mut cache = ContainerCache::default();
-        for i in 0..MAX_CONTAINERS {
-            cache.register_container(format!("id{}", i), String::new());
-        }
-        // add_item to an unregistered container also creates an entry
-        cache.add_item("overflow", "a coin".to_string());
-        assert_eq!(cache.containers.len(), MAX_CONTAINERS);
-        assert!(cache.get("id0").is_none());
-        assert!(cache.get("overflow").is_some());
-    }
-
-    #[test]
-    fn test_container_cache_find_by_title_mixed_case() {
-        let mut cache = ContainerCache::default();
-        cache.register_container("c1".to_string(), "Sturdy Bandolier".to_string());
-        // Exact match, different case
-        assert_eq!(cache.find_by_title("sturdy bandolier").unwrap().id, "c1");
-        // Partial match, different case
-        assert_eq!(cache.find_by_title("BANDO").unwrap().id, "c1");
-        // Title update keeps the lowercase copy in sync
-        cache.register_container("c1".to_string(), "Leather Satchel".to_string());
-        assert!(cache.find_by_title("bandolier").is_none());
-        assert_eq!(cache.find_by_title("SATCHEL").unwrap().id, "c1");
-    }
-
-    #[test]
-    fn test_container_cache_reregister_does_not_evict() {
-        let mut cache = ContainerCache::default();
-        for i in 0..MAX_CONTAINERS {
-            cache.register_container(format!("id{}", i), String::new());
-        }
-        // Re-registering an existing ID (title update) must not evict anything
-        cache.register_container("id0".to_string(), "new title".to_string());
-        assert_eq!(cache.containers.len(), MAX_CONTAINERS);
-        assert_eq!(cache.get("id0").unwrap().title, "new title");
     }
 
     // ========== GameState tests ==========

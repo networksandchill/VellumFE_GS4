@@ -362,6 +362,20 @@ impl Frontend for TuiFrontend {
                             container_widget.render(area, f.buffer_mut());
                         }
                     }
+                    WindowContent::DialogPanel { dialog_id } => {
+                        // Render the resident dialog panel from the store as
+                        // banded rows (defense | stance ▼ | offense, ...).
+                        if let Some(dialog) =
+                            app_core.ui_state.dialog_store.get(dialog_id)
+                        {
+                            crate::frontend::tui::dialog::render_dialog_panel(
+                                dialog,
+                                area,
+                                f.buffer_mut(),
+                                &theme,
+                            );
+                        }
+                    }
                     WindowContent::Players { .. } => {
                         // Use the Players widget
                         if let Some(players_widget) = players_widgets.get_mut(name) {
@@ -614,6 +628,9 @@ impl Frontend for TuiFrontend {
             }
             if let Some(ref mut spell_color_form) = self.spell_color_form {
                 spell_color_form.render(screen_area, f.buffer_mut(), &app_core.config, &theme);
+            }
+            if let Some(ref mut menu_keybind_editor) = self.menu_keybind_editor {
+                menu_keybind_editor.render(screen_area, f.buffer_mut(), &theme);
             }
             if let Some(ref mut theme_editor) = self.theme_editor {
                 theme_editor.render(screen_area, f.buffer_mut(), &app_core.config, &theme);

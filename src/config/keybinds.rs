@@ -119,6 +119,8 @@ pub enum KeyAction {
     ScrollCurrentWindowDownPage,
     ScrollCurrentWindowHome, // Scroll to top of window
     ScrollCurrentWindowEnd,  // Scroll to bottom of window
+    ScrollAllWindowsEnd,     // Scroll every text window to bottom
+    ScrollWindowEnd,         // "scroll_window_end:<names>" - named windows to bottom
 
     // Search actions (already implemented)
     StartSearch,
@@ -189,6 +191,159 @@ pub enum KeyAction {
     // Macro - send literal text
     SendMacro(String),
 }
+
+/// Where a bindable action is meaningful — drives which editors offer it.
+///
+/// `Keyboard` actions are text-input / widget-level and would no-op from a
+/// controller button, so the controller editor never offers them.
+/// `Controller` actions execute fully inside AppCore and are offerable from a
+/// gamepad button as well as the keyboard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActionScope {
+    Keyboard,
+    Controller,
+}
+
+/// One canonical bindable action. This table is THE single source of truth for
+/// keybind actions: [`KeyAction::from_str`] resolves against it, the controller
+/// editor's dropdown is generated from its `Controller`-scoped rows
+/// ([`KeyAction::controller_action_names`]), and the TUI keybind form offers
+/// exactly [`KeyAction::offered_action_names`]. A parity test
+/// (`keybind_action_table_is_the_single_source_of_truth`) fails the build if any
+/// consumer drifts from this table or a `KeyAction` variant is neither listed
+/// here nor on `EXEMPT_ACTIONS`.
+///
+/// Order is meaningful — dropdowns render in table order, so keep related
+/// actions grouped and do not sort.
+pub struct ActionDef {
+    /// Wire name written to keybinds.toml (e.g. "cursor_word_left").
+    pub name: &'static str,
+    /// The variant `name` parses to.
+    pub action: KeyAction,
+    /// Human-facing label for editor dropdowns.
+    pub label: &'static str,
+    /// Dropdown grouping.
+    pub category: &'static str,
+    pub scope: ActionScope,
+}
+
+impl KeyAction {
+    /// THE canonical action catalog. Every exact-match name `from_str` accepts
+    /// lives here (the only exceptions are the `controller_wheel:` prefix form
+    /// and the `tts_pause_resume` legacy alias, both handled explicitly in
+    /// `from_str` and listed in `EXEMPT_ACTIONS`).
+    pub const ACTIONS: &'static [ActionDef] = &[
+        // ---- Command input ----
+        ActionDef { name: "send_command", action: KeyAction::SendCommand, label: "Send Command", category: "Command", scope: ActionScope::Keyboard },
+        ActionDef { name: "cursor_left", action: KeyAction::CursorLeft, label: "Cursor Left", category: "Cursor", scope: ActionScope::Keyboard },
+        ActionDef { name: "cursor_right", action: KeyAction::CursorRight, label: "Cursor Right", category: "Cursor", scope: ActionScope::Keyboard },
+        ActionDef { name: "cursor_word_left", action: KeyAction::CursorWordLeft, label: "Cursor Word Left", category: "Cursor", scope: ActionScope::Keyboard },
+        ActionDef { name: "cursor_word_right", action: KeyAction::CursorWordRight, label: "Cursor Word Right", category: "Cursor", scope: ActionScope::Keyboard },
+        ActionDef { name: "cursor_home", action: KeyAction::CursorHome, label: "Cursor Home", category: "Cursor", scope: ActionScope::Keyboard },
+        ActionDef { name: "cursor_end", action: KeyAction::CursorEnd, label: "Cursor End", category: "Cursor", scope: ActionScope::Keyboard },
+        ActionDef { name: "cursor_backspace", action: KeyAction::CursorBackspace, label: "Backspace", category: "Cursor", scope: ActionScope::Keyboard },
+        ActionDef { name: "cursor_delete", action: KeyAction::CursorDelete, label: "Delete", category: "Cursor", scope: ActionScope::Keyboard },
+        ActionDef { name: "cursor_delete_word", action: KeyAction::CursorDeleteWord, label: "Delete Word", category: "Cursor", scope: ActionScope::Keyboard },
+        ActionDef { name: "cursor_clear_line", action: KeyAction::CursorClearLine, label: "Clear Line", category: "Cursor", scope: ActionScope::Keyboard },
+        // ---- History ----
+        ActionDef { name: "previous_command", action: KeyAction::PreviousCommand, label: "Previous Command", category: "History", scope: ActionScope::Keyboard },
+        ActionDef { name: "next_command", action: KeyAction::NextCommand, label: "Next Command", category: "History", scope: ActionScope::Keyboard },
+        ActionDef { name: "send_last_command", action: KeyAction::SendLastCommand, label: "Send Last Command", category: "History", scope: ActionScope::Keyboard },
+        ActionDef { name: "send_second_last_command", action: KeyAction::SendSecondLastCommand, label: "Send Second-Last Command", category: "History", scope: ActionScope::Keyboard },
+        // ---- Windows / scrolling ----
+        ActionDef { name: "switch_current_window", action: KeyAction::SwitchCurrentWindow, label: "Switch Current Window", category: "Window", scope: ActionScope::Keyboard },
+        ActionDef { name: "scroll_current_window_up_one", action: KeyAction::ScrollCurrentWindowUpOne, label: "Scroll Up One", category: "Scroll", scope: ActionScope::Controller },
+        ActionDef { name: "scroll_current_window_down_one", action: KeyAction::ScrollCurrentWindowDownOne, label: "Scroll Down One", category: "Scroll", scope: ActionScope::Controller },
+        ActionDef { name: "scroll_current_window_up_page", action: KeyAction::ScrollCurrentWindowUpPage, label: "Scroll Up Page", category: "Scroll", scope: ActionScope::Controller },
+        ActionDef { name: "scroll_current_window_down_page", action: KeyAction::ScrollCurrentWindowDownPage, label: "Scroll Down Page", category: "Scroll", scope: ActionScope::Controller },
+        ActionDef { name: "scroll_current_window_home", action: KeyAction::ScrollCurrentWindowHome, label: "Scroll To Top", category: "Scroll", scope: ActionScope::Controller },
+        ActionDef { name: "scroll_current_window_end", action: KeyAction::ScrollCurrentWindowEnd, label: "Scroll To Bottom", category: "Scroll", scope: ActionScope::Controller },
+        ActionDef { name: "scroll_all_windows_end", action: KeyAction::ScrollAllWindowsEnd, label: "Scroll All To Bottom", category: "Scroll", scope: ActionScope::Controller },
+        // ---- Search ----
+        ActionDef { name: "start_search", action: KeyAction::StartSearch, label: "Start Search", category: "Search", scope: ActionScope::Keyboard },
+        ActionDef { name: "next_search_match", action: KeyAction::NextSearchMatch, label: "Next Match", category: "Search", scope: ActionScope::Keyboard },
+        ActionDef { name: "prev_search_match", action: KeyAction::PrevSearchMatch, label: "Previous Match", category: "Search", scope: ActionScope::Keyboard },
+        ActionDef { name: "clear_search", action: KeyAction::ClearSearch, label: "Clear Search", category: "Search", scope: ActionScope::Keyboard },
+        // ---- Tabs ----
+        ActionDef { name: "next_tab", action: KeyAction::NextTab, label: "Next Tab", category: "Tabs", scope: ActionScope::Keyboard },
+        ActionDef { name: "prev_tab", action: KeyAction::PrevTab, label: "Previous Tab", category: "Tabs", scope: ActionScope::Keyboard },
+        ActionDef { name: "next_unread_tab", action: KeyAction::NextUnreadTab, label: "Next Unread Tab", category: "Tabs", scope: ActionScope::Keyboard },
+        // ---- Clipboard ----
+        ActionDef { name: "copy", action: KeyAction::Copy, label: "Copy", category: "Clipboard", scope: ActionScope::Keyboard },
+        ActionDef { name: "paste", action: KeyAction::Paste, label: "Paste", category: "Clipboard", scope: ActionScope::Keyboard },
+        ActionDef { name: "select_all", action: KeyAction::SelectAll, label: "Select All", category: "Clipboard", scope: ActionScope::Keyboard },
+        // ---- System toggles ----
+        ActionDef { name: "toggle_performance_stats", action: KeyAction::TogglePerformanceStats, label: "Toggle Performance Stats", category: "System", scope: ActionScope::Controller },
+        ActionDef { name: "toggle_sounds", action: KeyAction::ToggleSounds, label: "Toggle Sounds", category: "System", scope: ActionScope::Controller },
+        // ---- Travel ----
+        ActionDef { name: "stop_travel", action: KeyAction::StopTravel, label: "Stop Travel", category: "Travel", scope: ActionScope::Controller },
+        // ---- Interact / menu navigation (controller-friendly) ----
+        ActionDef { name: "interact_mode", action: KeyAction::InteractMode, label: "Toggle Interact Mode", category: "Interact", scope: ActionScope::Controller },
+        ActionDef { name: "interact_select", action: KeyAction::InteractSelect, label: "Interact Select", category: "Interact", scope: ActionScope::Controller },
+        ActionDef { name: "menu_up", action: KeyAction::MenuUp, label: "Menu Up", category: "Menu", scope: ActionScope::Controller },
+        ActionDef { name: "menu_down", action: KeyAction::MenuDown, label: "Menu Down", category: "Menu", scope: ActionScope::Controller },
+        ActionDef { name: "menu_left", action: KeyAction::MenuLeft, label: "Menu Left", category: "Menu", scope: ActionScope::Controller },
+        ActionDef { name: "menu_right", action: KeyAction::MenuRight, label: "Menu Right", category: "Menu", scope: ActionScope::Controller },
+        ActionDef { name: "menu_cancel", action: KeyAction::MenuCancel, label: "Menu Cancel", category: "Menu", scope: ActionScope::Controller },
+        // ---- Controller layers ----
+        // controller_wheel is configured per-wheel in the Wheels tab, so it is
+        // intentionally NOT offered in the generic action dropdown (see
+        // controller_action_names); it still parses via from_str's prefix arm.
+        ActionDef { name: "controller_shift", action: KeyAction::ControllerShift, label: "Controller Shift Layer", category: "Controller", scope: ActionScope::Controller },
+        ActionDef { name: "controller_overlay", action: KeyAction::ControllerOverlay, label: "Toggle Binding Overlay", category: "Controller", scope: ActionScope::Controller },
+        // ---- TTS / accessibility ----
+        ActionDef { name: "tts_next", action: KeyAction::TtsNext, label: "TTS: Next Message", category: "Speech", scope: ActionScope::Controller },
+        ActionDef { name: "tts_previous", action: KeyAction::TtsPrevious, label: "TTS: Previous Message", category: "Speech", scope: ActionScope::Controller },
+        ActionDef { name: "tts_next_unread", action: KeyAction::TtsNextUnread, label: "TTS: Next Unread", category: "Speech", scope: ActionScope::Controller },
+        ActionDef { name: "tts_stop", action: KeyAction::TtsStop, label: "TTS: Stop", category: "Speech", scope: ActionScope::Controller },
+        ActionDef { name: "tts_mute_toggle", action: KeyAction::TtsMuteToggle, label: "TTS: Mute Toggle", category: "Speech", scope: ActionScope::Controller },
+        ActionDef { name: "tts_increase_rate", action: KeyAction::TtsIncreaseRate, label: "TTS: Increase Rate", category: "Speech", scope: ActionScope::Controller },
+        ActionDef { name: "tts_decrease_rate", action: KeyAction::TtsDecreaseRate, label: "TTS: Decrease Rate", category: "Speech", scope: ActionScope::Controller },
+        ActionDef { name: "tts_increase_volume", action: KeyAction::TtsIncreaseVolume, label: "TTS: Increase Volume", category: "Speech", scope: ActionScope::Controller },
+        ActionDef { name: "tts_decrease_volume", action: KeyAction::TtsDecreaseVolume, label: "TTS: Decrease Volume", category: "Speech", scope: ActionScope::Controller },
+    ];
+
+    /// Names offered by the TUI keybind form's action dropdown — every
+    /// exact-match action a keyboard key can bind (i.e. the whole table; the
+    /// keyboard editor can bind controller-scoped actions too, they simply
+    /// no-op from a keyboard key). Returned in table order.
+    pub fn offered_action_names() -> impl Iterator<Item = &'static str> {
+        Self::ACTIONS.iter().map(|d| d.name)
+    }
+
+    /// Names offered by the controller editor's action dropdown: the
+    /// `Controller`-scoped subset, in table order. Replaces the former
+    /// hand-maintained `CONTROLLER_ACTION_NAMES` const.
+    pub fn controller_action_names() -> impl Iterator<Item = &'static str> {
+        Self::ACTIONS
+            .iter()
+            .filter(|d| d.scope == ActionScope::Controller)
+            .map(|d| d.name)
+    }
+}
+
+/// Wire names `from_str` accepts that are deliberately NOT rows in the
+/// [`ACTIONS`](KeyAction::ACTIONS) table, each with a reason. The parity test
+/// (`keybind_action_table_is_the_single_source_of_truth`) proves each still
+/// parses; nothing may fall outside `ACTIONS ∪ EXEMPT_ACTIONS` by accident.
+/// Mirror of `registry.rs::EXEMPT_PREFIXES` — an explicit, reviewed escape hatch.
+pub const EXEMPT_ACTIONS: &[(&str, &str)] = &[
+    (
+        "controller_wheel",
+        "prefix form 'controller_wheel:<name>' can't be an exact table row; \
+         configured per-wheel in the Wheels tab, not the action dropdown",
+    ),
+    (
+        "tts_pause_resume",
+        "legacy alias of tts_stop kept for old configs; never offered in editors",
+    ),
+    (
+        "scroll_window_end",
+        "prefix form 'scroll_window_end:<name>[,<name>...]' can't be an exact \
+         table row; the bare name scrolls the focused window, so the dropdown \
+         offers scroll_current_window_end instead",
+    ),
+];
 
 /// One slice of the controller radial wheel: a label drawn on the wheel
 /// and either a command to fire (game text or dot-command) or a child
@@ -398,6 +553,22 @@ pub struct RumbleConfig {
     /// (event rows, highlight rules). Built-in names win on collision.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub patterns: Vec<RumblePattern>,
+}
+
+impl RumbleConfig {
+    /// The built-in rumble pattern names, always selectable.
+    pub const BUILTIN_PATTERNS: &'static [&'static str] = &["short", "long", "double"];
+
+    /// Every selectable rumble pattern name — the built-ins followed by any
+    /// user-defined patterns — for editor picklists (highlight rules, event
+    /// rows). Single source shared by the TUI and GUI highlight forms so the
+    /// two can't offer different sets.
+    pub fn pattern_names(&self) -> Vec<String> {
+        let mut names: Vec<String> =
+            Self::BUILTIN_PATTERNS.iter().map(|s| s.to_string()).collect();
+        names.extend(self.patterns.iter().map(|p| p.name.clone()));
+        names
+    }
 }
 
 /// A user-defined vibration pattern: `pulses` buzzes of `strength`
@@ -695,6 +866,59 @@ pub struct MenuKeybinds {
     pub edit: String,
 }
 
+/// One editable menu-keybind field, used to drive both the TUI and GUI menu
+/// keybind editors from a single list (the registry pattern: declare once,
+/// render everywhere). `MenuKeybinds` is a fixed 26-field struct rather than a
+/// map, so the editor is a form over these rows, not a browsable list.
+pub struct MenuKeybindField {
+    /// Human label shown in the editor (e.g. "Select").
+    pub label: &'static str,
+    /// Section header the row groups under.
+    pub group: &'static str,
+    pub get: fn(&MenuKeybinds) -> &str,
+    pub set: fn(&mut MenuKeybinds, String),
+}
+
+impl MenuKeybinds {
+    /// The 26 editable fields, in editor order (grouped as the struct is).
+    /// Both editors iterate this so neither hardcodes a parallel field list.
+    pub const FIELDS: &'static [MenuKeybindField] = &[
+        // Navigation
+        MenuKeybindField { label: "Navigate Up", group: "Navigation", get: |m| &m.navigate_up, set: |m, v| m.navigate_up = v },
+        MenuKeybindField { label: "Navigate Down", group: "Navigation", get: |m| &m.navigate_down, set: |m, v| m.navigate_down = v },
+        MenuKeybindField { label: "Navigate Left", group: "Navigation", get: |m| &m.navigate_left, set: |m, v| m.navigate_left = v },
+        MenuKeybindField { label: "Navigate Right", group: "Navigation", get: |m| &m.navigate_right, set: |m, v| m.navigate_right = v },
+        MenuKeybindField { label: "Page Up", group: "Navigation", get: |m| &m.page_up, set: |m, v| m.page_up = v },
+        MenuKeybindField { label: "Page Down", group: "Navigation", get: |m| &m.page_down, set: |m, v| m.page_down = v },
+        MenuKeybindField { label: "Home", group: "Navigation", get: |m| &m.home, set: |m, v| m.home = v },
+        MenuKeybindField { label: "End", group: "Navigation", get: |m| &m.end, set: |m, v| m.end = v },
+        // Field navigation
+        MenuKeybindField { label: "Next Field", group: "Field Navigation", get: |m| &m.next_field, set: |m, v| m.next_field = v },
+        MenuKeybindField { label: "Previous Field", group: "Field Navigation", get: |m| &m.previous_field, set: |m, v| m.previous_field = v },
+        // Actions
+        MenuKeybindField { label: "Select", group: "Actions", get: |m| &m.select, set: |m, v| m.select = v },
+        MenuKeybindField { label: "Cancel", group: "Actions", get: |m| &m.cancel, set: |m, v| m.cancel = v },
+        MenuKeybindField { label: "Save", group: "Actions", get: |m| &m.save, set: |m, v| m.save = v },
+        MenuKeybindField { label: "Delete", group: "Actions", get: |m| &m.delete, set: |m, v| m.delete = v },
+        // Clipboard
+        MenuKeybindField { label: "Select All", group: "Clipboard", get: |m| &m.select_all, set: |m, v| m.select_all = v },
+        MenuKeybindField { label: "Copy", group: "Clipboard", get: |m| &m.copy, set: |m, v| m.copy = v },
+        MenuKeybindField { label: "Cut", group: "Clipboard", get: |m| &m.cut, set: |m, v| m.cut = v },
+        MenuKeybindField { label: "Paste", group: "Clipboard", get: |m| &m.paste, set: |m, v| m.paste = v },
+        // Toggles / cycling
+        MenuKeybindField { label: "Toggle", group: "Toggles", get: |m| &m.toggle, set: |m, v| m.toggle = v },
+        MenuKeybindField { label: "Toggle Filter", group: "Toggles", get: |m| &m.toggle_filter, set: |m, v| m.toggle_filter = v },
+        MenuKeybindField { label: "Cycle Forward", group: "Toggles", get: |m| &m.cycle_forward, set: |m, v| m.cycle_forward = v },
+        MenuKeybindField { label: "Cycle Backward", group: "Toggles", get: |m| &m.cycle_backward, set: |m, v| m.cycle_backward = v },
+        // Reordering
+        MenuKeybindField { label: "Move Up", group: "Reordering", get: |m| &m.move_up, set: |m, v| m.move_up = v },
+        MenuKeybindField { label: "Move Down", group: "Reordering", get: |m| &m.move_down, set: |m, v| m.move_down = v },
+        // List management
+        MenuKeybindField { label: "Add", group: "List Management", get: |m| &m.add, set: |m, v| m.add = v },
+        MenuKeybindField { label: "Edit", group: "List Management", get: |m| &m.edit, set: |m, v| m.edit = v },
+    ];
+}
+
 // Default keybind functions
 fn default_navigate_up() -> String {
     "Up".to_string()
@@ -953,107 +1177,31 @@ impl MenuKeybinds {
 }
 
 impl KeyAction {
-    /// Action names that execute fully inside AppCore — the set that does
-    /// something useful from a controller button (everything else is
-    /// keyboard-widget-level and would no-op). Drives the controller
-    /// editor's action dropdown; a test keeps every entry parseable.
-    pub const CONTROLLER_ACTION_NAMES: &'static [&'static str] = &[
-        "interact_mode",
-        "interact_select",
-        "menu_up",
-        "menu_down",
-        "menu_left",
-        "menu_right",
-        "menu_cancel",
-        "controller_shift",
-        // controller_wheel / controller_wheel:<name> are configured in the
-        // Wheels tab (each wheel's "Opens with" button writes the matching
-        // [controller] entry), so they are intentionally NOT offered here —
-        // that keeps a single source of truth for wheel buttons.
-        "controller_overlay",
-        "stop_travel",
-        "scroll_current_window_up_page",
-        "scroll_current_window_down_page",
-        "scroll_current_window_up_one",
-        "scroll_current_window_down_one",
-        "scroll_current_window_home",
-        "scroll_current_window_end",
-        "toggle_sounds",
-        "toggle_performance_stats",
-        "tts_next",
-        "tts_previous",
-        "tts_next_unread",
-        "tts_stop",
-        "tts_mute_toggle",
-        "tts_increase_rate",
-        "tts_decrease_rate",
-        "tts_increase_volume",
-        "tts_decrease_volume",
-    ];
-
+    /// Resolve a wire name to its action. Exact matches come from the canonical
+    /// [`ACTIONS`](Self::ACTIONS) table; the only names handled outside the
+    /// table are the `controller_wheel:<name>` prefix form and the
+    /// `tts_pause_resume` legacy alias (both listed in `EXEMPT_ACTIONS`).
     pub fn from_str(action: &str) -> Option<Self> {
-        match action {
-            "send_command" => Some(Self::SendCommand),
-            "cursor_left" => Some(Self::CursorLeft),
-            "cursor_right" => Some(Self::CursorRight),
-            "cursor_word_left" => Some(Self::CursorWordLeft),
-            "cursor_word_right" => Some(Self::CursorWordRight),
-            "cursor_home" => Some(Self::CursorHome),
-            "cursor_end" => Some(Self::CursorEnd),
-            "cursor_backspace" => Some(Self::CursorBackspace),
-            "cursor_delete" => Some(Self::CursorDelete),
-            "cursor_delete_word" => Some(Self::CursorDeleteWord),
-            "cursor_clear_line" => Some(Self::CursorClearLine),
-            "previous_command" => Some(Self::PreviousCommand),
-            "next_command" => Some(Self::NextCommand),
-            "send_last_command" => Some(Self::SendLastCommand),
-            "send_second_last_command" => Some(Self::SendSecondLastCommand),
-            "switch_current_window" => Some(Self::SwitchCurrentWindow),
-            "scroll_current_window_up_one" => Some(Self::ScrollCurrentWindowUpOne),
-            "scroll_current_window_down_one" => Some(Self::ScrollCurrentWindowDownOne),
-            "scroll_current_window_up_page" => Some(Self::ScrollCurrentWindowUpPage),
-            "scroll_current_window_down_page" => Some(Self::ScrollCurrentWindowDownPage),
-            "scroll_current_window_home" => Some(Self::ScrollCurrentWindowHome),
-            "scroll_current_window_end" => Some(Self::ScrollCurrentWindowEnd),
-            "start_search" => Some(Self::StartSearch),
-            "next_search_match" => Some(Self::NextSearchMatch),
-            "prev_search_match" => Some(Self::PrevSearchMatch),
-            "clear_search" => Some(Self::ClearSearch),
-            "next_tab" => Some(Self::NextTab),
-            "prev_tab" => Some(Self::PrevTab),
-            "next_unread_tab" => Some(Self::NextUnreadTab),
-            "copy" => Some(Self::Copy),
-            "paste" => Some(Self::Paste),
-            "select_all" => Some(Self::SelectAll),
-            "toggle_performance_stats" => Some(Self::TogglePerformanceStats),
-            "toggle_sounds" => Some(Self::ToggleSounds),
-            "stop_travel" => Some(Self::StopTravel),
-            "interact_mode" => Some(Self::InteractMode),
-            "interact_select" => Some(Self::InteractSelect),
-            "menu_up" => Some(Self::MenuUp),
-            "menu_down" => Some(Self::MenuDown),
-            "menu_left" => Some(Self::MenuLeft),
-            "menu_right" => Some(Self::MenuRight),
-            "menu_cancel" => Some(Self::MenuCancel),
-            "controller_shift" => Some(Self::ControllerShift),
-            // "controller_wheel" opens the default wheel;
-            // "controller_wheel:<name>" opens a named [controller_wheels.<name>].
-            s if s == "controller_wheel" || s.starts_with("controller_wheel:") => {
-                Some(Self::ControllerWheel)
-            }
-            "controller_overlay" => Some(Self::ControllerOverlay),
-            "tts_next" => Some(Self::TtsNext),
-            "tts_previous" => Some(Self::TtsPrevious),
-            "tts_next_unread" => Some(Self::TtsNextUnread),
-            "tts_stop" => Some(Self::TtsStop),
-            "tts_pause_resume" => Some(Self::TtsStop), // Legacy support
-            "tts_mute_toggle" => Some(Self::TtsMuteToggle),
-            "tts_increase_rate" => Some(Self::TtsIncreaseRate),
-            "tts_decrease_rate" => Some(Self::TtsDecreaseRate),
-            "tts_increase_volume" => Some(Self::TtsIncreaseVolume),
-            "tts_decrease_volume" => Some(Self::TtsDecreaseVolume),
-            _ => None,
+        // "controller_wheel" opens the default wheel;
+        // "controller_wheel:<name>" opens a named [controller_wheels.<name>].
+        // Prefix form can't be an exact table row, so match it first.
+        if action == "controller_wheel" || action.starts_with("controller_wheel:") {
+            return Some(Self::ControllerWheel);
         }
+        // Legacy alias: kept for old configs, never offered in any editor.
+        if action == "tts_pause_resume" {
+            return Some(Self::TtsStop);
+        }
+        // "scroll_window_end:<name>[,<name>...]" scrolls the named windows;
+        // the bare name falls back to the focused window. Prefix form, so it
+        // is matched here rather than as a table row.
+        if action == "scroll_window_end" || action.starts_with("scroll_window_end:") {
+            return Some(Self::ScrollWindowEnd);
+        }
+        Self::ACTIONS
+            .iter()
+            .find(|d| d.name == action)
+            .map(|d| d.action.clone())
     }
 }
 
@@ -1265,30 +1413,99 @@ impl Config {
         }
     }
 
-    /// Load the radial wheel slices from `[[controller_wheel]]` of the
-    /// global keybinds.toml, falling back to the shipped defaults when
-    /// absent.
-    pub fn load_controller_wheel() -> Result<Vec<WheelSlice>> {
-        let slices_from = |contents: &str| -> Option<Vec<WheelSlice>> {
-            let toml_value: toml::Value = toml::from_str(contents).ok()?;
-            let array = toml_value.get("controller_wheel")?;
-            array.clone().try_into().ok()
-        };
-        let path = Self::common_keybinds_path()?;
-        if path.exists() {
+    /// Resolve which controller.toml a save targets: the global file, or a
+    /// character's override file. The single scope→path decision shared by
+    /// every controller saver.
+    fn controller_save_path(is_global: bool, character: Option<&str>) -> Result<std::path::PathBuf> {
+        if is_global {
+            Self::common_controller_path()
+        } else {
+            Self::controller_path(character)
+        }
+    }
+
+    /// Load a controller.toml (global or character) as a plain
+    /// `toml::value::Table` for the section savers (creating the parent dir
+    /// when the file is absent). A file that fails to parse yields an empty
+    /// table rather than an error so a single bad edit can't wedge every
+    /// controller save.
+    fn load_controller_table(
+        is_global: bool,
+        character: Option<&str>,
+    ) -> Result<(std::path::PathBuf, toml::value::Table)> {
+        let path = Self::controller_save_path(is_global, character)?;
+        let table = if path.exists() {
             let contents = fs::read_to_string(&path)
-                .with_context(|| format!("Failed to read keybinds file: {:?}", path))?;
-            if let Some(slices) = slices_from(&contents) {
-                return Ok(slices);
+                .with_context(|| format!("Failed to read controller file: {:?}", path))?;
+            toml::from_str(&contents).unwrap_or_else(|_| toml::value::Table::new())
+        } else {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)
+                    .with_context(|| format!("Failed to create directory: {:?}", parent))?;
+            }
+            toml::value::Table::new()
+        };
+        Ok((path, table))
+    }
+
+    /// Serialize and atomically write a controller.toml table.
+    fn write_controller_table(path: &std::path::Path, table: &toml::value::Table) -> Result<()> {
+        let contents =
+            toml::to_string_pretty(table).context("Failed to serialize controller config")?;
+        write_atomic(path, contents)
+            .with_context(|| format!("Failed to write controller file: {:?}", path))?;
+        Ok(())
+    }
+
+    /// The controller config layers as raw TOML text, base first: the global
+    /// layer (the on-disk `global/controller.toml`, or the shipped default
+    /// when it hasn't been extracted yet) followed by the character's
+    /// override file when one exists. Each loader delegates to the matching
+    /// pure `merge_*`/`last_*` helper below, which folds these layers so the
+    /// merge rules stay filesystem-free and unit-testable.
+    fn controller_layers(character: Option<&str>) -> Vec<String> {
+        let mut layers = Vec::with_capacity(2);
+        // Global base: prefer the extracted file, fall back to the shipped
+        // default so a fresh install still gets the built-in wheel/binds.
+        match Self::common_controller_path().ok().filter(|p| p.exists()) {
+            Some(path) => match fs::read_to_string(&path) {
+                Ok(text) => layers.push(text),
+                Err(err) => {
+                    tracing::warn!("Failed to read controller file {:?}: {}", path, err);
+                    layers.push(DEFAULT_CONTROLLER.to_string());
+                }
+            },
+            None => layers.push(DEFAULT_CONTROLLER.to_string()),
+        }
+        // Character override layer (optional).
+        if let Some(path) = Self::controller_path(character).ok().filter(|p| p.exists()) {
+            match fs::read_to_string(&path) {
+                Ok(text) => layers.push(text),
+                Err(err) => {
+                    tracing::warn!("Failed to read character controller {:?}: {}", path, err)
+                }
             }
         }
-        Ok(slices_from(DEFAULT_KEYBINDS).unwrap_or_default())
+        layers
+    }
+
+    /// Load the radial default-wheel slices from `[[controller_wheel]]`,
+    /// global base with the character's override winning wholesale (the ring
+    /// is one array, so a character that defines it replaces it entirely).
+    pub fn load_controller_wheel(character: Option<&str>) -> Result<Vec<WheelSlice>> {
+        let slices_from = |contents: &str| -> Option<Vec<WheelSlice>> {
+            let toml_value: toml::Value = toml::from_str(contents).ok()?;
+            toml_value.get("controller_wheel")?.clone().try_into().ok()
+        };
+        // Last layer that defines the ring wins (character over global).
+        Ok(last_controller_value(&Self::controller_layers(character), slices_from).unwrap_or_default())
     }
 
     /// Load the overlay legend's curated entries from
-    /// `[controller_overlay] buttons` of the global keybinds.toml:
-    /// button names, with a `shift/` prefix for shift-layer entries.
-    pub fn load_controller_overlay() -> Result<Vec<String>> {
+    /// `[controller_overlay] buttons`: button names, with a `shift/` prefix
+    /// for shift-layer entries. The character's list, if present, replaces
+    /// the global one wholesale.
+    pub fn load_controller_overlay(character: Option<&str>) -> Result<Vec<String>> {
         let list_from = |contents: &str| -> Option<Vec<String>> {
             let toml_value: toml::Value = toml::from_str(contents).ok()?;
             toml_value
@@ -1298,31 +1515,16 @@ impl Config {
                 .try_into()
                 .ok()
         };
-        let path = Self::common_keybinds_path()?;
-        if path.exists() {
-            let contents = fs::read_to_string(&path)
-                .with_context(|| format!("Failed to read keybinds file: {:?}", path))?;
-            if let Some(list) = list_from(&contents) {
-                return Ok(list);
-            }
-        }
-        Ok(list_from(DEFAULT_KEYBINDS).unwrap_or_default())
+        Ok(last_controller_value(&Self::controller_layers(character), list_from).unwrap_or_default())
     }
 
     /// Replace the overlay legend's curated entry list.
-    pub fn save_controller_overlay(buttons: &[String]) -> Result<()> {
-        let path = Self::common_keybinds_path()?;
-        let mut toml_table: toml::value::Table = if path.exists() {
-            let contents = fs::read_to_string(&path)
-                .with_context(|| format!("Failed to read keybinds file: {:?}", path))?;
-            toml::from_str(&contents).unwrap_or_else(|_| toml::value::Table::new())
-        } else {
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent)
-                    .with_context(|| format!("Failed to create directory: {:?}", parent))?;
-            }
-            toml::value::Table::new()
-        };
+    pub fn save_controller_overlay(
+        buttons: &[String],
+        is_global: bool,
+        character: Option<&str>,
+    ) -> Result<()> {
+        let (path, mut toml_table) = Self::load_controller_table(is_global, character)?;
         let section = toml_table
             .entry("controller_overlay".to_string())
             .or_insert_with(|| toml::Value::Table(toml::value::Table::new()));
@@ -1332,152 +1534,90 @@ impl Config {
                 toml::Value::try_from(buttons).context("Failed to serialize overlay list")?,
             );
         }
-        let contents =
-            toml::to_string_pretty(&toml_table).context("Failed to serialize keybinds")?;
-        write_atomic(&path, contents)
-            .with_context(|| format!("Failed to write keybinds file: {:?}", path))?;
-        Ok(())
+        Self::write_controller_table(&path, &toml_table)
     }
 
-    /// Load the rumble event map from `[controller_rumble]` of the global
-    /// keybinds.toml (shipped defaults when absent).
-    pub fn load_controller_rumble() -> Result<RumbleConfig> {
+    /// Load the rumble event map from `[controller_rumble]`. The character's
+    /// section, if present, replaces the global one wholesale.
+    pub fn load_controller_rumble(character: Option<&str>) -> Result<RumbleConfig> {
         let section_from = |contents: &str| -> Option<RumbleConfig> {
             let toml_value: toml::Value = toml::from_str(contents).ok()?;
             toml_value.get("controller_rumble")?.clone().try_into().ok()
         };
-        let path = Self::common_keybinds_path()?;
-        if path.exists() {
-            let contents = fs::read_to_string(&path)
-                .with_context(|| format!("Failed to read keybinds file: {:?}", path))?;
-            if let Some(config) = section_from(&contents) {
-                return Ok(config);
-            }
-        }
-        Ok(section_from(DEFAULT_KEYBINDS).unwrap_or_default())
+        Ok(last_controller_value(&Self::controller_layers(character), section_from).unwrap_or_default())
     }
 
     /// Replace the `[controller_rumble]` section.
-    pub fn save_controller_rumble(rumble: &RumbleConfig) -> Result<()> {
-        let path = Self::common_keybinds_path()?;
-        let mut toml_table: toml::value::Table = if path.exists() {
-            let contents = fs::read_to_string(&path)
-                .with_context(|| format!("Failed to read keybinds file: {:?}", path))?;
-            toml::from_str(&contents).unwrap_or_else(|_| toml::value::Table::new())
-        } else {
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent)
-                    .with_context(|| format!("Failed to create directory: {:?}", parent))?;
-            }
-            toml::value::Table::new()
-        };
+    pub fn save_controller_rumble(
+        rumble: &RumbleConfig,
+        is_global: bool,
+        character: Option<&str>,
+    ) -> Result<()> {
+        let (path, mut toml_table) = Self::load_controller_table(is_global, character)?;
         toml_table.insert(
             "controller_rumble".to_string(),
             toml::Value::try_from(rumble).context("Failed to serialize rumble config")?,
         );
-        let contents =
-            toml::to_string_pretty(&toml_table).context("Failed to serialize keybinds")?;
-        write_atomic(&path, contents)
-            .with_context(|| format!("Failed to write keybinds file: {:?}", path))?;
-        Ok(())
+        Self::write_controller_table(&path, &toml_table)
     }
 
-    /// Load the input-feel tuning from `[controller_tuning]` of the global
-    /// keybinds.toml (shipped defaults when absent).
-    pub fn load_controller_tuning() -> Result<TuningConfig> {
+    /// Load the input-feel tuning from `[controller_tuning]`. The character's
+    /// section, if present, replaces the global one wholesale.
+    pub fn load_controller_tuning(character: Option<&str>) -> Result<TuningConfig> {
         let section_from = |contents: &str| -> Option<TuningConfig> {
             let toml_value: toml::Value = toml::from_str(contents).ok()?;
             toml_value.get("controller_tuning")?.clone().try_into().ok()
         };
-        let path = Self::common_keybinds_path()?;
-        if path.exists() {
-            let contents = fs::read_to_string(&path)
-                .with_context(|| format!("Failed to read keybinds file: {:?}", path))?;
-            if let Some(config) = section_from(&contents) {
-                return Ok(config);
-            }
-        }
-        Ok(section_from(DEFAULT_KEYBINDS).unwrap_or_default())
+        Ok(last_controller_value(&Self::controller_layers(character), section_from).unwrap_or_default())
     }
 
     /// Replace the `[controller_tuning]` section.
-    pub fn save_controller_tuning(tuning: &TuningConfig) -> Result<()> {
-        let path = Self::common_keybinds_path()?;
-        let mut toml_table: toml::value::Table = if path.exists() {
-            let contents = fs::read_to_string(&path)
-                .with_context(|| format!("Failed to read keybinds file: {:?}", path))?;
-            toml::from_str(&contents).unwrap_or_else(|_| toml::value::Table::new())
-        } else {
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent)
-                    .with_context(|| format!("Failed to create directory: {:?}", parent))?;
-            }
-            toml::value::Table::new()
-        };
+    pub fn save_controller_tuning(
+        tuning: &TuningConfig,
+        is_global: bool,
+        character: Option<&str>,
+    ) -> Result<()> {
+        let (path, mut toml_table) = Self::load_controller_table(is_global, character)?;
         toml_table.insert(
             "controller_tuning".to_string(),
             toml::Value::try_from(tuning).context("Failed to serialize tuning config")?,
         );
-        let contents =
-            toml::to_string_pretty(&toml_table).context("Failed to serialize keybinds")?;
-        write_atomic(&path, contents)
-            .with_context(|| format!("Failed to write keybinds file: {:?}", path))?;
-        Ok(())
+        Self::write_controller_table(&path, &toml_table)
     }
 
-    /// Load the named wheels from `[controller_wheels.<name>]` arrays of
-    /// the global keybinds.toml (bound via "controller_wheel:<name>").
-    pub fn load_controller_wheels() -> Result<HashMap<String, Vec<WheelSlice>>> {
-        let wheels_from = |contents: &str| -> Option<HashMap<String, Vec<WheelSlice>>> {
-            let toml_value: toml::Value = toml::from_str(contents).ok()?;
-            let table = toml_value.get("controller_wheels")?;
-            table.clone().try_into().ok()
-        };
-        let path = Self::common_keybinds_path()?;
-        if path.exists() {
-            let contents = fs::read_to_string(&path)
-                .with_context(|| format!("Failed to read keybinds file: {:?}", path))?;
-            if let Some(wheels) = wheels_from(&contents) {
-                return Ok(wheels);
-            }
-        }
-        Ok(wheels_from(DEFAULT_KEYBINDS).unwrap_or_default())
+    /// Load the named wheels from `[controller_wheels.<name>]` arrays
+    /// (bound via "controller_wheel:<name>"). Merged by name: a character's
+    /// wheel of a given name overrides the global one, other names fall
+    /// through to global.
+    pub fn load_controller_wheels(
+        character: Option<&str>,
+    ) -> Result<HashMap<String, Vec<WheelSlice>>> {
+        Ok(merge_controller_named_layers(
+            "controller_wheels",
+            &Self::controller_layers(character),
+        ))
     }
 
     /// Load per-wheel metadata from `[controller_wheels_meta.<name>]`
-    /// (button/stick). Absent = empty map = today's behavior.
-    pub fn load_controller_wheels_meta() -> Result<HashMap<String, WheelMeta>> {
-        let meta_from = |contents: &str| -> Option<HashMap<String, WheelMeta>> {
-            let toml_value: toml::Value = toml::from_str(contents).ok()?;
-            let table = toml_value.get("controller_wheels_meta")?;
-            table.clone().try_into().ok()
-        };
-        let path = Self::common_keybinds_path()?;
-        if path.exists() {
-            let contents = fs::read_to_string(&path)
-                .with_context(|| format!("Failed to read keybinds file: {:?}", path))?;
-            if let Some(meta) = meta_from(&contents) {
-                return Ok(meta);
-            }
-        }
-        Ok(meta_from(DEFAULT_KEYBINDS).unwrap_or_default())
+    /// (button/stick). Merged by name (character overrides global). Absent
+    /// in both = empty map = today's behavior.
+    pub fn load_controller_wheels_meta(
+        character: Option<&str>,
+    ) -> Result<HashMap<String, WheelMeta>> {
+        Ok(merge_controller_named_layers(
+            "controller_wheels_meta",
+            &Self::controller_layers(character),
+        ))
     }
 
     /// Replace the `[controller_wheels_meta]` section. Entries with both
     /// fields None are dropped so the section stays tidy.
-    pub fn save_controller_wheels_meta(meta: &HashMap<String, WheelMeta>) -> Result<()> {
-        let path = Self::common_keybinds_path()?;
-        let mut toml_table: toml::value::Table = if path.exists() {
-            let contents = fs::read_to_string(&path)
-                .with_context(|| format!("Failed to read keybinds file: {:?}", path))?;
-            toml::from_str(&contents).unwrap_or_else(|_| toml::value::Table::new())
-        } else {
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent)
-                    .with_context(|| format!("Failed to create directory: {:?}", parent))?;
-            }
-            toml::value::Table::new()
-        };
+    pub fn save_controller_wheels_meta(
+        meta: &HashMap<String, WheelMeta>,
+        is_global: bool,
+        character: Option<&str>,
+    ) -> Result<()> {
+        let (path, mut toml_table) = Self::load_controller_table(is_global, character)?;
         let pruned: HashMap<&String, &WheelMeta> = meta
             .iter()
             .filter(|(_, m)| m.button.is_some() || m.stick.is_some() || m.start.is_some())
@@ -1490,11 +1630,7 @@ impl Config {
                 toml::Value::try_from(&pruned).context("Failed to serialize wheel meta")?,
             );
         }
-        let contents =
-            toml::to_string_pretty(&toml_table).context("Failed to serialize keybinds")?;
-        write_atomic(&path, contents)
-            .with_context(|| format!("Failed to write keybinds file: {:?}", path))?;
-        Ok(())
+        Self::write_controller_table(&path, &toml_table)
     }
 
     /// The slice list at a folder path within a wheel. Key "" is the
@@ -1604,15 +1740,18 @@ impl Config {
             });
     }
 
-    /// Load the keybinds file as a comment-preserving `toml_edit` document
-    /// (empty doc when absent), ensuring the parent dir exists. Shared by
-    /// the wheel savers so they can splice wheel arrays with inline-table
-    /// slices without disturbing the rest of the file.
-    fn load_keybinds_document() -> Result<(std::path::PathBuf, toml_edit::DocumentMut)> {
-        let path = Self::common_keybinds_path()?;
+    /// Load a controller file (global or character) as a comment-preserving
+    /// `toml_edit` document (empty doc when absent), ensuring the parent dir
+    /// exists. Shared by the wheel savers so they can splice wheel arrays
+    /// with inline-table slices without disturbing the rest of the file.
+    fn load_controller_document(
+        is_global: bool,
+        character: Option<&str>,
+    ) -> Result<(std::path::PathBuf, toml_edit::DocumentMut)> {
+        let path = Self::controller_save_path(is_global, character)?;
         let doc = if path.exists() {
             let contents = fs::read_to_string(&path)
-                .with_context(|| format!("Failed to read keybinds file: {:?}", path))?;
+                .with_context(|| format!("Failed to read controller file: {:?}", path))?;
             contents
                 .parse::<toml_edit::DocumentMut>()
                 .unwrap_or_default()
@@ -1626,8 +1765,13 @@ impl Config {
         Ok((path, doc))
     }
 
-    pub fn save_controller_wheel_named(name: Option<&str>, slices: &[WheelSlice]) -> Result<()> {
-        let (path, mut doc) = Self::load_keybinds_document()?;
+    pub fn save_controller_wheel_named(
+        name: Option<&str>,
+        slices: &[WheelSlice],
+        is_global: bool,
+        character: Option<&str>,
+    ) -> Result<()> {
+        let (path, mut doc) = Self::load_controller_document(is_global, character)?;
         match name {
             None => {
                 Self::set_root_value_before_tables(
@@ -1657,23 +1801,27 @@ impl Config {
             }
         }
         write_atomic(&path, doc.to_string())
-            .with_context(|| format!("Failed to write keybinds file: {:?}", path))?;
+            .with_context(|| format!("Failed to write controller file: {:?}", path))?;
         Ok(())
     }
 
     /// Replace the whole `[[controller_wheel]]` array in the global
-    /// keybinds.toml (the wheel editor saves the full slice list). Nested
+    /// controller.toml (the wheel editor saves the full slice list). Nested
     /// folder slices are written as inline tables so a folder's children
     /// can never re-bind to a later sibling on reload.
-    pub fn save_controller_wheel(slices: &[WheelSlice]) -> Result<()> {
-        let (path, mut doc) = Self::load_keybinds_document()?;
+    pub fn save_controller_wheel(
+        slices: &[WheelSlice],
+        is_global: bool,
+        character: Option<&str>,
+    ) -> Result<()> {
+        let (path, mut doc) = Self::load_controller_document(is_global, character)?;
         Self::set_root_value_before_tables(
             &mut doc,
             "controller_wheel",
             Self::wheel_slices_to_inline(slices),
         );
         write_atomic(&path, doc.to_string())
-            .with_context(|| format!("Failed to write keybinds file: {:?}", path))?;
+            .with_context(|| format!("Failed to write controller file: {:?}", path))?;
         Ok(())
     }
 
@@ -1686,54 +1834,58 @@ impl Config {
     }
 
     /// Load controller (gamepad) bindings from a `[controller]`-family
-    /// section of the global keybinds.toml. Controller binds are
-    /// global-only: pads are per-desk, not per-character. Falls back to
-    /// the shipped defaults when the file lacks the section
-    /// (pre-refresh installs).
-    pub fn load_controller_binds_layer(shift: bool) -> Result<HashMap<String, KeyBindAction>> {
+    /// section, merged by button: the global layer is the base and a
+    /// character's controller.toml overrides individual buttons, with unset
+    /// buttons falling through to global. Falls back to the shipped defaults
+    /// when neither layer has the section (pre-refresh installs).
+    pub fn load_controller_binds_layer(
+        shift: bool,
+        character: Option<&str>,
+    ) -> Result<HashMap<String, KeyBindAction>> {
         let section = Self::controller_section_name(shift);
-        let section_from = |contents: &str| -> Option<HashMap<String, KeyBindAction>> {
-            let toml_value: toml::Value = toml::from_str(contents).ok()?;
-            let table = toml_value.get(section)?;
-            table.clone().try_into().ok()
-        };
-
-        let path = Self::common_keybinds_path()?;
-        if path.exists() {
-            let contents = fs::read_to_string(&path)
-                .with_context(|| format!("Failed to read keybinds file: {:?}", path))?;
-            if let Some(binds) = section_from(&contents) {
-                return Ok(binds);
-            }
-        }
-        Ok(section_from(DEFAULT_KEYBINDS).unwrap_or_default())
+        Ok(merge_controller_bind_layers(
+            section,
+            &Self::controller_layers(character),
+        ))
     }
 
     /// Base-layer controller bindings (`[controller]`).
-    pub fn load_controller_binds() -> Result<HashMap<String, KeyBindAction>> {
-        Self::load_controller_binds_layer(false)
+    pub fn load_controller_binds(character: Option<&str>) -> Result<HashMap<String, KeyBindAction>> {
+        Self::load_controller_binds_layer(false, character)
+    }
+
+    /// A character's own controller binds for one layer, NOT merged with
+    /// global — the editor uses this to tell whether a given button is a
+    /// character override (so it can tag the row and route the edit to the
+    /// right file). Empty when the character has no controller.toml.
+    pub fn load_character_controller_binds_only(
+        shift: bool,
+        character: Option<&str>,
+    ) -> Result<HashMap<String, KeyBindAction>> {
+        let path = Self::controller_path(character)?;
+        if !path.exists() {
+            return Ok(HashMap::new());
+        }
+        let contents = fs::read_to_string(&path)
+            .with_context(|| format!("Failed to read character controller: {:?}", path))?;
+        let binds = toml::from_str::<toml::Value>(&contents)
+            .ok()
+            .and_then(|v| v.get(Self::controller_section_name(shift)).cloned())
+            .and_then(|t| t.try_into().ok())
+            .unwrap_or_default();
+        Ok(binds)
     }
 
     /// Save one controller binding into a `[controller]`-family section of
-    /// the global keybinds.toml (created if missing).
+    /// the global controller.toml (created if missing).
     pub fn save_single_controller_bind(
         button: &str,
         action: &KeyBindAction,
         shift: bool,
+        is_global: bool,
+        character: Option<&str>,
     ) -> Result<()> {
-        let path = Self::common_keybinds_path()?;
-        let mut toml_table: toml::value::Table = if path.exists() {
-            let contents = fs::read_to_string(&path)
-                .with_context(|| format!("Failed to read keybinds file: {:?}", path))?;
-            toml::from_str(&contents).unwrap_or_else(|_| toml::value::Table::new())
-        } else {
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent)
-                    .with_context(|| format!("Failed to create directory: {:?}", parent))?;
-            }
-            toml::value::Table::new()
-        };
-
+        let (path, mut toml_table) = Self::load_controller_table(is_global, character)?;
         let section = toml_table
             .entry(Self::controller_section_name(shift).to_string())
             .or_insert_with(|| toml::Value::Table(toml::value::Table::new()));
@@ -1751,34 +1903,32 @@ impl Config {
             };
             table.insert(button.to_string(), action_value);
         }
-
-        let contents =
-            toml::to_string_pretty(&toml_table).context("Failed to serialize keybinds")?;
-        write_atomic(&path, contents)
-            .with_context(|| format!("Failed to write keybinds file: {:?}", path))?;
+        Self::write_controller_table(&path, &toml_table)?;
         tracing::info!("Saved controller bind '{}' to {:?}", button, path);
         Ok(())
     }
 
     /// Delete one controller binding from a `[controller]`-family section
-    /// of the global keybinds.toml.
-    pub fn delete_single_controller_bind(button: &str, shift: bool) -> Result<()> {
-        let path = Self::common_keybinds_path()?;
+    /// of the global or a character's controller.toml.
+    pub fn delete_single_controller_bind(
+        button: &str,
+        shift: bool,
+        is_global: bool,
+        character: Option<&str>,
+    ) -> Result<()> {
+        let path = Self::controller_save_path(is_global, character)?;
         if !path.exists() {
             return Ok(());
         }
         let contents = fs::read_to_string(&path)
-            .with_context(|| format!("Failed to read keybinds file: {:?}", path))?;
+            .with_context(|| format!("Failed to read controller file: {:?}", path))?;
         let mut toml_table: toml::value::Table = toml::from_str(&contents)
-            .with_context(|| format!("Failed to parse keybinds file: {:?}", path))?;
+            .with_context(|| format!("Failed to parse controller file: {:?}", path))?;
         if let Some(toml::Value::Table(table)) =
             toml_table.get_mut(Self::controller_section_name(shift))
         {
             if table.remove(button).is_some() {
-                let contents =
-                    toml::to_string_pretty(&toml_table).context("Failed to serialize keybinds")?;
-                write_atomic(&path, contents)
-                    .with_context(|| format!("Failed to write keybinds file: {:?}", path))?;
+                Self::write_controller_table(&path, &toml_table)?;
                 tracing::info!("Deleted controller bind '{}' from {:?}", button, path);
             }
         }
@@ -1861,6 +2011,53 @@ impl Config {
             path
         );
 
+        Ok(())
+    }
+
+    /// Persist the full [menu] keybinds table to the scope's keybinds.toml,
+    /// leaving other sections ([user], [app], ...) untouched. Menu keybinds
+    /// are a fixed 26-field struct (not an add/delete map), so the editor
+    /// always writes the whole set — the read-modify-write mirrors
+    /// `save_single_keybind`. Global writes global/keybinds.toml; character
+    /// writes the profile keybinds.toml.
+    pub fn save_menu_keybinds(
+        menu: &MenuKeybinds,
+        is_global: bool,
+        character: Option<&str>,
+    ) -> Result<()> {
+        let path = if is_global {
+            Self::common_keybinds_path()?
+        } else {
+            Self::keybinds_path(character)?
+        };
+
+        let mut toml_table: toml::value::Table = if path.exists() {
+            let contents = fs::read_to_string(&path)
+                .with_context(|| format!("Failed to read keybinds file: {:?}", path))?;
+            toml::from_str(&contents).unwrap_or_else(|_| toml::value::Table::new())
+        } else {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)
+                    .with_context(|| format!("Failed to create directory: {:?}", parent))?;
+            }
+            toml::value::Table::new()
+        };
+
+        // Replace the [menu] section wholesale with the serialized struct.
+        let menu_value =
+            toml::Value::try_from(menu).context("Failed to serialize menu keybinds")?;
+        toml_table.insert("menu".to_string(), menu_value);
+
+        let contents =
+            toml::to_string_pretty(&toml_table).context("Failed to serialize keybinds")?;
+        write_atomic(&path, contents)
+            .with_context(|| format!("Failed to write keybinds file: {:?}", path))?;
+
+        tracing::info!(
+            "Saved menu keybinds to {} keybinds file: {:?}",
+            if is_global { "global" } else { "character" },
+            path
+        );
         Ok(())
     }
 
@@ -2305,9 +2502,118 @@ pub fn default_keybinds() -> HashMap<String, KeyBindAction> {
     map
 }
 
+// ── Pure controller-layer merge helpers ────────────────────────────────
+// The controller loaders read one or two raw TOML layer strings (global
+// base, then optional character override) and fold them per the section's
+// merge rule. Factoring the fold out here keeps the rules filesystem-free
+// and unit-testable; the loaders in `impl Config` just supply the layers.
+
+/// Map-merge a `[table]` of `key = value` entries across layers: later
+/// layers (the character override) win per key, unset keys fall through to
+/// the base. A layer that doesn't parse or lacks the table contributes
+/// nothing. Used for `[controller]` / `[controller_shift]` binds.
+fn merge_controller_bind_layers(section: &str, layers: &[String]) -> HashMap<String, KeyBindAction> {
+    let mut merged: HashMap<String, KeyBindAction> = HashMap::new();
+    for text in layers {
+        let binds: HashMap<String, KeyBindAction> = toml::from_str::<toml::Value>(text)
+            .ok()
+            .and_then(|v| v.get(section).cloned())
+            .and_then(|t| t.try_into().ok())
+            .unwrap_or_default();
+        merged.extend(binds);
+    }
+    merged
+}
+
+/// Map-merge a named `[table.<name>]` collection across layers, where each
+/// value deserializes to `T`: later layers win per name. Used for
+/// `[controller_wheels]` and `[controller_wheels_meta]`.
+fn merge_controller_named_layers<T>(table: &str, layers: &[String]) -> HashMap<String, T>
+where
+    T: serde::de::DeserializeOwned,
+{
+    let mut merged: HashMap<String, T> = HashMap::new();
+    for text in layers {
+        let map: HashMap<String, T> = toml::from_str::<toml::Value>(text)
+            .ok()
+            .and_then(|v| v.get(table).cloned())
+            .and_then(|t| t.try_into().ok())
+            .unwrap_or_default();
+        merged.extend(map);
+    }
+    merged
+}
+
+/// Last-layer-wins for a whole value parsed by `extract`: the character's
+/// section replaces the global one wholesale (the value is one indivisible
+/// unit — a ring array, an overlay list, a tuning/rumble struct). Returns
+/// None only when no layer defines it (loaders then use the type default).
+fn last_controller_value<T>(
+    layers: &[String],
+    extract: impl Fn(&str) -> Option<T>,
+) -> Option<T> {
+    layers.iter().rev().find_map(|text| extract(text))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The [menu] section that save_menu_keybinds writes must survive a
+    /// serialize → deserialize round trip with every field intact (the save
+    /// path replaces [menu] with toml::Value::try_from(menu); load reads it
+    /// back the same way). A dropped field here = a setting the editor could
+    /// silently lose.
+    #[test]
+    fn menu_keybinds_toml_section_round_trips() {
+        let mut menu = MenuKeybinds::default();
+        // Diverge every field from its default so a lost field is detectable.
+        for field in MenuKeybinds::FIELDS {
+            let mangled = format!("Test+{}", (field.get)(&menu));
+            (field.set)(&mut menu, mangled);
+        }
+        // Emulate save (write the [menu] value) then load (try_into back).
+        let value = toml::Value::try_from(&menu).expect("serialize menu");
+        let back: MenuKeybinds = value.try_into().expect("deserialize menu");
+        for field in MenuKeybinds::FIELDS {
+            assert_eq!(
+                (field.get)(&back),
+                (field.get)(&menu),
+                "menu keybind field '{}' did not round-trip",
+                field.label
+            );
+        }
+    }
+
+    /// The FIELDS table must cover every editable menu keybind (26) and each
+    /// get/set must address the same field. Adding a MenuKeybinds field without
+    /// a FIELDS entry means the editors can't reach it — this catches that.
+    #[test]
+    fn menu_keybind_fields_cover_all_26_and_round_trip() {
+        assert_eq!(MenuKeybinds::FIELDS.len(), 26, "expected 26 menu keybind fields");
+
+        // Every field's setter writes what its getter reads back.
+        let mut menu = MenuKeybinds::default();
+        for (i, field) in MenuKeybinds::FIELDS.iter().enumerate() {
+            let sentinel = format!("Sentinel{i}");
+            (field.set)(&mut menu, sentinel.clone());
+            assert_eq!(
+                (field.get)(&menu),
+                sentinel,
+                "field '{}' get/set address different storage",
+                field.label
+            );
+        }
+        // No two fields alias the same storage: after setting each to a unique
+        // value, all 26 read back distinct.
+        let mut fresh = MenuKeybinds::default();
+        for (i, field) in MenuKeybinds::FIELDS.iter().enumerate() {
+            (field.set)(&mut fresh, format!("K{i}"));
+        }
+        let values: std::collections::HashSet<&str> =
+            MenuKeybinds::FIELDS.iter().map(|f| (f.get)(&fresh)).collect();
+        assert_eq!(values.len(), 26, "some FIELDS entries alias the same field");
+    }
 
     #[test]
     fn rumble_resolve_builtins_and_off() {
@@ -2346,6 +2652,92 @@ mod tests {
             gap_ms: 0,
         });
         assert_eq!(config.resolve_pattern("short"), Some((0.5, 160, 1, 120)));
+    }
+
+    // ── Per-character controller layering (pure merge helpers) ──────────
+
+    #[test]
+    fn controller_binds_merge_character_over_global_per_button() {
+        let global = "[controller]\nsouth = \"look\"\nstart = \"interact_mode\"\n".to_string();
+        // Character overrides `south`, adds `north`, leaves `start` alone.
+        let character =
+            "[controller]\nsouth = \"search\"\nnorth = { macro_text = \"n\\r\" }\n".to_string();
+        let merged = merge_controller_bind_layers("controller", &[global, character]);
+
+        assert_eq!(merged.get("south").unwrap().display_value(), "search"); // overridden
+        assert_eq!(merged.get("start").unwrap().display_value(), "interact_mode"); // inherited
+        assert_eq!(merged.get("north").unwrap().display_value(), "n\r"); // added
+        assert_eq!(merged.len(), 3);
+    }
+
+    #[test]
+    fn controller_binds_global_only_when_no_character_layer() {
+        let global = "[controller]\nsouth = \"look\"\n".to_string();
+        let merged = merge_controller_bind_layers("controller", &[global]);
+        assert_eq!(merged.get("south").unwrap().display_value(), "look");
+        assert_eq!(merged.len(), 1);
+    }
+
+    #[test]
+    fn controller_named_wheels_merge_by_name() {
+        let global = "\
+[[controller_wheels.combat]]
+label = \"cast\"
+command = \"cast\"
+
+[[controller_wheels.travel]]
+label = \"go\"
+command = \"go bank\"
+"
+        .to_string();
+        // Character replaces `combat` wholesale, keeps `travel` from global.
+        let character = "\
+[[controller_wheels.combat]]
+label = \"shoot\"
+command = \"fire\"
+"
+        .to_string();
+        let merged: HashMap<String, Vec<WheelSlice>> =
+            merge_controller_named_layers("controller_wheels", &[global, character]);
+
+        assert_eq!(merged.get("combat").unwrap()[0].label, "shoot"); // overridden
+        assert_eq!(merged.get("travel").unwrap()[0].label, "go"); // inherited
+        assert_eq!(merged.len(), 2);
+    }
+
+    #[test]
+    fn controller_tuning_last_layer_wins_wholesale() {
+        let extract = |text: &str| -> Option<TuningConfig> {
+            toml::from_str::<toml::Value>(text)
+                .ok()?
+                .get("controller_tuning")?
+                .clone()
+                .try_into()
+                .ok()
+        };
+        let global = "[controller_tuning]\ndeadzone = 50\nfire_mode = \"release\"\n".to_string();
+        let character = "[controller_tuning]\ndeadzone = 30\n".to_string();
+        // Character wins wholesale — its file omits fire_mode, so the field
+        // default (not the global value) applies. This is the documented
+        // whole-struct-override behavior.
+        let merged = last_controller_value(&[global, character], extract).unwrap();
+        assert_eq!(merged.deadzone, 30);
+        assert_eq!(merged.fire_mode, default_fire_mode());
+    }
+
+    #[test]
+    fn controller_last_value_none_when_no_layer_defines_it() {
+        let extract = |text: &str| -> Option<TuningConfig> {
+            toml::from_str::<toml::Value>(text)
+                .ok()?
+                .get("controller_tuning")?
+                .clone()
+                .try_into()
+                .ok()
+        };
+        // Neither layer has the section.
+        let layers = ["[controller]\nsouth = \"look\"\n".to_string()];
+        assert!(last_controller_value(&layers, extract).is_none());
     }
 
     fn wheel_config() -> crate::config::Config {
@@ -2429,12 +2821,35 @@ mod tests {
 
     #[test]
     fn controller_action_names_all_parse() {
-        for name in KeyAction::CONTROLLER_ACTION_NAMES {
+        for name in KeyAction::controller_action_names() {
             assert!(
                 KeyAction::from_str(name).is_some(),
-                "'{name}' in CONTROLLER_ACTION_NAMES does not parse"
+                "'{name}' in controller_action_names() does not parse"
             );
         }
+    }
+
+    #[test]
+    fn scroll_to_bottom_actions_parse_and_are_offered() {
+        // The all-windows form is a table row, so editors offer it.
+        assert_eq!(
+            KeyAction::from_str("scroll_all_windows_end"),
+            Some(KeyAction::ScrollAllWindowsEnd)
+        );
+        let offered: Vec<&str> = KeyAction::offered_action_names().collect();
+        assert!(offered.contains(&"scroll_all_windows_end"));
+
+        // The by-name form is a prefix, so it resolves via the exempt path;
+        // bare and comma-joined both parse (bare = focused window).
+        assert_eq!(
+            KeyAction::from_str("scroll_window_end"),
+            Some(KeyAction::ScrollWindowEnd)
+        );
+        assert_eq!(
+            KeyAction::from_str("scroll_window_end:main,thoughts"),
+            Some(KeyAction::ScrollWindowEnd)
+        );
+        assert!(!offered.contains(&"scroll_window_end"));
     }
 
     #[test]
@@ -2448,9 +2863,68 @@ mod tests {
         assert_eq!(KeyAction::from_str("menu_right"), Some(KeyAction::MenuRight));
         assert_eq!(KeyAction::from_str("menu_cancel"), Some(KeyAction::MenuCancel));
         // And they're all offered in the controller editor dropdown.
+        let controller: Vec<&str> = KeyAction::controller_action_names().collect();
         for n in ["interact_select","menu_up","menu_down","menu_left","menu_right","menu_cancel"] {
-            assert!(KeyAction::CONTROLLER_ACTION_NAMES.contains(&n), "{n} missing from dropdown list");
+            assert!(controller.contains(&n), "{n} missing from dropdown list");
         }
+    }
+
+    /// THE parity guard for keybind actions — the keybind-domain analogue of
+    /// registry.rs's leaf-coverage test. Fails the build if any consumer drifts
+    /// from the canonical ACTIONS table. This is the test that would have
+    /// blocked the shipped TUI clobber bug (an action `from_str` accepted but
+    /// the dropdown didn't offer).
+    #[test]
+    fn keybind_action_table_is_the_single_source_of_truth() {
+        // (a) Every table row round-trips: its name parses back to its variant.
+        for def in KeyAction::ACTIONS {
+            assert_eq!(
+                KeyAction::from_str(def.name),
+                Some(def.action.clone()),
+                "ACTIONS row '{}' does not from_str back to its own variant",
+                def.name
+            );
+        }
+
+        // (b) No duplicate names in the table (a copy-paste slip would let one
+        // action silently shadow another in every dropdown).
+        let mut seen = std::collections::HashSet::new();
+        for def in KeyAction::ACTIONS {
+            assert!(seen.insert(def.name), "duplicate action name '{}'", def.name);
+        }
+
+        // (c) Every exempt name still parses (the non-table escape hatches must
+        // keep working) and is NOT also a table row (no redundant exemption).
+        for (name, _reason) in EXEMPT_ACTIONS {
+            assert!(
+                KeyAction::from_str(name).is_some(),
+                "EXEMPT_ACTIONS name '{name}' no longer parses"
+            );
+            assert!(
+                !KeyAction::ACTIONS.iter().any(|d| d.name == *name),
+                "'{name}' is exempt AND a table row — drop one"
+            );
+        }
+        // The wheel prefix form resolves via the exempt path, not a table row.
+        assert_eq!(KeyAction::from_str("controller_wheel:portals"), Some(KeyAction::ControllerWheel));
+
+        // (d) The two generated dropdown sets are exactly the table's slices,
+        // in table order — the TUI form and controller editor cannot offer a
+        // set that drifts from the table (the clobber bug's root cause).
+        let offered: Vec<&str> = KeyAction::offered_action_names().collect();
+        let table_all: Vec<&str> = KeyAction::ACTIONS.iter().map(|d| d.name).collect();
+        assert_eq!(offered, table_all, "TUI offered set drifted from ACTIONS");
+
+        let controller: Vec<&str> = KeyAction::controller_action_names().collect();
+        let table_controller: Vec<&str> = KeyAction::ACTIONS
+            .iter()
+            .filter(|d| d.scope == ActionScope::Controller)
+            .map(|d| d.name)
+            .collect();
+        assert_eq!(
+            controller, table_controller,
+            "controller offered set drifted from ACTIONS controller-scoped rows"
+        );
     }
 
     #[test]

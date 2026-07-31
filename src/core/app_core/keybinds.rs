@@ -209,6 +209,14 @@ impl AppCore {
                 tracing::debug!("KeyAction::ScrollCurrentWindowEnd triggered");
                 self.scroll_current_window_end();
             }
+            KeyAction::ScrollAllWindowsEnd | KeyAction::ScrollWindowEnd => {
+                // Handled in input_handlers.rs - scrolling other windows needs
+                // the frontend's per-widget scroll state, not just the focused
+                // window's core offset.
+                tracing::debug!(
+                    "Scroll-by-name action reached keybinds.rs - should be handled in input_handlers"
+                );
+            }
 
             // Search actions - handled in frontend layer (TuiFrontend.handle_normal_mode_keys)
             // These require frontend access to manipulate text windows
@@ -447,7 +455,8 @@ impl AppCore {
                 max_rows: None,
                 min_cols: None,
                 max_cols: None,
-                visible: true,
+                visibility: crate::config::WindowVisibility::Shown,
+                binding: None,
                 content_align: None,
                 tts_speak: false,
                 text_size: None,

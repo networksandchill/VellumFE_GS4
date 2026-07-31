@@ -22,6 +22,7 @@
   - [config.toml](./configuration/config-toml.md)
   - [layout.toml](./configuration/layout-toml.md)
   - [keybinds.toml](./configuration/keybinds-toml.md)
+  - [controller.toml](./configuration/controller-toml.md)
   - [highlights.toml](./configuration/highlights-toml.md)
   - [colors.toml](./configuration/colors-toml.md)
   - [macros.toml](./configuration/macros-toml.md)
@@ -63,6 +64,7 @@
 # Reference
 
 - [Command Reference](./reference/commands.md)
+- [Inventory Tools (.foreach, .sorter)](./features/inventory-tools.md)
 - [CLI Reference](./reference/cli.md)
 - [FAQ](./reference/faq.md)
 - [Troubleshooting](./reference/troubleshooting.md)

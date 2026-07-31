@@ -103,6 +103,10 @@ pub struct UiConfig {
     /// Draw emoji in color in the GUI (monochrome when off)
     #[serde(default = "default_true")]
     pub color_emoji: bool,
+    /// Categorize "look in container" output by item type (`.sorter`,
+    /// the native sorter.lic)
+    #[serde(default)]
+    pub sorter_enabled: bool,
     // Performance stats settings
     #[serde(default = "default_performance_stats_enabled")]
     pub performance_stats_enabled: bool, // Global toggle for performance overlay
@@ -153,8 +157,6 @@ pub struct UiConfig {
     pub timestamp_position: TimestampPosition, // "start" or "end" (default: end)
     #[serde(default = "default_betrayer_active_color")]
     pub betrayer_active_color: Option<String>,
-    #[serde(default = "default_open_dialog_blocklist")]
-    pub open_dialog_blocklist: Vec<String>,
     #[serde(default)]
     pub focus: FocusConfig, // Tab focus behavior and order
     /// Terminal title template with variables: {character}, {room}, {health}, {mana}, {stamina}, {unread}
@@ -193,6 +195,7 @@ impl Default for UiConfig {
             command_echo: default_command_echo(),
             emoji_shortcodes: true,
             color_emoji: true,
+            sorter_enabled: false,
             performance_stats_enabled: default_performance_stats_enabled(),
             perf_stats_x: default_perf_stats_x(),
             perf_stats_y: default_perf_stats_y(),
@@ -216,7 +219,6 @@ impl Default for UiConfig {
             color_mode: ColorMode::default(),
             timestamp_position: TimestampPosition::default(),
             betrayer_active_color: default_betrayer_active_color(),
-            open_dialog_blocklist: default_open_dialog_blocklist(),
             focus: FocusConfig::default(),
             terminal_title: String::new(),
             progress_bar_style: default_progress_bar_style(),
