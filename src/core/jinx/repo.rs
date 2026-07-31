@@ -57,7 +57,41 @@ const SEEDS: &[Seed] = &[
     Seed { name: "vellum-dolls", url: "https://nisugi.github.io/vellum-assets/dolls", only: None },
     Seed { name: "vellum-skins", url: "https://nisugi.github.io/vellum-assets/skins", only: None },
     Seed { name: "vellum-layouts", url: "https://nisugi.github.io/vellum-assets/layouts", only: None },
+    Seed { name: "vellum-frames", url: "https://nisugi.github.io/vellum-assets/frames", only: None },
+    Seed {
+        name: "vellum-backgrounds",
+        url: "https://nisugi.github.io/vellum-assets/backgrounds",
+        only: None,
+    },
+    Seed {
+        name: "vellum-compass",
+        url: "https://nisugi.github.io/vellum-assets/compass",
+        only: None,
+    },
+    Seed {
+        name: "vellum-statusicons",
+        url: "https://nisugi.github.io/vellum-assets/statusicons",
+        only: None,
+    },
+    Seed {
+        name: "vellum-hands",
+        url: "https://nisugi.github.io/vellum-assets/hands",
+        only: None,
+    },
 ];
+
+/// Root discovery index of the vellum-assets monorepo: a repos.json listing
+/// every category sub-repo, so a category added to the monorepo shows up in
+/// `.jinx` without a client release. Merged (add-only) on top of the
+/// compiled-in seeds each time the worker loads the repo list.
+const DISCOVERY_INDEX: &str = "https://nisugi.github.io/vellum-assets/repos.json";
+
+/// The repos.json shape: `{"repos":[{"name":"vellum-frames","url":"..."}]}`.
+#[derive(Debug, Default, Deserialize)]
+struct DiscoveryIndex {
+    #[serde(default)]
+    repos: Vec<RepoSource>,
+}
 
 /// Repo names to remove on load if present — deprecated or superseded seeds a
 /// past version wrote to a user's `repos.toml`. Mirrors Jinx's `Setup.apply`
@@ -109,6 +143,50 @@ impl RepoList {
                 self.repos.push(RepoSource {
                     name: seed.name.to_string(),
                     url: seed.url.to_string(),
+                });
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    /// Fetch the discovery index and merge any new repos, persisting on
+    /// change. Best-effort on top of the compiled-in seeds: offline or a
+    /// broken index just logs and moves on, never failing the command.
+    pub fn discover(&mut self, agent: &ureq::Agent) {
+        let index = match super::installer::fetch_bytes(agent, DISCOVERY_INDEX) {
+            Ok(bytes) => match serde_json::from_slice::<DiscoveryIndex>(&bytes) {
+                Ok(index) => index,
+                Err(e) => {
+                    tracing::warn!("jinx discovery index did not parse: {e}");
+                    return;
+                }
+            },
+            Err(e) => {
+                tracing::debug!("jinx discovery index unavailable: {e}");
+                return;
+            }
+        };
+        if self.merge_discovered(index) {
+            if let Err(e) = self.save() {
+                tracing::warn!("could not persist discovered repos: {e}");
+            }
+        }
+    }
+
+    /// Add-only merge of index entries: existing names are never touched
+    /// (user URL overrides win), non-HTTPS or empty-named entries are
+    /// skipped. Returns whether the list changed.
+    fn merge_discovered(&mut self, index: DiscoveryIndex) -> bool {
+        let mut changed = false;
+        for repo in index.repos {
+            if repo.name.trim().is_empty() || !repo.url.starts_with("https://") {
+                continue;
+            }
+            if self.find(&repo.name).is_none() {
+                self.repos.push(RepoSource {
+                    name: repo.name,
+                    url: repo.url.trim_end_matches('/').to_string(),
                 });
                 changed = true;
             }
@@ -187,6 +265,10 @@ mod tests {
         assert!(gs.find("vellum-icons").is_some());
         assert!(gs.find("vellum-dolls").is_some());
         assert!(gs.find("vellum-layouts").is_some());
+        assert!(gs.find("vellum-frames").is_some());
+        assert!(gs.find("vellum-backgrounds").is_some());
+        assert!(gs.find("vellum-compass").is_some());
+        assert!(gs.find("vellum-statusicons").is_some());
 
         let mut dr = RepoList::default();
         dr.apply_seeds(GameType::DR);
@@ -224,6 +306,38 @@ mod tests {
         assert!(list.find("myfriend").is_some());
         // Idempotent: a second prune never changes anything.
         assert!(!list.prune_deprecated());
+    }
+
+    #[test]
+    fn merge_discovered_is_add_only_and_filters_bad_entries() {
+        let mut list = RepoList::default();
+        list.add("vellum-frames", "https://mine.example/frames").unwrap();
+
+        let index = DiscoveryIndex {
+            repos: vec![
+                // Existing name: the user's URL must win.
+                RepoSource { name: "vellum-frames".into(), url: "https://official/frames".into() },
+                // New name: merged in, trailing slash normalized.
+                RepoSource { name: "vellum-banners".into(), url: "https://official/banners/".into() },
+                // Bad entries: skipped.
+                RepoSource { name: "".into(), url: "https://official/x".into() },
+                RepoSource { name: "vellum-evil".into(), url: "http://insecure/evil".into() },
+            ],
+        };
+        assert!(list.merge_discovered(index));
+        assert_eq!(list.find("vellum-frames").unwrap().url, "https://mine.example/frames");
+        assert_eq!(list.find("vellum-banners").unwrap().url, "https://official/banners");
+        assert!(list.find("vellum-evil").is_none());
+        assert_eq!(list.repos.len(), 2);
+
+        // Idempotent: merging the same index again changes nothing.
+        let again = DiscoveryIndex {
+            repos: vec![RepoSource {
+                name: "vellum-banners".into(),
+                url: "https://official/banners".into(),
+            }],
+        };
+        assert!(!list.merge_discovered(again));
     }
 
     #[test]

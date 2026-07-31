@@ -155,6 +155,7 @@ impl TuiFrontend {
                     "Border" => colors.ui.border_color = value,
                     "Command Echo" => colors.ui.command_echo_color = value,
                     "Focused Border" => colors.ui.focused_border_color = value,
+                    "System Messages" => colors.ui.system_message_color = value,
                     "Text" => colors.ui.text_color = value,
                     "Text Selection" => colors.ui.selection_bg_color = value,
                     "Textarea Background" => colors.ui.textarea_background = value,
@@ -1313,189 +1314,11 @@ impl TuiFrontend {
                             command
                         );
 
-                        // Handle command same way as Enter key
-                        if let Some(submenu_name) = command.strip_prefix("menu:") {
-                            // Config menu submenu - build nested submenu
-                            tracing::debug!("Clicked config submenu: {}", submenu_name);
-
-                            // Build the appropriate submenu items
-                            let items = match submenu_name {
-                                "addwindow" | "widgetpicker" => app_core.build_add_window_menu(),
-                                "editwindow" => app_core.build_edit_window_menu(),
-                                "hidewindow" => app_core.build_hide_window_menu(),
-                                "layouts" => app_core.build_layouts_submenu(),
-                                _ => Vec::new(),
-                            };
-
-                            if !items.is_empty() {
-                                // Get position from existing submenu (if any) or popup_menu
-                                let position = app_core
-                                    .ui_state
-                                    .submenu
-                                    .as_ref()
-                                    .map(|m| m.get_position())
-                                    .or_else(|| app_core.ui_state.popup_menu.as_ref().map(|m| m.get_position()))
-                                    .unwrap_or((40, 12));
-                                let nested_pos = (position.0 + 2, position.1);
-
-                                // Create nested_submenu since we already have submenu
-                                app_core.ui_state.nested_submenu =
-                                    Some(crate::data::ui_state::PopupMenu::new(
-                                        items,
-                                        nested_pos,
-                                    ));
-                                tracing::info!("Opened nested submenu from menu: {}", submenu_name);
-                            } else {
-                                tracing::warn!("No items for menu submenu: {}", submenu_name);
-                            }
-                        } else if let Some(name) = command.strip_prefix("__TOGGLE_WINDOW__") {
-                            // Windows list: flip this window's show/hide and
-                            // close the menu (U3, keyed on window name).
-                            let name = name.to_string();
-                            app_core.toggle_known_window(&name);
-                            app_core.ui_state.popup_menu = None;
-                            app_core.ui_state.submenu = None;
-                            app_core.ui_state.nested_submenu = None;
-                            app_core.ui_state.deep_submenu = None;
-                            app_core.ui_state.input_mode = InputMode::Normal;
-                            app_core.needs_render = true;
-                            return Ok((true, None));
-                        } else if let Some(category) = command.strip_prefix("__SUBMENU__") {
-                            // Context menu or .menu submenu
-                            // Try build_submenu first (for .menu categories)
-                            let items = app_core.build_submenu(category);
-                            let items = if !items.is_empty() {
-                                items
-                            } else if let Some(items) = app_core.menu_categories.get(category) {
-                                items.clone()
-                            } else {
-                                Vec::new()
-                            };
-
-                            if !items.is_empty() {
-                                let position = app_core
-                                    .ui_state
-                                    .popup_menu
-                                    .as_ref()
-                                    .map(|m| m.get_position())
-                                    .unwrap_or((40, 12));
-                                let submenu_pos = (position.0 + 2, position.1);
-                                app_core.ui_state.submenu =
-                                    Some(crate::data::ui_state::PopupMenu::new(
-                                        items,
-                                        submenu_pos,
-                                    ));
-                                tracing::info!(
-                                    "Opened submenu: {}",
-                                    category
-                                );
-                            }
-                        } else if !command.is_empty() {
-                            // Close menu first
-                            app_core.ui_state.popup_menu = None;
-                            app_core.ui_state.submenu = None;
-                            app_core.ui_state.nested_submenu = None;
-                            app_core.ui_state.deep_submenu = None;
-                            app_core.ui_state.input_mode = InputMode::Normal;
-
-                            // Handle window close command from right-click menu
-                            if let Some(window_name) = command.strip_prefix("__CLOSE_WINDOW__") {
-                                // Check if it's an ephemeral window
-                                if app_core.ui_state.ephemeral_windows.contains(window_name) {
-                                    app_core.ui_state.remove_window(window_name);
-                                    app_core.ui_state.ephemeral_windows.remove(window_name);
-                                    app_core.add_system_message(&format!(
-                                        "Closed container window: {}",
-                                        window_name
-                                    ));
-                                } else {
-                                    // Regular window - just hide it
-                                    app_core.hide_window(window_name);
-                                }
-                                app_core.needs_render = true;
-                                return Ok((true, None));
-                            }
-
-                            // Handle perf menu close
-                            if command == "__PERF_MENU_CLOSE__" {
-                                app_core.ui_state.popup_menu = None;
-                                app_core.ui_state.input_mode = InputMode::Normal;
-                                app_core.needs_render = true;
-                                return Ok((true, None));
-                            }
-
-                            // Handle performance metric toggle from right-click menu
-                            if let Some(metric) = command.strip_prefix("__TOGGLE_PERF__") {
-                                match metric {
-                                    "fps" => app_core.config.ui.perf_show_fps = !app_core.config.ui.perf_show_fps,
-                                    "frame_times" => app_core.config.ui.perf_show_frame_times = !app_core.config.ui.perf_show_frame_times,
-                                    "render_times" => app_core.config.ui.perf_show_render_times = !app_core.config.ui.perf_show_render_times,
-                                    "ui_times" => app_core.config.ui.perf_show_ui_times = !app_core.config.ui.perf_show_ui_times,
-                                    "wrap_times" => app_core.config.ui.perf_show_wrap_times = !app_core.config.ui.perf_show_wrap_times,
-                                    "net" => app_core.config.ui.perf_show_net = !app_core.config.ui.perf_show_net,
-                                    "parse" => app_core.config.ui.perf_show_parse = !app_core.config.ui.perf_show_parse,
-                                    "events" => app_core.config.ui.perf_show_events = !app_core.config.ui.perf_show_events,
-                                    "memory" => app_core.config.ui.perf_show_memory = !app_core.config.ui.perf_show_memory,
-                                    "lines" => app_core.config.ui.perf_show_lines = !app_core.config.ui.perf_show_lines,
-                                    "uptime" => app_core.config.ui.perf_show_uptime = !app_core.config.ui.perf_show_uptime,
-                                    "jitter" => app_core.config.ui.perf_show_jitter = !app_core.config.ui.perf_show_jitter,
-                                    "frame_spikes" => app_core.config.ui.perf_show_frame_spikes = !app_core.config.ui.perf_show_frame_spikes,
-                                    "event_lag" => app_core.config.ui.perf_show_event_lag = !app_core.config.ui.perf_show_event_lag,
-                                    "memory_delta" => app_core.config.ui.perf_show_memory_delta = !app_core.config.ui.perf_show_memory_delta,
-                                    _ => {}
-                                }
-                                // Re-apply enabled flags to perf_stats collector
-                                let data = app_core.perf_overlay_data(true);
-                                app_core.perf_stats.apply_enabled_from(&data);
-                                // Rebuild menu with updated checkmarks (keep it open)
-                                if let Some(ref mut menu) = app_core.ui_state.popup_menu {
-                                    menu.items = Self::build_perf_metrics_context_menu(&app_core.config.ui);
-                                    // Keep selection in bounds
-                                    if menu.selected >= menu.items.len() {
-                                        menu.selected = menu.items.len().saturating_sub(1);
-                                    }
-                                }
-                                app_core.needs_render = true;
-                                return Ok((true, None));
-                            }
-
-                            // Check if this is an internal action or game command
-                            if command.starts_with("action:") {
-                                // Internal action - handle it
-                                if let Err(e) = handle_menu_action_fn(app_core, self, &command) {
-                                    tracing::error!("Menu action error: {}", e);
-                                }
-                                app_core.needs_render = true;
-                                return Ok((true, None));
-                            } else if command.starts_with(".") {
-                                // Dot command - close menu and process through normal dot command handler
-                                app_core.ui_state.popup_menu = None;
-                                app_core.ui_state.submenu = None;
-                                app_core.ui_state.nested_submenu = None;
-                                app_core.ui_state.deep_submenu = None;
-                                app_core.ui_state.input_mode = InputMode::Normal;
-                                // Process the dot command (e.g., .menu, .help)
-                                if let Err(e) = app_core.send_command(command.to_string()) {
-                                    tracing::error!("Dot command error: {}", e);
-                                }
-                                app_core.needs_render = true;
-                                return Ok((true, None));
-                            } else {
-                                if let Some(id) = command.strip_prefix("_qlink change ") {
-                                    let id = id.trim();
-                                    if !id.is_empty() {
-                                        app_core.ui_state.active_quickbar_id = Some(id.to_string());
-                                        if !app_core.ui_state.quickbar_order.contains(&id.to_string()) {
-                                            app_core.ui_state.quickbar_order.push(id.to_string());
-                                        }
-                                    }
-                                }
-                                // Game command - return it for sending to server
-                                app_core.needs_render = true;
-                                return Ok((true, Some(format!("{}\n", command))));
-                            }
-                        }
-                        app_core.needs_render = true;
+                        // Dispatch through the same path as keyboard Enter so
+                        // mouse and keyboard menus can never diverge.
+                        let result =
+                            self.handle_menu_command(command, app_core, &handle_menu_action_fn)?;
+                        return Ok((true, result));
                     } else {
                         // Click outside menu - close it
                         app_core.ui_state.popup_menu = None;
@@ -2167,6 +1990,7 @@ impl TuiFrontend {
                 }
 
                 // Sync UI state positions back to layout WindowDefs after mouse resize/move
+                let mut window_layout_changed = false;
                 if let Some(drag_state) = &app_core.ui_state.mouse_drag {
                     if let Some(window) =
                         app_core.ui_state.get_window(&drag_state.window_name)
@@ -2185,7 +2009,7 @@ impl TuiFrontend {
                             base.rows = window.position.height;
                             tracing::info!("Synced mouse resize/move for '{}' to layout: pos=({},{}) size={}x{}",
                                 drag_state.window_name, base.col.get(), base.row.get(), base.cols.get(), base.rows.get());
-                            app_core.layout_modified_since_save = true;
+                            window_layout_changed = true;
                         }
 
                         // Save ephemeral container window positions to widget_state.toml
@@ -2212,6 +2036,10 @@ impl TuiFrontend {
                             tracing::debug!("Saved ephemeral container position for '{}'", drag_state.window_name);
                         }
                     }
+                }
+
+                if window_layout_changed {
+                    app_core.schedule_layout_autosave();
                 }
 
                 app_core.ui_state.mouse_drag = None;
@@ -4547,7 +4375,7 @@ impl TuiFrontend {
                     if let Some(window_def) = window_def {
                         let actual_name = window_def.name().to_string();
                         app_core.add_new_window(&window_def, width, height);
-                        app_core.layout_modified_since_save = true;
+                        app_core.schedule_layout_autosave();
                         app_core.add_system_message(&format!("Window '{}' added", actual_name));
                         tracing::info!("Added window: {}", actual_name);
 
@@ -4576,7 +4404,7 @@ impl TuiFrontend {
             match app_core.layout.hide_window(window_name) {
                 Ok(_) => {
                     app_core.ui_state.remove_window(window_name);
-                    app_core.layout_modified_since_save = true;
+                    app_core.schedule_layout_autosave();
                     app_core.add_system_message(&format!("Window '{}' hidden", window_name));
                     tracing::info!("Hidden window: {}", window_name);
                     app_core.layout.remove_window_if_default(window_name);
@@ -4687,12 +4515,13 @@ impl TuiFrontend {
                 app_core.ui_state.nested_submenu = None;
                 app_core.ui_state.deep_submenu = None;
                 app_core.ui_state.input_mode = InputMode::Normal;
-                // Process the dot command (e.g., .menu, .help)
-                // IMPORTANT: Check return value for action: prefix - some dot commands
-                // return UI action strings that need to be handled by handle_menu_action
+                // Process the dot command (e.g., .menu, .help); UI
+                // outcomes are performed here like any menu pick.
                 match app_core.send_command(command.to_string()) {
-                    Ok(action_str) if action_str.starts_with("action:") => {
-                        handle_menu_action_fn(app_core, self, &action_str)?;
+                    Ok(crate::data::CommandOutcome::Ui(action)) => {
+                        crate::frontend::tui::menu_actions::handle_ui_action(
+                            app_core, self, action,
+                        )?;
                     }
                     Err(e) => {
                         tracing::error!("Dot command error: {}", e);
@@ -4736,16 +4565,9 @@ impl TuiFrontend {
         use crate::config::WidgetCategory;
         use crate::data::ui_state::InputMode;
 
-        match category_str {
-            "ProgressBar" => Ok(WidgetCategory::ProgressBar),
-            "TextWindow" => Ok(WidgetCategory::TextWindow),
-            "Countdown" => Ok(WidgetCategory::Countdown),
-            "Hand" => Ok(WidgetCategory::Hand),
-            "ActiveEffects" => Ok(WidgetCategory::ActiveEffects),
-            "Entity" => Ok(WidgetCategory::Entity),
-            "Status" => Ok(WidgetCategory::Status),
-            "Other" => Ok(WidgetCategory::Other),
-            _ => {
+        match WidgetCategory::from_name(category_str) {
+            Some(category) => Ok(category),
+            None => {
                 tracing::warn!("Unknown widget category: {}", category_str);
                 app_core.ui_state.popup_menu = None;
                 app_core.ui_state.input_mode = InputMode::Normal;
@@ -5127,6 +4949,11 @@ impl TuiFrontend {
                                         app_core.ui_state.needs_widget_reset = true;
                                     }
                                 }
+                                // Text windows: push streams/compact/timestamps
+                                // onto the live content so the change (e.g. the
+                                // bounty condense toggle) applies immediately
+                                // instead of on window recreation.
+                                app_core.apply_text_content_settings(&window_def);
                             }
                         }
                         app_core.mark_layout_modified();

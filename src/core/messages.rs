@@ -182,6 +182,8 @@ pub struct MessageProcessor {
 
     /// Pending sounds from highlight processing (to be transferred to GameState)
     pub pending_sounds: Vec<super::highlight_engine::SoundTrigger>,
+    /// Custom-status changes from matched highlights, drained by AppCore.
+    pub pending_status_actions: Vec<super::highlight_engine::StatusAction>,
     /// Rumble pattern names from highlight matches, drained by AppCore
     /// into the haptic queue.
     pub pending_rumbles: Vec<String>,
@@ -210,9 +212,29 @@ pub struct MessageProcessor {
     /// Remote client sink for the web frontend sidecar.
     /// None unless `[web] enabled = true` — see core/remote.rs.
     pub remote: Option<super::remote::RemoteSink>,
+
+    /// Dot-commands injected by the feed (`<vellumCmd cmd="..."/>`), waiting
+    /// for the frontend to drain them into its dot-command dispatch.
+    pub pending_client_commands: Vec<String>,
 }
 
 impl MessageProcessor {
+    /// Registry entry for a held item from the `<left>`/`<right>` feed;
+    /// None for an empty hand (the game sends the literal "Empty").
+    fn hand_game_item(
+        item: &str,
+        link: Option<&crate::data::LinkData>,
+    ) -> Option<crate::core::game_objects::GameItem> {
+        if item.is_empty() || item.eq_ignore_ascii_case("empty") {
+            return None;
+        }
+        Some(crate::core::game_objects::GameItem::new(
+            link.map(|l| l.exist_id.clone()).unwrap_or_default(),
+            link.map(|l| l.noun.clone()).unwrap_or_default(),
+            item.to_string(),
+        ))
+    }
+
     /// Update any countdown windows whose id matches the provided id (case-sensitive).
     /// Falls back to window name for backward compatibility.
     fn update_countdown_by_id(
@@ -273,6 +295,7 @@ impl MessageProcessor {
             inv_scan: Default::default(),
             pending_container_ingest: None,
             remote: None,
+            pending_client_commands: Vec::new(),
             chunk_has_main_text: false,
             chunk_has_silent_updates: false,
             discard_current_stream: false,
@@ -299,6 +322,7 @@ impl MessageProcessor {
             newly_registered_container: None,
             pending_webui_handshake: None,
             pending_sounds: Vec::new(),
+            pending_status_actions: Vec::new(),
             pending_rumbles: Vec::new(),
             pending_evidence: Vec::new(),
             pending_pathcode: None,
@@ -987,6 +1011,19 @@ impl MessageProcessor {
                 // domain, like RoundTime/CastTime; 0 or a past time clears.
                 self.update_countdown_by_id(ui_state, id, (*value).max(0));
             }
+            ParsedElement::VellumCommand { command } => {
+                // Feed-driven client commands (Lich scripts). Dot-commands
+                // only: the frontends drain this queue into their normal
+                // dot-command dispatch, so anything else could round-trip
+                // back to the game — refuse it.
+                if command.starts_with('.') {
+                    self.pending_client_commands.push(command.clone());
+                } else {
+                    tracing::warn!(
+                        "vellumCmd rejected (only dot-commands are allowed): {command}"
+                    );
+                }
+            }
             ParsedElement::LeftHand { item, link } => {
                 self.chunk_has_silent_updates = true; // Mark as silent update
 
@@ -995,6 +1032,10 @@ impl MessageProcessor {
                 } else {
                     Some(item.clone())
                 };
+                game_state.objects.set_hand(
+                    crate::core::game_objects::Hand::Left,
+                    Self::hand_game_item(item, link.as_ref()),
+                );
 
                 // Update left hand widget if it exists (support legacy and new names)
                 for name in ["left", "left_hand"] {
@@ -1028,6 +1069,10 @@ impl MessageProcessor {
                 } else {
                     Some(item.clone())
                 };
+                game_state.objects.set_hand(
+                    crate::core::game_objects::Hand::Right,
+                    Self::hand_game_item(item, link.as_ref()),
+                );
 
                 // Update right hand widget if it exists (support legacy and new names)
                 for name in ["right", "right_hand"] {
@@ -1369,11 +1414,11 @@ impl MessageProcessor {
                 tracing::debug!("DialogOpen received: id={}, title={:?}, save={}", id, title, save);
 
                 // U3: dialogs reaching here are non-resident (resident ones
-                // are mined into panels). Blocklisted ones (bank-style that
-                // the user suppresses) don't pop up; the store still ingests
-                // their data so the window can be shown later.
+                // are mined into panels). Hidden-until-shown: a dialog the
+                // user never showed doesn't pop up, but the store still
+                // ingests its data so the window can be shown later.
                 if !Self::dialog_should_popup(ui_state, id) {
-                    tracing::debug!("DialogOpen suppressed (blocklisted): id={}", id);
+                    tracing::debug!("DialogOpen suppressed (not shown by user): id={}", id);
                     return;
                 }
 
@@ -2038,10 +2083,6 @@ impl MessageProcessor {
     /// stream to "room", causing room text to be discarded. The stream is reset on prompt.
     ///
     /// DragonRealms-specific - GemStone IV doesn't use streamWindow room.
-    /// Gate a `dialogData` element through the window-offer registry:
-    /// make sure the dialog id is offered (seeding a Hidden policy from
-    /// the config blocklist the first time it's seen, so dialogData-first
-    /// ids are still suppressed) and return whether it may be shown.
     /// After ingesting a dialogData delta into the store, reflect it into
     /// the visible `active_dialog` if this dialog should be shown. When
     /// first materializing a shown dialog, seed its saved position/size.
@@ -2076,7 +2117,6 @@ impl MessageProcessor {
         }
     }
 
-    /// Whether a dialog's data may be shown as a transient popup. The
     /// Whether a dialog's data may be shown as a transient popup. The
     /// always-ingest store keeps every dialog's state regardless; this only
     /// gates the popup. U6: nothing pops up unless the user has SHOWN it via
@@ -2769,7 +2809,13 @@ impl MessageProcessor {
     /// Mirror the `.sorter` toggle into the processor's live config
     /// (AppCore owns the persisted copy).
     pub fn set_sorter_enabled(&mut self, enabled: bool) {
-        self.config.ui.sorter_enabled = enabled;
+        self.config.sorter.enabled = enabled;
+    }
+
+    /// Mirror the full sorter config (rules/order/labels/format) into the
+    /// processor after an editor save.
+    pub fn set_sorter_config(&mut self, sorter: crate::config::SorterConfig) {
+        self.config.sorter = sorter;
     }
 
     /// Apply container contents captured from a main-stream look line into
@@ -2911,12 +2957,13 @@ impl MessageProcessor {
             }
 
             // Categorized display transform (only when .sorter is on).
-            if self.config.ui.sorter_enabled {
+            if self.config.sorter.enabled {
                 let data = self.sorter_gameobj();
                 if let Some(mut lines) = crate::core::sorter::transform(
                     &self.current_segments,
                     &full_text,
                     &data,
+                    &self.config.sorter,
                 ) {
                     self.current_segments = lines.remove(0);
                     self.injected_lines.extend(lines);
@@ -2962,6 +3009,8 @@ impl MessageProcessor {
 
         // Queue sounds from highlight processing
         self.pending_sounds.extend(highlight_result.sounds);
+        self.pending_status_actions
+            .extend(highlight_result.status_actions);
         self.pending_rumbles.extend(highlight_result.rumbles);
 
         let mut line = StyledLine {
@@ -3441,6 +3490,69 @@ impl MessageProcessor {
                         }
                         delivered = true;
                         break;
+                    }
+                    if !delivered {
+                        // Last resort: any shown subscriber of the story
+                        // ("main") stream. The window NAMED "main" can be
+                        // hidden with the story feed routed into another
+                        // window or a tabbedtext tab — mirror
+                        // add_system_message's fallback instead of dropping.
+                        'fallback: for (win_name, window) in ui_state.windows.iter_mut() {
+                            match &mut window.content {
+                                WindowContent::Text(content)
+                                    if content
+                                        .streams
+                                        .iter()
+                                        .any(|s| s.eq_ignore_ascii_case("main")) =>
+                                {
+                                    let final_line = if deferred_replacements.is_empty() {
+                                        line.clone()
+                                    } else {
+                                        StyledLine {
+                                            segments:
+                                                super::highlight_engine::apply_deferred_for_window(
+                                                    &line.segments,
+                                                    &deferred_replacements,
+                                                    win_name,
+                                                ),
+                                            stream: line.stream.clone(),
+                                            timestamp: line.timestamp,
+                                        }
+                                    };
+                                    content.add_line(final_line);
+                                    if let Some(tts_mgr) = tts_manager.as_deref_mut() {
+                                        self.enqueue_tts(tts_mgr, win_name, line);
+                                    }
+                                    delivered = true;
+                                    break 'fallback;
+                                }
+                                WindowContent::TabbedText(tab_content) => {
+                                    let active_tab_index = tab_content.active_tab_index;
+                                    for (tab_index, tab) in
+                                        tab_content.tabs.iter_mut().enumerate()
+                                    {
+                                        if tab
+                                            .definition
+                                            .streams
+                                            .iter()
+                                            .any(|s| s.trim().eq_ignore_ascii_case("main"))
+                                        {
+                                            tab.content.add_line(line.clone());
+                                            if tab_index != active_tab_index
+                                                && !tab.definition.ignore_activity
+                                            {
+                                                tab.has_unread = true;
+                                            }
+                                            delivered = true;
+                                        }
+                                    }
+                                    if delivered {
+                                        break 'fallback;
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
                     }
                     if !delivered {
                         tracing::trace!(
@@ -4554,6 +4666,9 @@ mod tests {
             replace: None,
             stream: None,
             window: None,
+            set_status: None,
+            status_duration: None,
+            clear_status: None,
             compiled_regex: None,
         }
     }
@@ -4630,7 +4745,7 @@ mod tests {
     #[test]
     fn discovery_routes_container_signal_bank_popup_stream_queue() {
         // U3: no offer registry. A container sets the newly_registered
-        // signal; a non-blocklisted dialog (bank) becomes a popup; a
+        // signal; a dialog (bank) pops up only once the user shows it; a
         // streamWindow pushes a WindowDiscovery for AppCore to bind.
         let mut processor = create_test_processor();
         let mut game_state = GameState::new();
@@ -4674,8 +4789,8 @@ mod tests {
             processor.newly_registered_container,
             Some(("77".to_string(), "Backpack".to_string()))
         );
-        // U6: bank does NOT pop up by default (hidden-until-shown; the
-        // blocklist is gone — nothing pops unless its id is in shown_dialog_ids).
+        // U6: bank does NOT pop up by default (hidden-until-shown —
+        // nothing pops unless its id is in shown_dialog_ids).
         assert!(ui_state.active_dialog.is_none());
         // Stream → a WindowDiscovery for AppCore to register.
         let disc = &ui_state.pending_window_discoveries;
@@ -4705,8 +4820,8 @@ mod tests {
 
     #[test]
     fn dialog_popup_gated_on_shown_dialog_ids() {
-        // U6: no blocklist — a dialog pops up ONLY if the user has shown it
-        // (its id in shown_dialog_ids). Empty set = nothing pops up.
+        // U6: a dialog pops up ONLY if the user has shown it (its id in
+        // shown_dialog_ids). Empty set = nothing pops up.
         let mut processor = create_test_processor();
         let mut game_state = GameState::new();
         let mut ui_state = UiState::default();
@@ -4749,11 +4864,11 @@ mod tests {
     }
 
     #[test]
-    fn blocklisted_combat_dialogdata_never_opens_popup() {
+    fn hidden_combat_dialogdata_never_opens_popup() {
         // Real shapes from a 2026-07-28 session log: the combat window is a
         // RESIDENT openDialog (so no DialogOpen is emitted) whose dialogData
-        // then arrives both embedded and standalone. 'combat' is in the
-        // default blocklist, so none of it may create the generic popup.
+        // then arrives both embedded and standalone. The user never showed
+        // 'combat', so none of it may create the generic popup.
         let mut parser = crate::parser::XmlParser::new();
         let mut processor = create_test_processor();
         let mut game_state = GameState::new();
@@ -4783,7 +4898,7 @@ mod tests {
 
         assert!(
             ui_state.active_dialog.is_none(),
-            "blocklisted combat dialogData opened the generic popup: {:?}",
+            "hidden combat dialogData opened the generic popup: {:?}",
             ui_state.active_dialog.as_ref().map(|d| &d.id)
         );
         // It was recorded as a DialogPanel discovery (Hidden by default).
@@ -4864,9 +4979,9 @@ mod tests {
     }
 
     #[test]
-    fn always_ingest_store_accumulates_blocklisted_dialog() {
+    fn always_ingest_store_accumulates_hidden_dialog() {
         // The core fix: the game sends combat's definition (here as a batch);
-        // combat is blocklisted so no popup appears, but the store ingests
+        // combat was never shown so no popup appears, but the store ingests
         // the whole panel so showing it later renders fully formed.
         let mut parser = crate::parser::XmlParser::new();
         let mut processor = create_test_processor();
@@ -4893,7 +5008,7 @@ mod tests {
             }
         }
 
-        // Blocklisted → no transient popup, but fully stored.
+        // Hidden → no transient popup, but fully stored.
         assert!(app.ui_state.active_dialog.is_none());
         let stored = app.ui_state.dialog_store.get("combat").expect("stored");
         assert_eq!(stored.buttons.len(), 2);

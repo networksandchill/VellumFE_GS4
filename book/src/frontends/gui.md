@@ -31,27 +31,57 @@ TUI-only).
 ## Windows and Zones
 
 The GUI arranges windows in five zones: header, footer, left sidebar,
-center, and right sidebar. Toggle zones from the top toolbar.
+center, and right sidebar. Toggle zones from the top toolbar. Every zone
+is a free canvas: windows go exactly where you drag them, may overlap,
+and remember their spot.
 
-- **Move a window**: drag its title bar (free placement in the center), or
-  **Alt+drag** the window body to move it between zones.
+- **Move a window**: drag it anywhere — body or title bar (interactive
+  content like text selection and links still wins over the drag). To
+  move a window **between zones**, **Alt+drag** it; the drop point
+  becomes its new position. Within its zone, just drag it.
 - **Resize**: drag any window edge or corner.
+- **Snapping**: while you drag or resize, edges snap to the zone's
+  bounds, to other windows in the same zone, and (optionally) to a grid.
+  Engaged snaps draw a guide line with the matched coordinate, and the
+  grid shows as a faint overlay during the gesture. **Hold Shift** to
+  place a window freely. Tune it under **Settings → GUI**: snap distance,
+  targets (other windows / pane edges / pane center), grid pitch, and
+  **Grid sizing** (moves also pull each edge onto the grid, so windows
+  conform to it as you drag).
+- **Sidebar width**: drag the strip on the sidebar/center boundary — it
+  stays grabbable even with a window parked flush against it. Header and
+  footer heights have their own edge handles.
+- **Lock Window** (context menu) pins a window's position and size;
+  `.lockwindows` locks everything at once.
 - **The Windows manager**: the **Windows** button in the toolbar opens one
-  window listing everything the client knows about — layout widgets, game
-  dialogs, streams, and containers — grouped by category and collapsible.
-  Each row has a **show/hide checkbox** and a **Zone** selector; **➕ Add
-  window…** creates a new one (custom windows open the editor). Hidden
-  windows stay hidden even when the game re-sends them (there is no dialog
-  blocklist — hiding is the control).
+  window listing **every window the client can have** — the full built-in
+  catalog plus game dialogs, streams, and containers — grouped into
+  categories (Status, Progress Bars, Character, Navigation, Hotbars,
+  Containers, Dialogs, …) that start collapsed. Each row has a
+  **show/hide checkbox** (ticking a never-added window creates it) and a
+  **Zone** dropdown — set the zone on a hidden window and it appears
+  there when shown; otherwise placement defaults to a sensible zone
+  (usually Center). **➕ Custom window…** creates blank custom widgets
+  (text, tabbed, progress, countdown, entity, active effects) and drops
+  you into the editor; they then appear as rows under their category.
+  Hidden windows stay hidden even when the game re-sends them (there is
+  no dialog blocklist — hiding is the control). Even the **story (main)
+  window** can be hidden once another window or tab carries the `main`
+  stream, and hiding the **command input** hands typing to the built-in
+  bottom bar (the TUI always keeps its input line).
 - **Right-click** a window body for its context menu — including **Edit
   Window…**, which opens the window editor; title bars can be hidden
-  per-window. Overlapping windows in the center area offer **Send to
-  Back**, dropping the window behind any it covers so a buried one can be
-  reached (clicking a window still raises it to the front).
+  per-window. Overlapping windows offer **Send to Back**, dropping the
+  window behind any it covers so a buried one can be reached (clicking a
+  window still raises it to the front).
 - Windows can be **detached** into separate OS windows (restored across
   sessions), or locked together into tab groups that move as a unit. The
-  context menu reorders group members (**Move Up / Move Down**) and can
-  ungroup one member or the whole group.
+  context menu reorders group members (⬆ / ⬇) and can ungroup one member
+  or the whole group.
+
+Layouts saved by older versions arranged sidebar windows in a fixed
+stack; they convert to freely placed windows automatically the first
+time each sidebar is shown, keeping their on-screen positions.
 
 ## The Map
 

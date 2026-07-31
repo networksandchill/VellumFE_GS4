@@ -74,6 +74,35 @@ pub struct TabSettings {
     #[serde(default)]
     pub accent_color: Option<String>,
 
+    /// Corner radius override for this window's frame; None follows the
+    /// global `GuiUiSettings::window_corner_radius`. Skin border art still
+    /// forces square corners.
+    #[serde(default)]
+    pub corner_radius: Option<f32>,
+
+    /// Skin frame override: None follows the skin's own per-window
+    /// mapping, "none" disables the frame for this window, anything else
+    /// names a `[frames.*]` entry in the active skin (unknown names fall
+    /// back to the skin's mapping).
+    #[serde(default)]
+    pub skin_frame: Option<String>,
+
+    /// Background override: None follows the skin's per-window mapping,
+    /// "none" disables the background, anything else is a pool-relative
+    /// image path ("backgrounds/parchment.png").
+    #[serde(default)]
+    pub background_image: Option<String>,
+
+    /// Title bar height override in points; None follows the global
+    /// `GuiUiSettings::title_bar_height` (where 0 = derive from the font).
+    #[serde(default)]
+    pub title_bar_height: Option<f32>,
+
+    /// Title alignment override ("left" | "center" | "right"); None follows
+    /// the global setting.
+    #[serde(default)]
+    pub title_bar_align: Option<String>,
+
     /// Whether to wrap text at window boundary
     #[serde(default = "default_wrap_text")]
     pub wrap_text: bool,
@@ -98,6 +127,11 @@ impl Default for TabSettings {
             font_secondary: FontRef::SystemDefault,
             text_size: None,
             accent_color: None,
+            corner_radius: None,
+            skin_frame: None,
+            background_image: None,
+            title_bar_height: None,
+            title_bar_align: None,
             wrap_text: true,
             copy_behavior: CopyBehavior::PlainText,
             map_zoom: None,
@@ -223,13 +257,30 @@ impl Default for VitalsConfig {
 /// A group of windows locked together and rendered as one window.
 ///
 /// The first member is the leader: the group renders in the leader's slot
-/// and zone. Members split the content area along `orientation`.
+/// and zone. Members split the content area along `orientation` into
+/// slots; a member listed in `merged` shares its predecessor's slot,
+/// stacking along the perpendicular axis (side-by-side group → merged
+/// members stack vertically inside their column, and vice versa). An
+/// empty `merged` reproduces the old flat one-member-per-slot layout, so
+/// existing saved groups load unchanged.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TabGroup {
     pub members: Vec<TabKey>,
-    /// true = members side by side; false = stacked vertically
+    /// true = slots side by side; false = slots stacked vertically
     #[serde(default)]
     pub horizontal: bool,
+    /// Members that render in the same slot as the member before them.
+    /// Stale keys (no longer members) are ignored; the first member is
+    /// never merged (it has no predecessor).
+    #[serde(default)]
+    pub merged: Vec<TabKey>,
+    /// Slots (keyed by their first member) whose content anchors to the
+    /// END of the perpendicular axis: leftover space goes above a column's
+    /// members (bottom-anchored) / left of a row's members (right-anchored)
+    /// instead of after them. Only matters for slots with no flexible
+    /// member to absorb the leftover. Stale keys are ignored.
+    #[serde(default)]
+    pub end_anchored: Vec<TabKey>,
 }
 
 /// Application-wide GUI sizing/accessibility settings.
@@ -247,9 +298,19 @@ pub struct GuiUiSettings {
     #[serde(default = "default_text_size")]
     pub text_size: f32,
 
-    /// Title bar text size, in points; title bar height follows it.
+    /// Title bar text size, in points; by default the bar height follows it.
     #[serde(default = "default_title_font_size")]
     pub title_font_size: f32,
+
+    /// Exact title bar height in points for game windows, independent of
+    /// the title text size. 0 = derive the height from the title font.
+    #[serde(default)]
+    pub title_bar_height: f32,
+
+    /// Title text alignment in game-window title bars:
+    /// "left" | "center" | "right".
+    #[serde(default = "default_title_bar_align")]
+    pub title_bar_align: String,
 
     /// Height of one active-effect bar row, in points.
     #[serde(default = "default_effects_bar_height")]
@@ -265,6 +326,12 @@ pub struct GuiUiSettings {
     #[serde(default = "default_bar_corner_radius")]
     pub bar_corner_radius: f32,
 
+    /// Corner radius for window frames. 0 = square Wrayth-style corners;
+    /// 6 matches egui's default rounding. Windows with skin border art
+    /// always render square so the art isn't clipped.
+    #[serde(default = "default_window_corner_radius")]
+    pub window_corner_radius: f32,
+
     /// Automatically switch bar text between light and dark when the
     /// configured color would be unreadable against the bar fill.
     #[serde(default = "default_true")]
@@ -273,6 +340,157 @@ pub struct GuiUiSettings {
     /// Vitals window layout and bar selection.
     #[serde(default)]
     pub vitals: VitalsConfig,
+
+    /// Active skin (directory name under ~/.vellum-fe/global/skins/);
+    /// None = plain theme colors. Lives in the layout so checkpoints
+    /// carry their skin; config.active_skin is kept as a mirror for the
+    /// web doll endpoint and the headless/TUI frontends.
+    #[serde(default)]
+    pub active_skin: Option<String>,
+
+    /// Injury doll image override as a pool-relative path
+    /// ("dolls/dwarf_ranger.png"); None follows the active skin's
+    /// `[injury_doll]` (or the vector doll with no skin). Calibration for a
+    /// pool doll lives in its sidecar toml. Mirrored to config.doll_image
+    /// for the web doll endpoint, like active_skin.
+    #[serde(default)]
+    pub doll_image: Option<String>,
+
+    /// Status icon art selection (pool set + per-indicator overrides).
+    #[serde(default)]
+    pub status_icons: StatusIconSettings,
+
+    /// Compass art set from the pool (`compass/<set>_<role>.png`, roles
+    /// rose/n/ne/.../out); None follows the active skin's `[compass]`.
+    #[serde(default)]
+    pub compass_set: Option<String>,
+
+    /// Global default frame for windows without a per-window override (a
+    /// skin `[frames.*]` name or pool frame stem). Precedence: window
+    /// override > this > the skin's own per-window mapping; a per-window
+    /// "none" still removes the frame.
+    #[serde(default)]
+    pub default_frame: Option<String>,
+
+    /// Global default background (pool-relative path, or "none" to
+    /// suppress skin backgrounds everywhere). Same precedence as
+    /// `default_frame`.
+    #[serde(default)]
+    pub default_background: Option<String>,
+
+    /// Render the injury doll's art (base + overlays) in grayscale; the
+    /// generated wound/scar dots keep their colors. Off = no gray twins
+    /// are ever built.
+    #[serde(default)]
+    pub doll_grayscale: bool,
+
+    /// Zone boundary lines (header/footer edges, sidebar dividers). They
+    /// clash with skin frames, so they can be shown only while a resize
+    /// strip is hovered, or hidden entirely — resizing works in every mode
+    /// through the invisible drag strips.
+    #[serde(default)]
+    pub zone_separators: ZoneSeparatorStyle,
+
+    /// Snap-to-edge docking for freely placed Center windows: while a
+    /// window is dragged or resized, its moving edges snap to pane bounds,
+    /// sibling edges, and center lines. Shift suspends it for one drag.
+    #[serde(default = "default_true")]
+    pub snap_enabled: bool,
+
+    /// Snap engage distance in points; 0 also disables snapping.
+    #[serde(default = "default_snap_radius")]
+    pub snap_radius: f32,
+
+    /// Snap to sibling window edges (butt together / align flush).
+    #[serde(default = "default_true")]
+    pub snap_to_siblings: bool,
+
+    /// Snap to the center pane's four edges.
+    #[serde(default = "default_true")]
+    pub snap_to_bounds: bool,
+
+    /// Snap to the pane's horizontal/vertical center lines. Off by
+    /// default: center candidates near real edge targets make the engaged
+    /// line flip while dragging. Sibling centers are not candidates at all.
+    #[serde(default)]
+    pub snap_to_centers: bool,
+
+    /// Grid pitch in points, relative to the pane origin; 0 = no grid.
+    #[serde(default)]
+    pub snap_grid: f32,
+
+    /// With a grid set, moving a window also pulls each edge to its
+    /// nearest grid line — the window resizes to conform to the grid
+    /// instead of only repositioning.
+    #[serde(default)]
+    pub snap_move_sizes_to_grid: bool,
+
+    /// Draw a dashed guide line with the matched coordinate while a snap
+    /// is engaged.
+    #[serde(default = "default_true")]
+    pub snap_show_guides: bool,
+
+    /// Hand widget icon size in points (left/right/spell hand art). Rows
+    /// grow to fit; the default matches Wrayth, whose hand icons span
+    /// about two text lines.
+    #[serde(default = "default_hand_icon_size")]
+    pub hand_icon_size: f32,
+}
+
+/// How the shell draws the boundary between zones.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ZoneSeparatorStyle {
+    /// Always drawn in the theme's separator color (the classic look).
+    #[default]
+    Shown,
+    /// Invisible until the pointer hovers/drags a zone resize strip, then
+    /// drawn along that boundary so resize stays discoverable.
+    Hover,
+    /// Never drawn; the resize strips still work (cursor still changes).
+    Hidden,
+}
+
+/// Which art status indicators use, resolved ahead of the built-in vector
+/// pictograms: an optional statusicons pool set supplies defaults by glyph
+/// name, and per-indicator overrides pin any icon reference.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct StatusIconSettings {
+    /// Pool set (the `<set>_` filename prefix in global/images/statusicons);
+    /// None = no pool defaults (skin `[icons]` / vector only).
+    #[serde(default)]
+    pub set: Option<String>,
+    /// Indicator id (any case) -> icon override. `Default` entries are
+    /// dropped on save; absence means "no override".
+    #[serde(default)]
+    pub overrides: std::collections::HashMap<String, crate::data::IconRef>,
+    /// Inactive statuses render their icon in grayscale (instead of the
+    /// default alpha dim). Off = no gray twins are ever built (unless a
+    /// per-indicator override below turns one on).
+    #[serde(default)]
+    pub gray_inactive: bool,
+
+    /// Per-indicator exceptions to `gray_inactive` (indicator id → force
+    /// on/off). Absent = follow the global toggle.
+    #[serde(default)]
+    pub gray_overrides: std::collections::HashMap<String, bool>,
+}
+
+impl StatusIconSettings {
+    /// Whether this indicator grays out when inactive: its override if it
+    /// has one, else the global toggle.
+    pub fn gray_for(&self, indicator_id: &str) -> bool {
+        self.gray_overrides
+            .get(indicator_id)
+            .or_else(|| self.gray_overrides.get(&indicator_id.to_ascii_uppercase()))
+            .copied()
+            .unwrap_or(self.gray_inactive)
+    }
+
+    /// Whether ANY indicator needs a gray twin built.
+    pub fn any_gray(&self) -> bool {
+        self.gray_inactive || self.gray_overrides.values().any(|on| *on)
+    }
 }
 
 fn default_zoom_factor() -> f32 {
@@ -287,6 +505,10 @@ fn default_title_font_size() -> f32 {
     13.0
 }
 
+fn default_title_bar_align() -> String {
+    "center".to_string()
+}
+
 fn default_effects_bar_height() -> f32 {
     18.0
 }
@@ -299,8 +521,20 @@ fn default_bar_corner_radius() -> f32 {
     2.0
 }
 
+fn default_window_corner_radius() -> f32 {
+    6.0
+}
+
 fn default_true() -> bool {
     true
+}
+
+fn default_snap_radius() -> f32 {
+    8.0
+}
+
+fn default_hand_icon_size() -> f32 {
+    30.0
 }
 
 impl Default for GuiUiSettings {
@@ -309,11 +543,31 @@ impl Default for GuiUiSettings {
             zoom_factor: default_zoom_factor(),
             text_size: default_text_size(),
             title_font_size: default_title_font_size(),
+            title_bar_height: 0.0,
+            title_bar_align: default_title_bar_align(),
             effects_bar_height: default_effects_bar_height(),
             density: default_density(),
             bar_corner_radius: default_bar_corner_radius(),
+            window_corner_radius: default_window_corner_radius(),
             auto_contrast_bar_text: default_true(),
             vitals: VitalsConfig::default(),
+            active_skin: None,
+            doll_image: None,
+            status_icons: StatusIconSettings::default(),
+            compass_set: None,
+            default_frame: None,
+            default_background: None,
+            doll_grayscale: false,
+            zone_separators: ZoneSeparatorStyle::default(),
+            snap_enabled: default_true(),
+            snap_radius: default_snap_radius(),
+            snap_to_siblings: default_true(),
+            snap_to_bounds: default_true(),
+            snap_to_centers: false,
+            snap_grid: 0.0,
+            snap_move_sizes_to_grid: false,
+            snap_show_guides: default_true(),
+            hand_icon_size: default_hand_icon_size(),
         }
     }
 }
@@ -778,6 +1032,7 @@ pub fn load_named_layout(profile: &str, character: &str, name: &str) -> Result<G
     if !path.exists() {
         anyhow::bail!("No saved layout named '{name}'");
     }
+    tracing::info!("Loading named GUI layout from {:?}", path);
     load_from_path(&path)
 }
 
@@ -871,6 +1126,11 @@ mod tests {
             font_secondary: FontRef::SystemDefault,
             text_size: None,
             accent_color: None,
+            corner_radius: None,
+            skin_frame: None,
+            background_image: None,
+            title_bar_height: None,
+            title_bar_align: None,
             wrap_text: false,
             copy_behavior: CopyBehavior::Html,
             map_zoom: None,
@@ -1090,6 +1350,11 @@ mod tests {
                 font_secondary: FontRef::Named("Consolas".to_string()),
                 text_size: Some(16.0),
                 accent_color: Some("#4784d9".to_string()),
+                corner_radius: None,
+                skin_frame: None,
+                background_image: None,
+                title_bar_height: None,
+                title_bar_align: None,
                 wrap_text: true,
                 copy_behavior: CopyBehavior::AnsiCodes,
                 map_zoom: None,

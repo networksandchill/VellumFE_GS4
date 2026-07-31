@@ -888,6 +888,7 @@ impl Config {
                     icon: Some("L:".to_string()),
                     icon_color: None,
                     text_color: None,
+                    states: Vec::new(),
                 },
             }),
 
@@ -908,6 +909,7 @@ impl Config {
                     icon: Some("R:".to_string()),
                     icon_color: None,
                     text_color: None,
+                    states: Vec::new(),
                 },
             }),
 
@@ -928,6 +930,7 @@ impl Config {
                     icon: Some("S:".to_string()),
                     icon_color: None,
                     text_color: None,
+                    states: Vec::new(),
                 },
             }),
 

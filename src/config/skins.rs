@@ -1,6 +1,6 @@
 //! Skin manifest parsing: the frontend-neutral half of the skin system.
 //!
-//! A skin is a directory under `~/.vellum-fe/skins/<name>/` containing a
+//! A skin is a directory under `~/.vellum-fe/global/skins/<name>/` containing a
 //! `skin.toml` manifest plus image assets. This module owns the manifest
 //! format, loading, and the canonical injury doll part table; textures,
 //! painting, and the calibrator's comment-preserving save live in
@@ -57,6 +57,12 @@ pub struct SkinManifest {
     /// indexed 1-based left→right then top→bottom).
     #[serde(default)]
     pub sheets: HashMap<String, SheetSpec>,
+    /// Named nine-slice frames users can assign to individual windows from
+    /// the GUI (right-click > Appearance > Skin frame). Independent of the
+    /// per-window `[window.<name>.border]` entries, which stay the skin's
+    /// authored defaults.
+    #[serde(default)]
+    pub frames: HashMap<String, BorderSpec>,
     /// Sprite compass replacing the vector rose.
     #[serde(default)]
     pub compass: CompassSkin,
@@ -321,6 +327,27 @@ pub fn window_field<'a, T>(
         .or_else(|| manifest.windows.get("default").and_then(&field))
 }
 
+/// Named-frame lookup (case-insensitive). The reserved name "none" never
+/// matches a frame: it means "no frame" wherever an override is stored.
+pub fn named_frame<'a>(manifest: &'a SkinManifest, name: &str) -> Option<&'a BorderSpec> {
+    if name.eq_ignore_ascii_case(NO_FRAME) {
+        return None;
+    }
+    manifest
+        .frames
+        .get(name)
+        .or_else(|| {
+            manifest
+                .frames
+                .iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case(name))
+                .map(|(_, spec)| spec)
+        })
+}
+
+/// Reserved frame-override value meaning "draw no skin frame".
+pub const NO_FRAME: &str = "none";
+
 /// mtime of a skin directory's manifest, if it exists.
 pub fn manifest_mtime(root: &Path) -> Option<std::time::SystemTime> {
     std::fs::metadata(root.join("skin.toml"))
@@ -334,8 +361,10 @@ pub fn manifest_mtime(root: &Path) -> Option<std::time::SystemTime> {
 const SCAFFOLD_MANIFEST: &str = r##"# VellumFE skin manifest.
 # Full documentation: docs/SKINS.md in the VellumFE repository.
 #
-# Image paths are relative to this folder; absolute paths are allowed
-# (e.g. pointing at art from another install). Formats: PNG, JPEG, WebP, BMP.
+# Image paths are relative to this folder; anything not found here is
+# looked up in the shared pool at ~/.vellum-fe/global/images/ (e.g.
+# "frames/brass.png"), and absolute paths are allowed. Formats: PNG,
+# JPEG, WebP, BMP.
 # Activate with `.setskin <folder-name>`. Edits to this file reload
 # automatically; after editing images run `.reloadskin`.
 
@@ -509,6 +538,31 @@ pub fn load_global_sheets() -> anyhow::Result<(HashMap<String, SheetSpec>, PathB
     Ok((manifest.sheets, root))
 }
 
+/// Resolve a manifest image path to a filesystem path. Absolute paths are
+/// taken as-is; relative paths resolve against the skin directory first,
+/// then the shared image pool (`~/.vellum-fe/global/images/`) — so a skin
+/// can reference pooled art ("icons/rogue.png", "frames/brass.png",
+/// "dolls/human.png", ...) without copying it. When neither location has
+/// the file, the skin-local path is returned so the caller's error names
+/// the natural spot.
+pub fn resolve_image_path(root: &Path, image: &str) -> PathBuf {
+    let raw = Path::new(image);
+    if raw.is_absolute() {
+        return raw.to_path_buf();
+    }
+    let local = root.join(raw);
+    if local.is_file() {
+        return local;
+    }
+    if let Ok(pool) = crate::config::Config::global_images_dir() {
+        let pooled = pool.join(raw);
+        if pooled.is_file() {
+            return pooled;
+        }
+    }
+    local
+}
+
 /// Skin directory names that contain a skin.toml, sorted.
 pub fn list_skins() -> Vec<String> {
     let Ok(dir) = crate::config::Config::skins_dir() else {
@@ -532,6 +586,41 @@ mod tests {
 
     fn manifest(toml_src: &str) -> SkinManifest {
         toml::from_str(toml_src).expect("manifest should parse")
+    }
+
+    #[test]
+    fn named_frames_parse_and_look_up_case_insensitively() {
+        let manifest = manifest(
+            r#"
+            [frames.ornate]
+            image = "borders/ornate.png"
+            slice = [12.0, 12.0, 12.0, 12.0]
+            scale = 0.5
+
+            [frames.plain]
+            image = "borders/plain.png"
+            slice = [4.0, 4.0, 4.0, 4.0]
+            "#,
+        );
+        assert_eq!(manifest.frames.len(), 2);
+        assert_eq!(named_frame(&manifest, "ornate").unwrap().image, "borders/ornate.png");
+        assert_eq!(named_frame(&manifest, "Ornate").unwrap().scale, 0.5);
+        assert_eq!(named_frame(&manifest, "plain").unwrap().scale, 1.0);
+        assert!(named_frame(&manifest, "missing").is_none());
+    }
+
+    #[test]
+    fn named_frame_reserves_none() {
+        let manifest = manifest(
+            r#"
+            [frames.none]
+            image = "borders/never.png"
+            slice = [4.0, 4.0, 4.0, 4.0]
+            "#,
+        );
+        // "none" always means "no frame", even if a skin defines it.
+        assert!(named_frame(&manifest, "none").is_none());
+        assert!(named_frame(&manifest, "NONE").is_none());
     }
 
     #[test]

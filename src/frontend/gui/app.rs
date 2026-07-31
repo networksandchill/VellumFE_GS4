@@ -1,7 +1,7 @@
 use super::persistence::{
     is_valid_layout_name, list_named_layouts, load_layout, load_named_layout, save_layout,
     save_named_layout, FontRef, GuiLayoutFileV1, GuiUiSettings, MainViewportState, TabGroup,
-    TabSettings, TabSettingsEntry, ViewportState,
+    TabSettings, TabSettingsEntry, ViewportState, ZoneSeparatorStyle,
 };
 use super::skin;
 use super::{TabId, TabKey};
@@ -22,6 +22,7 @@ use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
+mod borders;
 mod color_emoji;
 mod detached;
 mod map_explorer;
@@ -32,6 +33,7 @@ mod editors;
 mod gamepad;
 mod interact;
 mod menus;
+mod snap;
 mod status_icons;
 mod theme;
 mod webui_panel;
@@ -42,8 +44,8 @@ use detached::{DetachedMenuState, DetachedWindowState};
 use dock::{DockStateSnapshot, MainWindowRectSnapshot};
 use menus::GuiWindowMenuRequest;
 use zones::{
-    GuiShellZone, GuiWindowMoveState, GuiZoneDragState, GuiZoneWindowRect, ShellLayoutSnapshot,
-    TabZoneSnapshot,
+    GuiShellZone, GuiWindowMoveState, GuiZoneDragState, GuiZoneWindowRect, PendingZoneSnapshot,
+    ShellLayoutSnapshot, TabZoneSnapshot,
 };
 
 const INITIAL_LAYOUT_WIDTH: u16 = 160;
@@ -89,6 +91,49 @@ pub(super) struct WidgetRenderSettings {
     /// Widget sprite art from the active skin (status icons, compass,
     /// injury doll); None = draw the built-in vector graphics.
     skin_art: Option<std::sync::Arc<skin::SkinWidgetArt>>,
+    /// Current command-input buffer, only for command-input windows. Render
+    /// paths are `&self`; edits flow back via `CommandInputEcho`.
+    command_input_seed: Option<String>,
+    /// Command-input windows with a hidden title bar show a small grip
+    /// gutter: the TextEdit owns every drag in the body, so without it the
+    /// window would have no drag surface at all.
+    command_input_drag_gutter: bool,
+    /// Hand widget icon box size in points (ui_settings.hand_icon_size).
+    hand_icon_size: f32,
+    /// Inactive status icons render their grayscale twin instead of the
+    /// alpha dim: the global toggle plus per-indicator exceptions
+    /// (ui_settings.status_icons.gray_inactive / gray_overrides).
+    gray_inactive_icons: bool,
+    gray_icon_overrides: std::collections::HashMap<String, bool>,
+    /// Doll art renders its grayscale twins (ui_settings.doll_grayscale).
+    doll_grayscale: bool,
+}
+
+/// Stable widget id for the command-input TextEdit, wherever it renders
+/// (docked window, detached viewport, or the fallback bottom panel). Focus
+/// routing and cursor placement key off this id.
+pub(super) const COMMAND_INPUT_EDIT_ID: &str = "gui_command_input_edit";
+
+/// Outcome of rendering the command-input widget inside a `&self` render
+/// path: buffer edits and key events are stashed in egui temp data and
+/// drained once per frame by the app update loop, which owns the state.
+#[derive(Clone, Default)]
+pub(super) struct CommandInputEcho {
+    /// New buffer contents, when edited this frame.
+    text: Option<String>,
+    submit: bool,
+    history_prev: bool,
+    history_next: bool,
+}
+
+impl CommandInputEcho {
+    pub(super) fn id() -> egui::Id {
+        egui::Id::new("gui_command_input_echo")
+    }
+
+    fn is_empty(&self) -> bool {
+        self.text.is_none() && !self.submit && !self.history_prev && !self.history_next
+    }
 }
 
 impl WidgetRenderSettings {
@@ -184,11 +229,20 @@ pub struct VellumGuiApp {
     available_tabs: HashMap<TabKey, GuiTab>,
     hidden_tabs: HashSet<TabKey>,
     main_window_rects: HashMap<TabKey, [f32; 4]>,
-    /// Sidebar stacks: desired empty space above each docked window, in
-    /// points (free vertical placement; 0 / absent = stacked flush).
+    /// Legacy sidebar stacks: desired empty space above each docked
+    /// window. Read once by `bake_sidebar_stack`, which converts the
+    /// stack into free-placement rects and drains these entries.
     sidebar_gap_above: HashMap<TabKey, f32>,
+    /// Sidebars whose windows are free-placement rects. A zone missing
+    /// here bakes its legacy gap stack on its first render pass; the set
+    /// persists in the layout snapshot so a bake can never re-run on a
+    /// freely rearranged sidebar.
+    migrated_sidebar_zones: HashSet<GuiShellZone>,
     last_center_window_rects: HashMap<TabKey, [f32; 4]>,
     tab_zones: HashMap<TabKey, GuiShellZone>,
+    /// Zone prefs for windows that aren't live tabs yet (hidden / never
+    /// added), keyed by window name; seeds tab_zones on materialize.
+    pending_zones: HashMap<String, GuiShellZone>,
     no_title_tabs: HashSet<TabKey>,
     shell_layout: ShellLayoutSnapshot,
     layout_profile: String,
@@ -200,7 +254,7 @@ pub struct VellumGuiApp {
     layout_dirty_since: Option<Instant>,
     applied_theme_id: Option<String>,
     current_theme: crate::theme::AppTheme,
-    /// Active skin graphics (config.active_skin); reloaded when it changes.
+    /// Active skin graphics (ui_settings.active_skin); reloaded when it changes.
     skin_state: skin::SkinState,
     ui_font: FontRef,
     fonts_applied: bool,
@@ -275,6 +329,9 @@ pub struct VellumGuiApp {
     applied_title_font_size: Option<f32>,
     /// Spacing density currently applied to the egui style.
     applied_density: Option<f32>,
+    /// Window frame corner radius currently applied to the egui visuals;
+    /// also reset after a theme switch, which rebuilds the visuals.
+    applied_window_corner_radius: Option<f32>,
     settings_editor: Option<editors::SettingsEditorState>,
     highlight_editor: Option<editors::HighlightEditorState>,
     keybind_editor: Option<editors::KeybindEditorState>,
@@ -282,6 +339,7 @@ pub struct VellumGuiApp {
     #[cfg(feature = "gamepad")]
     controller_editor: Option<editors::ControllerEditorState>,
     hotbar_editor: Option<editors::HotbarEditorState>,
+    hand_icons_editor: Option<editors::HandIconsEditorState>,
     colors_editor: Option<editors::ColorsEditorState>,
     theme_browser: Option<editors::ThemeBrowserState>,
     theme_editor: Option<editors::ThemeEditorState>,
@@ -289,6 +347,7 @@ pub struct VellumGuiApp {
     window_editor: Option<editors::WindowEditorState>,
     custom_windows_editor: Option<editors::CustomWindowsEditorState>,
     known_windows_editor: Option<editors::KnownWindowsEditorState>,
+    sorter_editor: Option<editors::SorterEditorState>,
     doll_calibration: Option<editors::DollCalibrationState>,
     /// Editor window Id to raise to the top on the next frame. Set when a
     /// settings command (`.controller`, `.settings`, …) is re-issued while
@@ -317,6 +376,20 @@ pub struct VellumGuiApp {
     window_context_menu_just_opened: bool,
     zone_drag_state: Option<GuiZoneDragState>,
     hand_resize_tab: Option<TabKey>,
+    /// Zone window whose size pin is relaxed for the CURRENT press.
+    /// Latched when a press starts on/near the window and held until the
+    /// mouse releases: a shrink drag moves the grabbed edge away from the
+    /// press origin, so re-testing the origin against the current rect
+    /// every frame would re-pin the size mid-drag and stall the resize.
+    zone_engaged_tab: Option<TabKey>,
+    /// Pointer-true rect of the zone window being dragged/resized, so
+    /// snapping stays escapable (see `snap.rs`); None outside a drag.
+    zone_snap_drag: Option<snap::ZoneSnapDrag>,
+    /// Snaps engaged this frame, drawn as guides by the owning zone's pass.
+    zone_snap_guides: Vec<snap::SnapGuide>,
+    /// `.snapdebug`: per-frame snap trace into vellum-fe.log. Runtime
+    /// toggle, deliberately not persisted.
+    snap_debug: bool,
     last_monitor_bounds: Option<[f32; 4]>,
     /// Latest main OS window geometry, persisted so the next launch opens
     /// at the same size (per-window rects are saved against this geometry).
@@ -479,7 +552,9 @@ impl VellumGuiApp {
             hidden_tabs,
             main_window_rects,
             sidebar_gap_above,
+            migrated_sidebar_zones,
             tab_zones,
+            pending_zones,
             no_title_tabs,
             shell_layout,
             tab_groups,
@@ -488,11 +563,16 @@ impl VellumGuiApp {
             ui_settings,
             tab_settings,
             main_viewport: main_viewport_state,
-        } = Self::restore_layout_state(
-            persisted_layout.as_ref(),
-            &available_tabs,
-            initial_width,
-        );
+        } = Self::restore_layout_state(persisted_layout.as_ref(), &available_tabs);
+
+        // The active skin lives in the layout now; GUI files from before
+        // that (or fresh characters) seed it from the config mirror once.
+        let mut ui_settings = ui_settings;
+        let mut seeded_active_skin = false;
+        if ui_settings.active_skin.is_none() && app_core.config.active_skin.is_some() {
+            ui_settings.active_skin = app_core.config.active_skin.clone();
+            seeded_active_skin = true;
+        }
 
         // Legacy GUI files stored per-window text size/font/wrap in
         // TabSettings; those now live on the shared layout defs. Migrate
@@ -504,7 +584,7 @@ impl VellumGuiApp {
             |key| available_tabs.get(key).map(|tab| tab.window_name.clone()),
         );
         if migrated_layout {
-            app_core.layout_modified_since_save = true;
+            app_core.schedule_layout_autosave();
         }
 
         let command_history =
@@ -536,16 +616,19 @@ impl VellumGuiApp {
             hidden_tabs,
             main_window_rects,
             sidebar_gap_above,
+            migrated_sidebar_zones,
             last_center_window_rects: HashMap::new(),
             tab_zones,
+            pending_zones,
             no_title_tabs,
             shell_layout,
             layout_profile,
             layout_character,
             core_layout_size,
-            // Migration emptied legacy TabSettings fields; rewrite the GUI
-            // file so they stay emptied.
-            layout_dirty: migrated_gui,
+            // Migration emptied legacy TabSettings fields (and may have
+            // seeded the layout's active_skin from config); rewrite the
+            // GUI file so both stick.
+            layout_dirty: migrated_gui || seeded_active_skin,
             layout_dirty_since: None,
             applied_theme_id: None,
             current_theme: crate::theme::AppTheme::default(),
@@ -583,6 +666,7 @@ impl VellumGuiApp {
             startup_music_at: None,
             applied_title_font_size: None,
             applied_density: None,
+            applied_window_corner_radius: None,
             settings_editor: None,
             highlight_editor: None,
             keybind_editor: None,
@@ -590,6 +674,7 @@ impl VellumGuiApp {
             #[cfg(feature = "gamepad")]
             controller_editor: None,
             hotbar_editor: None,
+            hand_icons_editor: None,
             colors_editor: None,
             theme_browser: None,
             theme_editor: None,
@@ -597,12 +682,15 @@ impl VellumGuiApp {
             window_editor: None,
             custom_windows_editor: None,
             known_windows_editor: None,
+            sorter_editor: None,
             doll_calibration: None,
             pending_editor_raise: None,
             search_bar_needs_focus: false,
             search_match_cache: None,
             available_tabs_fingerprint: None,
-            command_input_id: None,
+            // Fixed id: the TextEdit uses it wherever it renders, so focus
+            // routing and cursor placement survive docking moves.
+            command_input_id: Some(egui::Id::new(COMMAND_INPUT_EDIT_ID)),
             repaint_ctx,
             layout_save_tx: Some(layout_save_tx),
             layout_save_worker: Some(layout_save_worker),
@@ -611,6 +699,10 @@ impl VellumGuiApp {
             window_context_menu_just_opened: false,
             zone_drag_state: None,
             hand_resize_tab: None,
+            zone_engaged_tab: None,
+            zone_snap_drag: None,
+            zone_snap_guides: Vec::new(),
+            snap_debug: false,
             last_monitor_bounds: None,
             main_viewport_state,
             webui_bridge: None,
@@ -680,7 +772,8 @@ impl VellumGuiApp {
 
     fn tab_key_for_window(name: &str, window: &WindowState) -> Option<TabKey> {
         let key = match window.widget_type {
-            WidgetType::CommandInput | WidgetType::Spacer => return None,
+            WidgetType::Spacer => return None,
+            WidgetType::CommandInput => TabKey::CommandInput,
             WidgetType::Text | WidgetType::TabbedText => {
                 if Self::is_main_stream_window(name, window) {
                     TabKey::TextMain
@@ -828,10 +921,17 @@ impl VellumGuiApp {
             .retain(|key, _| self.available_tabs.contains_key(key));
         self.no_title_tabs
             .retain(|key| self.available_tabs.contains_key(key));
-        for key in self.available_tabs.keys() {
-            self.tab_zones
-                .entry(key.clone())
-                .or_insert_with(|| Self::default_zone_for_tab_key(key));
+        for (key, tab) in &self.available_tabs {
+            if !self.tab_zones.contains_key(key) {
+                // A pending zone pref (Windows-window dropdown set while
+                // the window was hidden) beats the widget default.
+                let zone = self
+                    .pending_zones
+                    .get(&tab.window_name)
+                    .copied()
+                    .unwrap_or_else(|| Self::default_zone_for_tab_key(key));
+                self.tab_zones.insert(key.clone(), zone);
+            }
         }
         self.prune_detached_tabs();
         self.layout_dirty = true;
@@ -981,6 +1081,26 @@ impl VellumGuiApp {
         self.app_core.room_window_dirty = false;
     }
 
+    /// Will the command-input tab render somewhere this frame — a zone
+    /// surface or a detached viewport? When not, the shell shows the fixed
+    /// bottom panel instead so typing is always possible.
+    fn command_input_tab_rendered(&self) -> bool {
+        let key = TabKey::CommandInput;
+        if !self.available_tabs.contains_key(&key) || self.hidden_tabs.contains(&key) {
+            return false;
+        }
+        if self.detached_tabs.contains_key(&key) {
+            return true;
+        }
+        match self.zone_for_tab(&key) {
+            GuiShellZone::Header => self.shell_layout.header_visible,
+            GuiShellZone::Footer => self.shell_layout.footer_visible,
+            GuiShellZone::LeftSidebar => !self.shell_layout.left_sidebar_collapsed,
+            GuiShellZone::RightSidebar => !self.shell_layout.right_sidebar_collapsed,
+            _ => true,
+        }
+    }
+
     fn hide_tab(&mut self, key: TabKey) {
         if self.hidden_tabs.insert(key) {
             self.prune_detached_tabs();
@@ -1044,6 +1164,8 @@ impl VellumGuiApp {
         }
         for group in &mut self.tab_groups {
             group.members.retain(|member| member != key);
+            group.merged.retain(|member| member != key);
+            group.end_anchored.retain(|member| member != key);
         }
         self.tab_groups.retain(|group| group.members.len() >= 2);
         self.layout_dirty = true;
@@ -1067,6 +1189,8 @@ impl VellumGuiApp {
             self.tab_groups.push(TabGroup {
                 members: vec![leader.clone(), other.clone()],
                 horizontal: false,
+                merged: Vec::new(),
+                end_anchored: Vec::new(),
             });
         }
         self.tab_zones.insert(other, leader_zone);
@@ -1108,7 +1232,7 @@ impl VellumGuiApp {
             return false;
         };
         mutate(def);
-        self.app_core.layout_modified_since_save = true;
+        self.app_core.schedule_layout_autosave();
         true
     }
 
@@ -1248,11 +1372,32 @@ impl VellumGuiApp {
             auto_contrast_bar_text: self.ui_settings.auto_contrast_bar_text,
             wrap_text: self.effective_wrap_text(key),
             vitals: self.ui_settings.vitals.clone(),
-            background: self
+            background: self.available_tabs.get(key).and_then(|tab| {
+                self.skin_state.background_for_with_override(
+                    &tab.window_name,
+                    self.tab_settings
+                        .get(key)
+                        .and_then(|settings| settings.background_image.as_deref())
+                        .or(self.ui_settings.default_background.as_deref()),
+                )
+            }),
+            skin_art: self.skin_state.widget_art(),
+            command_input_seed: self
                 .available_tabs
                 .get(key)
-                .and_then(|tab| self.skin_state.background_for(&tab.window_name)),
-            skin_art: self.skin_state.widget_art(),
+                .and_then(|tab| self.app_core.ui_state.windows.get(&tab.window_name))
+                .filter(|window| window.widget_type == WidgetType::CommandInput)
+                .map(|_| self.command_input.clone()),
+            command_input_drag_gutter: self
+                .available_tabs
+                .get(key)
+                .and_then(|tab| self.app_core.ui_state.windows.get(&tab.window_name))
+                .is_some_and(|window| window.widget_type == WidgetType::CommandInput)
+                && self.title_bar_hidden(key),
+            hand_icon_size: self.ui_settings.hand_icon_size.clamp(16.0, 48.0),
+            gray_inactive_icons: self.ui_settings.status_icons.gray_inactive,
+            gray_icon_overrides: self.ui_settings.status_icons.gray_overrides.clone(),
+            doll_grayscale: self.ui_settings.doll_grayscale,
         }
     }
 
@@ -1296,95 +1441,67 @@ impl VellumGuiApp {
                 self.widget_render_settings(&tab.id.key),
             );
         }
-        let horizontal = self
+        let (horizontal, merged, end_anchored) = self
             .group_for_tab(&tab.id.key)
-            .map(|group| group.horizontal)
-            .unwrap_or(false);
+            .map(|group| {
+                (
+                    group.horizontal,
+                    group.merged.clone(),
+                    group.end_anchored.clone(),
+                )
+            })
+            .unwrap_or_default();
+
+        // Partition members into slots along the group axis: a merged
+        // member joins its predecessor's slot and stacks along the
+        // perpendicular axis (a column of a side-by-side group holds a
+        // vertical stack; a row of a stacked group holds a side-by-side
+        // run). The first member always opens a slot.
+        let mut slots: Vec<Vec<GuiTab>> = Vec::new();
+        for member in members {
+            if !slots.is_empty() && merged.contains(&member.id.key) {
+                slots.last_mut().expect("slots checked non-empty").push(member);
+            } else {
+                slots.push(vec![member]);
+            }
+        }
 
         let mut clicked = None;
         // Each member's screen rect, recorded so window-level drag-and-drop
         // can resolve drops to the member under the pointer instead of the
         // whole group window (e.g. left vs right hand in a hand group).
-        let mut member_rects: Vec<(String, Rect)> = Vec::with_capacity(members.len());
+        let mut member_rects: Vec<(String, Rect)> = Vec::new();
         if horizontal {
-            ui.columns(members.len(), |columns| {
-                for (column, member) in columns.iter_mut().zip(members.iter()) {
-                    member_rects.push((member.window_name.clone(), column.max_rect()));
-                    column.push_id(&member.id.key, |ui| {
-                        if let Some(click) = Self::render_window_content(
-                            &self.app_core,
-                            ui,
-                            member,
-                            self.widget_render_settings(&member.id.key),
-                        ) {
-                            clicked = Some(click);
-                        }
-                    });
+            ui.columns(slots.len(), |columns| {
+                for (column, slot) in columns.iter_mut().zip(slots.iter()) {
+                    let anchored = end_anchored.contains(&slot[0].id.key);
+                    self.render_group_stack(
+                        column,
+                        slot,
+                        anchored,
+                        &mut member_rects,
+                        &mut clicked,
+                    );
                 }
             });
         } else {
             let gap = ui.spacing().item_spacing.y;
-            // Compact widgets (bars, timers, hands) only ever draw one row,
-            // so they get exactly that; the leftover splits among flexible
-            // members (doll, text, ...) instead of equal N-way shares that
-            // leave dead space under each bar.
             let bar_height = ui.spacing().interact_size.y.max(16.0);
-            let natural_heights: Vec<Option<f32>> = members
+            // A row slot is as tall as its tallest fixed member; any
+            // flexible member makes the whole row flexible.
+            let slot_heights: Vec<Option<f32>> = slots
                 .iter()
-                .map(|member| {
-                    match self
-                        .app_core
-                        .ui_state
-                        .windows
-                        .get(&member.window_name)
-                        .map(|window| &window.content)
-                    {
-                        Some(
-                            WindowContent::Progress(_)
-                            | WindowContent::Countdown(_)
-                            | WindowContent::Hand { .. },
-                        ) => Some(bar_height),
-                        Some(WindowContent::Betrayer)
-                            if self.app_core.game_state.betrayer.items.is_empty() =>
-                        {
-                            Some(bar_height)
-                        }
-                        Some(WindowContent::Encumbrance) => {
-                            let (show_bar, show_label) =
-                                Self::encumbrance_flags(&self.app_core, &member.window_name);
-                            let rows = (show_bar as u32 + show_label as u32).max(1) as f32;
-                            Some(bar_height * rows + gap * (rows - 1.0))
-                        }
-                        Some(WindowContent::GS4Experience) => {
-                            let (level, mind, exp_bar, total, ascension) =
-                                Self::gs4_experience_flags(&self.app_core, &member.window_name);
-                            let rows = ([level, mind, exp_bar, total, ascension]
-                                .into_iter()
-                                .filter(|on| *on)
-                                .count()
-                                .max(1)) as f32;
-                            Some(bar_height * rows + gap * (rows - 1.0))
-                        }
-                        Some(WindowContent::MiniVitals) => {
-                            use crate::frontend::gui::persistence::VitalsOrientation;
-                            let vitals = &self.ui_settings.vitals;
-                            let row = vitals.bar_height.clamp(8.0, 60.0);
-                            match vitals.orientation {
-                                VitalsOrientation::Horizontal => Some(row),
-                                VitalsOrientation::Vertical => {
-                                    let count = vitals.bars.len().max(1) as f32;
-                                    Some(row * count + gap * (count - 1.0))
-                                }
-                            }
-                        }
-                        _ => None,
-                    }
+                .map(|slot| {
+                    slot.iter()
+                        .map(|member| self.member_natural_height(gap, bar_height, member))
+                        .try_fold(0.0f32, |tallest, natural| {
+                            natural.map(|height| tallest.max(height))
+                        })
                 })
                 .collect();
-            let fixed_total: f32 = natural_heights.iter().flatten().sum();
-            let flexible_count =
-                natural_heights.iter().filter(|h| h.is_none()).count() as f32;
-            let total_gap = gap * (members.len() as f32 - 1.0);
+            let fixed_total: f32 = slot_heights.iter().flatten().sum();
+            let flexible_count = slot_heights.iter().filter(|h| h.is_none()).count() as f32;
+            let total_gap = gap * (slots.len() as f32 - 1.0);
             let flex_height = if flexible_count > 0.0 {
                 ((ui.available_height() - total_gap - fixed_total) / flexible_count)
                     .max(24.0)
@@ -1392,23 +1509,46 @@ impl VellumGuiApp {
                 0.0
             };
             let width = ui.available_width().max(1.0);
-            for (member, natural) in members.iter().zip(&natural_heights) {
+            for (slot, natural) in slots.iter().zip(&slot_heights) {
                 let each_height = natural.unwrap_or(flex_height);
-                let block = ui.push_id(&member.id.key, |ui| {
+                if let [member] = slot.as_slice() {
+                    let block = ui.push_id(&member.id.key, |ui| {
+                        ui.allocate_ui(Vec2::new(width, each_height), |ui| {
+                            ui.set_min_size(Vec2::new(width, each_height));
+                            ui.set_max_height(each_height);
+                            if let Some(click) = Self::render_window_content(
+                                &self.app_core,
+                                ui,
+                                member,
+                                self.widget_render_settings(&member.id.key),
+                            ) {
+                                clicked = Some(click);
+                            }
+                        })
+                    });
+                    member_rects.push((member.window_name.clone(), block.inner.response.rect));
+                } else {
                     ui.allocate_ui(Vec2::new(width, each_height), |ui| {
                         ui.set_min_size(Vec2::new(width, each_height));
                         ui.set_max_height(each_height);
-                        if let Some(click) = Self::render_window_content(
-                            &self.app_core,
-                            ui,
-                            member,
-                            self.widget_render_settings(&member.id.key),
-                        ) {
-                            clicked = Some(click);
-                        }
-                    })
-                });
-                member_rects.push((member.window_name.clone(), block.inner.response.rect));
+                        ui.columns(slot.len(), |columns| {
+                            for (column, member) in columns.iter_mut().zip(slot.iter()) {
+                                member_rects
+                                    .push((member.window_name.clone(), column.max_rect()));
+                                column.push_id(&member.id.key, |ui| {
+                                    if let Some(click) = Self::render_window_content(
+                                        &self.app_core,
+                                        ui,
+                                        member,
+                                        self.widget_render_settings(&member.id.key),
+                                    ) {
+                                        clicked = Some(click);
+                                    }
+                                });
+                            }
+                        });
+                    });
+                }
             }
         }
         ui.ctx().data_mut(|data| {
@@ -1423,20 +1563,332 @@ impl VellumGuiApp {
         egui::Id::new("gui_group_member_rects").with(leader)
     }
 
+    /// Natural (fixed) height of a group member, when it has one. Compact
+    /// widgets (bars, timers, hands) only ever draw one row, so they get
+    /// exactly that; the leftover splits among flexible members (doll,
+    /// text, ...) instead of equal N-way shares that leave dead space
+    /// under each bar. None = flexible.
+    fn member_natural_height(&self, gap: f32, bar_height: f32, member: &GuiTab) -> Option<f32> {
+        match self
+            .app_core
+            .ui_state
+            .windows
+            .get(&member.window_name)
+            .map(|window| &window.content)
+        {
+            Some(
+                WindowContent::Progress(_)
+                | WindowContent::Countdown(_)
+                | WindowContent::Hand { .. },
+            ) => Some(bar_height),
+            Some(WindowContent::Betrayer)
+                if self.app_core.game_state.betrayer.items.is_empty() =>
+            {
+                Some(bar_height)
+            }
+            Some(WindowContent::Encumbrance) => {
+                let (show_bar, show_label) =
+                    Self::encumbrance_flags(&self.app_core, &member.window_name);
+                let rows = (show_bar as u32 + show_label as u32).max(1) as f32;
+                Some(bar_height * rows + gap * (rows - 1.0))
+            }
+            Some(WindowContent::GS4Experience) => {
+                let (level, mind, exp_bar, total, ascension) =
+                    Self::gs4_experience_flags(&self.app_core, &member.window_name);
+                let rows = ([level, mind, exp_bar, total, ascension]
+                    .into_iter()
+                    .filter(|on| *on)
+                    .count()
+                    .max(1)) as f32;
+                Some(bar_height * rows + gap * (rows - 1.0))
+            }
+            Some(WindowContent::MiniVitals) => {
+                use crate::frontend::gui::persistence::VitalsOrientation;
+                let vitals = &self.ui_settings.vitals;
+                let row = vitals.bar_height.clamp(8.0, 60.0);
+                match vitals.orientation {
+                    VitalsOrientation::Horizontal => Some(row),
+                    VitalsOrientation::Vertical => {
+                        let count = vitals.bars.len().max(1) as f32;
+                        Some(row * count + gap * (count - 1.0))
+                    }
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Render one group slot's members stacked vertically (a column of a
+    /// side-by-side group, or the whole body of a stacked group's slot).
+    /// Fixed members get their natural height and the leftover splits
+    /// among flexible ones; when every member is fixed, the leftover pads
+    /// the bottom — or the top when the slot is end-anchored, so a bar
+    /// stack can hug the column's bottom edge.
+    fn render_group_stack(
+        &self,
+        ui: &mut egui::Ui,
+        members: &[GuiTab],
+        end_anchored: bool,
+        member_rects: &mut Vec<(String, Rect)>,
+        clicked: &mut Option<GuiLinkClick>,
+    ) {
+        let gap = ui.spacing().item_spacing.y;
+        let bar_height = ui.spacing().interact_size.y.max(16.0);
+        let natural_heights: Vec<Option<f32>> = members
+            .iter()
+            .map(|member| self.member_natural_height(gap, bar_height, member))
+            .collect();
+        let fixed_total: f32 = natural_heights.iter().flatten().sum();
+        let flexible_count = natural_heights.iter().filter(|h| h.is_none()).count() as f32;
+        let total_gap = gap * (members.len() as f32 - 1.0);
+        let flex_height = if flexible_count > 0.0 {
+            ((ui.available_height() - total_gap - fixed_total) / flexible_count).max(24.0)
+        } else {
+            0.0
+        };
+        if end_anchored && flexible_count == 0.0 {
+            let leftover = ui.available_height() - total_gap - fixed_total;
+            if leftover > 0.0 {
+                ui.add_space(leftover);
+            }
+        }
+        let width = ui.available_width().max(1.0);
+        for (member, natural) in members.iter().zip(&natural_heights) {
+            let each_height = natural.unwrap_or(flex_height);
+            let block = ui.push_id(&member.id.key, |ui| {
+                ui.allocate_ui(Vec2::new(width, each_height), |ui| {
+                    ui.set_min_size(Vec2::new(width, each_height));
+                    ui.set_max_height(each_height);
+                    if let Some(click) = Self::render_window_content(
+                        &self.app_core,
+                        ui,
+                        member,
+                        self.widget_render_settings(&member.id.key),
+                    ) {
+                        *clicked = Some(click);
+                    }
+                })
+            });
+            member_rects.push((member.window_name.clone(), block.inner.response.rect));
+        }
+    }
+
+    /// Set the active skin in the layout (its home — checkpoints carry it)
+    /// and mirror it into config for the web doll endpoint and the
+    /// non-GUI frontends.
+    fn set_active_skin(&mut self, skin: Option<String>) {
+        self.ui_settings.active_skin = skin.clone();
+        self.layout_dirty = true;
+        if self.app_core.config.active_skin != skin {
+            self.app_core.config.active_skin = skin;
+            self.save_config_after_skin_change();
+        }
+    }
+
+    /// Bake the current live appearance — doll, compass set, status icon
+    /// art, pool frames in use, per-window backgrounds — into
+    /// `global/skins/<name>/skin.toml`, referencing pool paths (the image
+    /// resolver falls back to the pool, so nothing is copied). The live
+    /// state doesn't change: skins are a publish format, not a
+    /// prerequisite. Sheet-cell icon overrides can't be expressed in a
+    /// skin manifest and stay as layout overrides.
+    fn compile_appearance_to_skin(&self, name: &str) -> anyhow::Result<()> {
+        use toml_edit::{value, Array, DocumentMut, Item, Table};
+
+        let mut doc = DocumentMut::new();
+        let mut meta = Table::new();
+        meta.insert("name", value(name));
+        meta.insert(
+            "description",
+            value("Compiled from the live appearance (.saveskin)"),
+        );
+        doc.insert("meta", Item::Table(meta));
+
+        // Status icons: the active pool set, then Image overrides on top.
+        let mut icon_entries: std::collections::BTreeMap<String, String> =
+            std::collections::BTreeMap::new();
+        if let Some(set) = &self.ui_settings.status_icons.set {
+            for image in crate::config::pool::list_category("statusicons") {
+                if let Some((prefix, glyph)) = image.stem().split_once('_') {
+                    if prefix.eq_ignore_ascii_case(set) && !glyph.is_empty() {
+                        icon_entries
+                            .insert(glyph.to_ascii_lowercase(), image.pool_path.clone());
+                    }
+                }
+            }
+        }
+        for (id, icon) in &self.ui_settings.status_icons.overrides {
+            if let crate::data::IconRef::Image { path } = icon {
+                icon_entries.insert(id.to_ascii_lowercase(), path.clone());
+            }
+        }
+        if !icon_entries.is_empty() {
+            let mut icons = Table::new();
+            for (id, path) in &icon_entries {
+                icons.insert(id, value(path));
+            }
+            doc.insert("icons", Item::Table(icons));
+        }
+
+        // Compass set (only meaningful with a rose).
+        if let Some(set) = &self.ui_settings.compass_set {
+            let mut entries: std::collections::BTreeMap<String, String> =
+                std::collections::BTreeMap::new();
+            for image in crate::config::pool::list_category("compass") {
+                if let Some((prefix, role)) = image.stem().split_once('_') {
+                    if prefix.eq_ignore_ascii_case(set) && !role.is_empty() {
+                        entries.insert(role.to_ascii_lowercase(), image.pool_path.clone());
+                    }
+                }
+            }
+            if let Some(rose) = entries.get("rose").cloned() {
+                let mut compass = Table::new();
+                compass.insert("rose", value(rose));
+                for (role, path) in &entries {
+                    if role != "rose" {
+                        compass.insert(role, value(path));
+                    }
+                }
+                doc.insert("compass", Item::Table(compass));
+            }
+        }
+
+        // Injury doll: pool image + its sidecar calibration.
+        if let Some(image) = &self.ui_settings.doll_image {
+            let mut doll = Table::new();
+            doll.insert("base", value(image));
+            doc.insert("injury_doll", Item::Table(doll));
+            let abs = crate::config::Config::global_images_dir()?.join(image);
+            if let Some(sidecar) =
+                crate::config::pool::read_sidecar::<crate::config::pool::DollSidecar>(&abs)
+            {
+                let rounded = |v: f32, places: f64| (v as f64 * places).round() / places;
+                let mut anchors = Table::new();
+                let mut keys: Vec<&String> = sidecar.anchors.keys().collect();
+                keys.sort();
+                for key in keys {
+                    let [x, y] = sidecar.anchors[key];
+                    let mut pair = Array::new();
+                    pair.push(rounded(x, 10_000.0));
+                    pair.push(rounded(y, 10_000.0));
+                    anchors.insert(key, value(pair));
+                }
+                let mut dots = Table::new();
+                dots.insert("wound_color", value(sidecar.dots.wound_color.as_str()));
+                dots.insert("scar_color", value(sidecar.dots.scar_color.as_str()));
+                dots.insert("opacity", value(rounded(sidecar.dots.opacity, 100.0)));
+                dots.insert("diameter", value(rounded(sidecar.dots.diameter, 1_000.0)));
+                let doll = doc["injury_doll"].as_table_mut().expect("just inserted");
+                doll.insert("anchors", Item::Table(anchors));
+                doll.insert("dots", Item::Table(dots));
+            }
+        }
+
+        // Pool frames any window override references -> [frames.<stem>],
+        // plus the global default frame (Settings > GUI).
+        let mut wanted_frames: Vec<String> = self
+            .tab_settings
+            .values()
+            .filter_map(|settings| settings.skin_frame.clone())
+            .chain(self.ui_settings.default_frame.clone())
+            .map(|frame| frame.to_ascii_lowercase())
+            .filter(|frame| frame != "none")
+            .collect();
+        wanted_frames.sort();
+        wanted_frames.dedup();
+        if !wanted_frames.is_empty() {
+            let mut frames = Table::new();
+            frames.set_implicit(true);
+            for image in crate::config::pool::list_category("frames") {
+                let stem = image.stem().to_ascii_lowercase();
+                if !wanted_frames.contains(&stem) {
+                    continue;
+                }
+                let Some(sidecar) = crate::config::pool::read_sidecar::<
+                    crate::config::pool::FrameSidecar,
+                >(&image.abs_path) else {
+                    continue;
+                };
+                let mut entry = Table::new();
+                entry.insert("image", value(&image.pool_path));
+                let mut slice = Array::new();
+                for inset in sidecar.slice.insets() {
+                    slice.push(inset as f64);
+                }
+                entry.insert("slice", value(slice));
+                entry.insert("scale", value(sidecar.effective_scale() as f64));
+                frames.insert(&stem, Item::Table(entry));
+            }
+            if !frames.is_empty() {
+                doc.insert("frames", Item::Table(frames));
+            }
+        }
+
+        // Per-window backgrounds -> [window.<name>.background]; the global
+        // default background bakes as the skin's [window.default] entry
+        // (the manifest-wide fallback window_field consults).
+        let mut backgrounds: std::collections::BTreeMap<String, String> =
+            std::collections::BTreeMap::new();
+        if let Some(background) = &self.ui_settings.default_background {
+            if !background.eq_ignore_ascii_case("none") {
+                backgrounds.insert("default".to_string(), background.clone());
+            }
+        }
+        for (key, settings) in &self.tab_settings {
+            let Some(background) = &settings.background_image else {
+                continue;
+            };
+            if background.eq_ignore_ascii_case("none") {
+                continue;
+            }
+            if let Some(tab) = self.available_tabs.get(key) {
+                backgrounds.insert(tab.window_name.clone(), background.clone());
+            }
+        }
+        if !backgrounds.is_empty() {
+            let mut windows = Table::new();
+            windows.set_implicit(true);
+            for (window_name, path) in &backgrounds {
+                let mut background = Table::new();
+                background.insert("image", value(path));
+                let mut per_window = Table::new();
+                per_window.set_implicit(true);
+                per_window.insert("background", Item::Table(background));
+                windows.insert(window_name, Item::Table(per_window));
+            }
+            doc.insert("window", Item::Table(windows));
+        }
+
+        let root = crate::config::Config::skins_dir()?.join(name);
+        std::fs::create_dir_all(&root)?;
+        crate::config::write_atomic(&root.join("skin.toml"), doc.to_string())?;
+        Ok(())
+    }
+
+    /// Set the injury doll override (pool-relative path), persisted in the
+    /// layout and mirrored to config for the web doll endpoint. The doll
+    /// switches next frame via `SkinState::apply_if_changed`.
+    pub(super) fn set_doll_image(&mut self, image: Option<String>) {
+        self.ui_settings.doll_image = image.clone();
+        self.layout_dirty = true;
+        if self.app_core.config.doll_image != image {
+            self.app_core.config.doll_image = image;
+            self.save_config_after_skin_change();
+        }
+    }
+
     /// Handle `action:setskin:<name>` from dot-commands or menus. "none"
     /// (or "off") disables the active skin. The switch itself happens next
     /// frame via `SkinState::apply_if_changed`.
     fn apply_skin_by_name(&mut self, name: &str) {
         if name.eq_ignore_ascii_case("none") || name.eq_ignore_ascii_case("off") {
-            self.app_core.config.active_skin = None;
-            self.save_config_after_skin_change();
+            self.set_active_skin(None);
             self.app_core.add_system_message("Skin disabled.");
             return;
         }
         match crate::config::skins::load_manifest(name) {
             Ok(_) => {
-                self.app_core.config.active_skin = Some(name.to_string());
-                self.save_config_after_skin_change();
+                self.set_active_skin(Some(name.to_string()));
                 self.app_core
                     .add_system_message(&format!("Skin switched to: {}", name));
             }
@@ -1444,7 +1896,7 @@ impl VellumGuiApp {
                 let available = crate::config::skins::list_skins();
                 if available.is_empty() {
                     self.app_core.add_system_message(&format!(
-                        "Cannot load skin '{}': {}. No skins installed; create one under ~/.vellum-fe/skins/<name>/skin.toml",
+                        "Cannot load skin '{}': {}. No skins installed; create one under ~/.vellum-fe/global/skins/<name>/skin.toml",
                         name, err
                     ));
                 } else {
@@ -1464,11 +1916,11 @@ impl VellumGuiApp {
         let available = crate::config::skins::list_skins();
         if available.is_empty() {
             self.app_core.add_system_message(
-                "No skins installed. Create one under ~/.vellum-fe/skins/<name>/skin.toml",
+                "No skins installed. Create one under ~/.vellum-fe/global/skins/<name>/skin.toml",
             );
             return;
         }
-        let active = self.app_core.config.active_skin.clone();
+        let active = self.ui_settings.active_skin.clone();
         self.app_core.add_system_message("Installed skins:");
         for name in available {
             let marker = if active.as_deref() == Some(name.as_str()) {
@@ -1518,17 +1970,68 @@ impl VellumGuiApp {
     /// Adjust a docked window's frame when the active skin draws this
     /// window's border: drop the stroke (the nine-slice replaces it) and
     /// widen the inner margin so content clears the border art.
-    fn apply_skin_border_to_frame(&self, window_name: &str, frame: &mut egui::Frame) {
-        let Some(border) = self.skin_state.border_for(window_name) else {
+    /// Which sides of the skin's nine-slice frame draw for this window,
+    /// as [top, right, bottom, left]. The layout def's border settings
+    /// drive it — Border off (or style "none") hides the whole frame,
+    /// per-side toggles hide individual rails (their corners collapse and
+    /// the surviving rails extend to the window edge). Windows without a
+    /// layout def draw all four.
+    pub(super) fn skin_border_sides_for_tab(&self, key: &TabKey) -> [bool; 4] {
+        let Some(def) = self.layout_def_for_tab(key) else {
+            return [true; 4];
+        };
+        let base = def.base();
+        if !base.show_border || base.border_style.eq_ignore_ascii_case("none") {
+            return [false; 4];
+        }
+        let sides = &base.border_sides;
+        [sides.top, sides.right, sides.bottom, sides.left]
+    }
+
+    /// The skin border this tab draws, honoring the per-window frame
+    /// override (Appearance > Skin frame) stored in its tab settings,
+    /// then the global default frame (Settings > GUI).
+    pub(super) fn skin_border_for_tab(&self, key: &TabKey) -> Option<skin::ResolvedBorder> {
+        let tab = self.available_tabs.get(key)?;
+        let frame_override = self
+            .tab_settings
+            .get(key)
+            .and_then(|settings| settings.skin_frame.as_deref())
+            .or(self.ui_settings.default_frame.as_deref());
+        self.skin_state
+            .border_for_with_override(&tab.window_name, frame_override)
+    }
+
+    fn apply_skin_border_to_frame(
+        &self,
+        key: &TabKey,
+        sides: [bool; 4],
+        frame: &mut egui::Frame,
+    ) {
+        let Some(border) = self.skin_border_for_tab(key) else {
             return;
         };
+        if sides == [false; 4] {
+            return;
+        }
         frame.stroke = egui::Stroke::NONE;
+        // Square corners whenever skin art frames the window: a rounded
+        // background fill would show through (or clip) the art's corners.
+        frame.corner_radius = egui::CornerRadius::ZERO;
         let side = |inset: f32| (inset * border.scale).ceil().clamp(0.0, 127.0) as i8;
         let margin = &mut frame.inner_margin;
-        margin.top = margin.top.max(side(border.slice[0]));
-        margin.right = margin.right.max(side(border.slice[1]));
-        margin.bottom = margin.bottom.max(side(border.slice[2]));
-        margin.left = margin.left.max(side(border.slice[3]));
+        if sides[0] {
+            margin.top = margin.top.max(side(border.slice[0]));
+        }
+        if sides[1] {
+            margin.right = margin.right.max(side(border.slice[1]));
+        }
+        if sides[2] {
+            margin.bottom = margin.bottom.max(side(border.slice[2]));
+        }
+        if sides[3] {
+            margin.left = margin.left.max(side(border.slice[3]));
+        }
     }
 
     /// Paint the skin's nine-slice border over a rendered window, on the
@@ -1536,16 +2039,87 @@ impl VellumGuiApp {
     fn paint_skin_border(
         &self,
         ctx: &egui::Context,
-        window_name: &str,
+        key: &TabKey,
+        sides: [bool; 4],
         response: &egui::Response,
     ) {
-        if let Some(border) = self.skin_state.border_for(window_name) {
+        if sides == [false; 4] {
+            return;
+        }
+        if let Some(border) = self.skin_border_for_tab(key) {
             skin::paint_nine_slice(
                 &ctx.layer_painter(response.layer_id),
                 response.rect,
                 &border,
+                sides,
             );
         }
+    }
+
+    /// Per-window position/size lock: locked windows ignore drag and
+    /// resize gestures in every zone; the deliberate Arrange ▸ Move Window
+    /// menu action still works. THE flag is the shared layout's
+    /// `WindowBase::locked` — the same one `.lockwindows`,
+    /// `.lockwindow <name>`, and the TUI write — so global and per-window
+    /// locks are one system across both frontends.
+    pub(super) fn window_locked(&self, key: &TabKey) -> bool {
+        self.available_tabs.get(key).is_some_and(|tab| {
+            self.app_core
+                .layout
+                .windows
+                .iter()
+                .find(|window| window.name() == tab.window_name)
+                .is_some_and(|window| window.base().locked)
+        })
+    }
+
+    /// Per-window frame corner radius override (context menu); None follows
+    /// the global `ui_settings.window_corner_radius` already baked into the
+    /// window frame style.
+    pub(super) fn corner_radius_override_for_tab(&self, key: &TabKey) -> Option<f32> {
+        self.tab_settings
+            .get(key)
+            .and_then(|settings| settings.corner_radius)
+    }
+
+    /// Effective title bar height for a game window: per-window override,
+    /// else the global setting. 0 means "auto" in both layers; None =
+    /// derive from the title font (egui's default behavior).
+    pub(super) fn title_bar_height_for_tab(&self, key: &TabKey) -> Option<f32> {
+        let height = self
+            .tab_settings
+            .get(key)
+            .and_then(|settings| settings.title_bar_height)
+            .unwrap_or(self.ui_settings.title_bar_height);
+        (height > 0.0).then(|| height.clamp(12.0, 32.0))
+    }
+
+    /// Effective title text alignment for a game window.
+    pub(super) fn title_align_for_tab(&self, key: &TabKey) -> egui::Align {
+        let align = self
+            .tab_settings
+            .get(key)
+            .and_then(|settings| settings.title_bar_align.as_deref())
+            .unwrap_or(&self.ui_settings.title_bar_align);
+        match align {
+            "left" => egui::Align::Min,
+            "right" => egui::Align::Max,
+            _ => egui::Align::Center,
+        }
+    }
+
+    /// Apply the resolved title bar height and alignment to a game-window
+    /// builder. Editor and dialog windows keep egui's standard chrome.
+    pub(super) fn style_window_title_bar<'a>(
+        &self,
+        key: &TabKey,
+        mut window: egui::Window<'a>,
+    ) -> egui::Window<'a> {
+        window = window.title_align(self.title_align_for_tab(key));
+        if let Some(height) = self.title_bar_height_for_tab(key) {
+            window = window.title_bar_height(height);
+        }
+        window
     }
 
     /// Accent (border) color for a window. Precedence: the per-window GUI
@@ -1609,14 +2183,20 @@ impl VellumGuiApp {
 
         let title_size = self.ui_settings.title_font_size.clamp(8.0, 40.0);
         let density = self.ui_settings.density.clamp(0.5, 2.0);
-        if self.applied_title_font_size != Some(title_size) || self.applied_density != Some(density)
+        let window_radius = self.ui_settings.window_corner_radius.clamp(0.0, 12.0);
+        if self.applied_title_font_size != Some(title_size)
+            || self.applied_density != Some(density)
+            || self.applied_window_corner_radius != Some(window_radius)
         {
             self.applied_title_font_size = Some(title_size);
             self.applied_density = Some(density);
+            self.applied_window_corner_radius = Some(window_radius);
             ctx.global_style_mut(|style| {
                 if let Some(font) = style.text_styles.get_mut(&egui::TextStyle::Heading) {
                     font.size = title_size;
                 }
+                style.visuals.window_corner_radius =
+                    egui::CornerRadius::same(window_radius.round() as u8);
                 // Scale spacing from egui's defaults (not the current values,
                 // so repeated applies don't compound).
                 let defaults = egui::style::Spacing::default();
@@ -1698,6 +2278,23 @@ impl VellumGuiApp {
             },
             shell_layout: self.shell_layout.clone(),
             tab_groups: Self::sanitize_tab_groups(self.tab_groups.clone(), &self.available_tabs),
+            // Stable order: GuiShellZone::all() filtered, not HashSet order.
+            free_sidebar_zones: GuiShellZone::all()
+                .into_iter()
+                .filter(|zone| self.migrated_sidebar_zones.contains(zone))
+                .collect(),
+            pending_zones: {
+                let mut entries: Vec<PendingZoneSnapshot> = self
+                    .pending_zones
+                    .iter()
+                    .map(|(window, zone)| PendingZoneSnapshot {
+                        window: window.clone(),
+                        zone: *zone,
+                    })
+                    .collect();
+                entries.sort_by(|a, b| a.window.cmp(&b.window));
+                entries
+            },
         };
         layout.dock_state_json = match serde_json::to_value(snapshot) {
             Ok(value) => value,
@@ -1795,24 +2392,39 @@ impl VellumGuiApp {
     /// are dropped. The main OS window geometry is deliberately left alone:
     /// only the arrangement inside it (and detached windows) changes.
     fn apply_layout_snapshot(&mut self, layout: &GuiLayoutFileV1) {
-        let content_width = self
-            .main_viewport_state
-            .as_ref()
-            .map(|state| state.inner_size[0])
-            .unwrap_or(1280.0);
-        let restored =
-            Self::restore_layout_state(Some(layout), &self.available_tabs, content_width);
+        let restored = Self::restore_layout_state(Some(layout), &self.available_tabs);
+        tracing::info!(
+            "Applying GUI layout snapshot: {} window rects, {} zone assignments",
+            restored.main_window_rects.len(),
+            restored.tab_zones.len()
+        );
         self.hidden_tabs = restored.hidden_tabs;
         self.main_window_rects = restored.main_window_rects;
         self.sidebar_gap_above = restored.sidebar_gap_above;
+        self.migrated_sidebar_zones = restored.migrated_sidebar_zones;
         self.last_center_window_rects.clear();
+        self.zone_snap_drag = None;
+        self.zone_snap_guides.clear();
         self.tab_zones = restored.tab_zones;
+        self.pending_zones = restored.pending_zones;
         self.no_title_tabs = restored.no_title_tabs;
         self.shell_layout = restored.shell_layout;
         self.tab_groups = restored.tab_groups;
         self.detached_tabs = restored.detached_tabs;
         self.ui_font = restored.ui_font;
+        let previous_skin = self.ui_settings.active_skin.take();
         self.ui_settings = restored.ui_settings;
+        // Skins ride with checkpoints. One without a skin recorded (incl.
+        // checkpoints from before skins lived in the layout) keeps the
+        // current skin instead of clearing it — .setskin none is the
+        // explicit off switch. apply_if_changed swaps the art next frame.
+        if self.ui_settings.active_skin.is_none() {
+            self.ui_settings.active_skin = previous_skin;
+        }
+        if self.app_core.config.active_skin != self.ui_settings.active_skin {
+            self.app_core.config.active_skin = self.ui_settings.active_skin.clone();
+            self.save_config_after_skin_change();
+        }
         self.tab_settings = restored.tab_settings;
         // Checkpoints can predate the move of per-window text size/font/wrap
         // onto the layout defs; migrate them the same way startup does.
@@ -1823,140 +2435,17 @@ impl VellumGuiApp {
             |key| available_tabs.get(key).map(|tab| tab.window_name.clone()),
         );
         if migrated_layout {
-            self.app_core.layout_modified_since_save = true;
+            self.app_core.schedule_layout_autosave();
         }
         // Lazy appliers pick up the new font/zoom/density next frame.
         self.fonts_applied = false;
         self.zoom_applied = false;
         self.applied_title_font_size = None;
         self.applied_density = None;
+        self.applied_window_corner_radius = None;
         // The live autosave slot now reflects the loaded arrangement; the
         // checkpoint itself is only written by an explicit .savelayout.
         self.layout_dirty = true;
-    }
-
-    /// Intercept the layout dot-commands with GUI-native named checkpoints,
-    /// mirroring how the TUI intercepts them before AppCore's fallbacks.
-    /// Returns true when the command was one of ours.
-    fn handle_layout_command(&mut self, command: &str) -> bool {
-        let Some(rest) = command.strip_prefix('.') else {
-            return false;
-        };
-        let mut parts = rest.split_whitespace();
-        let Some(cmd) = parts.next() else {
-            return false;
-        };
-        let arg = parts.next();
-        match cmd.to_lowercase().as_str() {
-            "savelayout" => {
-                let name = arg.unwrap_or("default");
-                if !is_valid_layout_name(name) {
-                    self.app_core.add_system_message(
-                        "Layout names use letters, digits, '-' and '_' only.",
-                    );
-                    return true;
-                }
-                let Some(layout) = self.build_layout_snapshot() else {
-                    self.app_core
-                        .add_system_message("Could not snapshot the current layout.");
-                    return true;
-                };
-                match save_named_layout(
-                    &layout,
-                    &self.layout_profile,
-                    &self.layout_character,
-                    name,
-                ) {
-                    Ok(()) => self.app_core.add_system_message(&format!(
-                        "Saved GUI layout '{}'. Load it with .loadlayout {}",
-                        name, name
-                    )),
-                    Err(err) => self
-                        .app_core
-                        .add_system_message(&format!("Failed to save layout: {}", err)),
-                }
-                true
-            }
-            "loadlayout" => {
-                let Some(name) = arg else {
-                    self.app_core
-                        .add_system_message("Usage: .loadlayout <name>");
-                    self.list_layout_checkpoints();
-                    return true;
-                };
-                match load_named_layout(&self.layout_profile, &self.layout_character, name) {
-                    Ok(layout) => {
-                        self.apply_layout_snapshot(&layout);
-                        self.app_core
-                            .add_system_message(&format!("Loaded GUI layout '{}'.", name));
-                    }
-                    Err(err) => {
-                        self.app_core
-                            .add_system_message(&format!("Failed to load layout: {}", err));
-                        self.list_layout_checkpoints();
-                    }
-                }
-                true
-            }
-            "layouts" => {
-                self.list_layout_checkpoints();
-                true
-            }
-            // UI packs: the GUI rides along on the core commands to add
-            // (export) / install (import) its live layout.
-            "uiexport" => {
-                let args: Vec<String> = parts.map(str::to_string).collect();
-                let mut args = {
-                    let mut all = vec![arg.unwrap_or_default().to_string()];
-                    all.extend(args);
-                    all
-                };
-                args.retain(|a| !a.is_empty());
-                let extra = self
-                    .build_layout_snapshot()
-                    .and_then(|layout| serde_json::to_vec_pretty(&layout).ok())
-                    .map(|bytes| {
-                        vec![(
-                            crate::core::uipack::GUI_LAYOUT_ENTRY.to_string(),
-                            bytes,
-                        )]
-                    })
-                    .unwrap_or_default();
-                self.app_core.uiexport_with(&args, extra);
-                true
-            }
-            "uiimport" => {
-                let args: Vec<String> = parts.map(str::to_string).collect();
-                let mut args = {
-                    let mut all = vec![arg.unwrap_or_default().to_string()];
-                    all.extend(args);
-                    all
-                };
-                args.retain(|a| !a.is_empty());
-                if let Some((pack_name, bytes)) = self.app_core.uiimport(&args) {
-                    match serde_json::from_slice(&bytes) {
-                        Ok(layout) => match save_named_layout(
-                            &layout,
-                            &self.layout_profile,
-                            &self.layout_character,
-                            &pack_name,
-                        ) {
-                            Ok(()) => self.app_core.add_system_message(&format!(
-                                "GUI layout installed — load it with .loadlayout {pack_name}"
-                            )),
-                            Err(err) => self.app_core.add_system_message(&format!(
-                                "Pack's GUI layout could not be saved: {err}"
-                            )),
-                        },
-                        Err(err) => self.app_core.add_system_message(&format!(
-                            "Pack's GUI layout did not parse: {err}"
-                        )),
-                    }
-                }
-                true
-            }
-            _ => false,
-        }
     }
 
     fn list_layout_checkpoints(&mut self) {
@@ -2513,7 +3002,7 @@ impl VellumGuiApp {
                                 self.app_core.remove_window(name);
                                 self.app_core.layout.windows.retain(|w| w.name() != *name);
                             }
-                            self.app_core.layout_modified_since_save = true;
+                            self.app_core.schedule_layout_autosave();
                             tracing::info!(
                                 "WebUI page '{}' ended; closed transient panel",
                                 page
@@ -2728,7 +3217,7 @@ impl VellumGuiApp {
         let Some(page_id) = page_id else { return };
         self.app_core.remove_window(name);
         self.app_core.layout.windows.retain(|w| w.name() != name);
-        self.app_core.layout_modified_since_save = true;
+        self.app_core.schedule_layout_autosave();
         self.layout_dirty = true;
         // Only unsubscribe when no other window still shows the page.
         let still_hosted = self.app_core.ui_state.windows.values().any(|w| {
@@ -3183,13 +3672,21 @@ impl VellumGuiApp {
             return;
         }
         match self.app_core.execute_keybind_action(action) {
-            Ok(commands) => {
-                for outbound in commands {
-                    if Self::should_send_to_network(&outbound) {
-                        self.app_core
-                            .perf_stats
-                            .record_bytes_sent((outbound.len() + 1) as u64);
-                        let _ = self.command_tx.send(outbound);
+            Ok(outcomes) => {
+                for outcome in outcomes {
+                    match outcome {
+                        crate::data::CommandOutcome::Game(outbound) => {
+                            if Self::should_send_to_network(&outbound) {
+                                self.app_core
+                                    .perf_stats
+                                    .record_bytes_sent((outbound.len() + 1) as u64);
+                                let _ = self.command_tx.send(outbound);
+                            }
+                        }
+                        crate::data::CommandOutcome::Handled => {}
+                        // A macro bound to a dot-command that opens an
+                        // editor: perform it here.
+                        crate::data::CommandOutcome::Ui(ui) => self.handle_ui_action(ui),
                     }
                 }
             }
@@ -3459,22 +3956,11 @@ impl VellumGuiApp {
             return;
         }
 
-        // Layout commands are GUI-native named checkpoints here; intercept
-        // before AppCore's TUI-oriented fallbacks see them.
-        if self.handle_layout_command(&command) {
-            return;
-        }
-
         match self.app_core.send_command(command) {
-            Ok(outbound) => {
-                if outbound.starts_with("action:") {
-                    if !self.handle_action_string(&outbound) {
-                        self.app_core.add_system_message(&format!(
-                            "GUI action not implemented yet: {}",
-                            outbound
-                        ));
-                    }
-                } else if Self::should_send_to_network(&outbound) {
+            Ok(crate::data::CommandOutcome::Ui(action)) => self.handle_ui_action(action),
+            Ok(crate::data::CommandOutcome::Handled) => {}
+            Ok(crate::data::CommandOutcome::Game(outbound)) => {
+                if Self::should_send_to_network(&outbound) {
                     self.app_core
                         .perf_stats
                         .record_bytes_sent((outbound.len() + 1) as u64);
@@ -3765,7 +4251,7 @@ impl VellumGuiApp {
                         INITIAL_LAYOUT_WIDTH,
                         INITIAL_LAYOUT_HEIGHT,
                     );
-                    self.app_core.layout_modified_since_save = true;
+                    self.app_core.schedule_layout_autosave();
                     self.app_core
                         .add_system_message(&format!("Window '{}' added.", actual_name));
                     // Blank custom widgets start unconfigured (e.g. a countdown
@@ -3842,34 +4328,69 @@ impl VellumGuiApp {
         self.app_core.add_system_message("No unread tabs.");
     }
 
-    /// Dispatch an `action:*` string from a dot-command or menu item.
-    /// Returns false when the action has no GUI handler yet.
+    /// Handle `action:zone:<zone>:<op>` from `.header`/`.footer`/`.leftbar`/
+    /// `.rightbar` — show, hide, or toggle a shell zone. Macroable via
+    /// keybinds and hotbar buttons like any other dot-command.
+    fn handle_zone_action(&mut self, rest: &str) -> bool {
+        let Some((zone, op)) = rest.split_once(':') else {
+            return false;
+        };
+        let shown_now = match zone {
+            "header" => self.shell_layout.header_visible,
+            "footer" => self.shell_layout.footer_visible,
+            "leftbar" => !self.shell_layout.left_sidebar_collapsed,
+            "rightbar" => !self.shell_layout.right_sidebar_collapsed,
+            _ => return false,
+        };
+        let shown = match op {
+            "on" => true,
+            "off" => false,
+            "toggle" => !shown_now,
+            _ => return false,
+        };
+        if shown != shown_now {
+            match zone {
+                "header" => self.shell_layout.header_visible = shown,
+                "footer" => self.shell_layout.footer_visible = shown,
+                "leftbar" => self.shell_layout.left_sidebar_collapsed = !shown,
+                "rightbar" => self.shell_layout.right_sidebar_collapsed = !shown,
+                _ => unreachable!(),
+            }
+            self.layout_dirty = true;
+        }
+        true
+    }
+
+    /// Dispatch an `action:*` string from a popup-menu item (menu items
+    /// carry strings). The typed path is [`Self::handle_ui_action`]; this
+    /// is the single string bridge into it. Returns false only for
+    /// unparseable strings — a menu-wiring bug.
     fn handle_action_string(&mut self, action: &str) -> bool {
-        if action == "action:windows" || action == "action:listwindows" {
-            let _ = self.app_core.send_command(".windows".to_string());
-            return true;
+        match crate::data::UiAction::parse(action) {
+            Some(action) => {
+                self.handle_ui_action(action);
+                true
+            }
+            None => false,
         }
-        if let Some(name) = action.strip_prefix("action:settheme:") {
-            let name = name.to_string();
-            self.apply_theme_by_name(&name);
-            return true;
-        }
-        if let Some(name) = action.strip_prefix("action:setskin:") {
-            let name = name.to_string();
-            self.apply_skin_by_name(&name);
-            return true;
-        }
-        if action == "action:skins" {
-            self.list_skins_to_window();
-            return true;
-        }
-        if let Some(name) = action.strip_prefix("action:makeskin:") {
-            let name = name.to_string();
-            self.make_skin_scaffold(&name);
-            return true;
-        }
-        if action == "action:reloadskin" {
-            match self.app_core.config.active_skin.clone() {
+    }
+
+    /// Perform a [`UiAction`] in the GUI. The match is EXHAUSTIVE on
+    /// purpose: adding a UiAction variant forces every frontend to decide
+    /// — implement it or answer with a redirect — so actions can never
+    /// silently die again (see the dot-command parity audit).
+    fn handle_ui_action(&mut self, action: crate::data::UiAction) {
+        use crate::data::UiAction as A;
+        match action {
+            A::WindowList => {
+                // Core renders the list; round-trip through the command.
+                let _ = self.app_core.send_command(".windows".to_string());
+            }
+            A::SetTheme(name) => self.apply_theme_by_name(&name),
+            A::SetSkin(name) => self.apply_skin_by_name(&name),
+            A::Skins => self.list_skins_to_window(),
+            A::MakeSkin(name) => self.make_skin_scaffold(&name),
+            A::ReloadSkin => match self.ui_settings.active_skin.clone() {
                 Some(name) => {
                     self.skin_state.force_reload();
                     self.app_core
@@ -3879,172 +4400,251 @@ impl VellumGuiApp {
                     self.app_core
                         .add_system_message("No skin active. Use .setskin <name> first.");
                 }
+            },
+            A::SorterEdit => self.open_sorter_editor(),
+            A::SnapDebug => {
+                self.snap_debug = !self.snap_debug;
+                self.app_core.add_system_message(if self.snap_debug {
+                    "Snap debug trace ON: drag/resize center windows, then read \
+                     ~/.vellum-fe/vellum-fe.log (lines tagged 'snapdbg'). \
+                     Toggle off with .snapdebug."
+                } else {
+                    "Snap debug trace off."
+                });
             }
-            return true;
-        }
-        if action == "action:settings" {
-            self.open_settings_editor();
-            return true;
-        }
-        if action == "action:highlights" {
-            self.open_highlight_editor(None);
-            return true;
-        }
-        if action == "action:addhighlight" {
-            self.open_highlight_editor(None);
-            self.open_highlight_form_new();
-            return true;
-        }
-        if let Some(name) = action.strip_prefix("action:edithighlight") {
-            let name = name.strip_prefix(':').unwrap_or("").to_string();
-            if name.is_empty() {
+            A::Settings => self.open_settings_editor(),
+            A::Highlights => self.open_highlight_editor(None),
+            A::AddHighlight => {
                 self.open_highlight_editor(None);
-            } else {
-                self.open_highlight_editor(Some(&name));
+                self.open_highlight_form_new();
             }
-            return true;
-        }
-        if action == "action:keybinds" {
-            self.open_keybind_editor();
-            return true;
-        }
-        if action == "action:menukeybinds" {
-            self.open_menu_keybind_editor();
-            return true;
-        }
-        if action == "action:controller" {
-            #[cfg(feature = "gamepad")]
-            self.open_controller_editor();
-            #[cfg(not(feature = "gamepad"))]
-            self.app_core
-                .add_system_message("This build has no gamepad support.");
-            return true;
-        }
-        if action == "action:hotbars" {
-            self.open_hotbar_editor();
-            return true;
-        }
-        if action == "action:addkeybind" {
-            self.open_keybind_editor();
-            self.open_keybind_form_new();
-            return true;
-        }
-        if action == "action:colors" {
-            self.open_colors_editor();
-            return true;
-        }
-        if action == "action:addcolor" {
-            self.open_palette_form_new();
-            return true;
-        }
-        if action == "action:uicolors" {
-            self.open_ui_colors_editor();
-            return true;
-        }
-        if action == "action:spellcolors" {
-            self.open_spell_colors_editor();
-            return true;
-        }
-        if action == "action:addspellcolor" {
-            self.open_spell_form_new();
-            return true;
-        }
-        if action == "action:themes" {
-            self.open_theme_browser();
-            return true;
-        }
-        if action == "action:edittheme" {
-            let base = self.current_theme.clone();
-            self.open_theme_editor(&base);
-            return true;
-        }
-        if let Some(name) = action.strip_prefix("action:editwindow") {
-            let name = name.strip_prefix(':').unwrap_or("").to_string();
-            if name.is_empty() {
-                self.open_window_editor(None);
-            } else {
-                self.open_window_editor(Some(&name));
-            }
-            return true;
-        }
-        if action == "action:nexttab" {
-            self.cycle_tabbed_tabs(true);
-            return true;
-        }
-        if action == "action:prevtab" {
-            self.cycle_tabbed_tabs(false);
-            return true;
-        }
-        if action == "action:nextunread" {
-            self.goto_unread_tab();
-            return true;
-        }
-        if let Some(name) = action.strip_prefix("action:hidewindow:") {
-            let name = name.to_string();
-            let key = self
-                .app_core
-                .ui_state
-                .windows
-                .get(&name)
-                .and_then(|window| Self::tab_key_for_window(&name, window));
-            match key {
-                Some(key) => self.hide_tab(key),
-                None => self
-                    .app_core
-                    .add_system_message(&format!("Window '{}' not found.", name)),
-            }
-            return true;
-        }
-        if action == "action:setpalette" || action == "action:resetpalette" {
-            self.app_core.add_system_message(
-                "Terminal palette commands do not apply to the GUI; use .themes instead.",
-            );
-            return true;
-        }
-        if action.strip_prefix("action:loadlayout:").is_some() {
-            // This action comes from the Layouts menu, which lists TUI TOML
-            // layouts — those don't apply here. GUI checkpoints are the
-            // .savelayout/.loadlayout commands (see handle_layout_command).
-            self.app_core.add_system_message(
-                "TOML layouts are a TUI feature. In the GUI, use .savelayout <name> and .loadlayout <name> for named layouts.",
-            );
-            return true;
-        }
-        if self.handle_webui_action(action) {
-            return true;
-        }
-        if action == "action:customwindows" {
-            self.open_custom_windows_editor();
-            return true;
-        }
-        if action == "action:knownwindows" {
-            self.open_known_windows_editor();
-            return true;
-        }
-        if action == "action:addwindow" {
-            let mut items = self.app_core.build_add_window_menu();
-            // Surface the custom-window authoring panel at the top of the
-            // Add Widget menu (GUI-local; the shared core menu builder stays
-            // untouched). The show/hide list lives under Windows > Show/Hide.
-            items.insert(
-                0,
-                PopupMenuItem {
-                    text: "Streams & Custom Windows…".to_string(),
-                    command: "action:customwindows".to_string(),
-                    disabled: false,
-                },
-            );
-            if items.is_empty() {
+            A::EditHighlight(name) => match name.as_deref() {
+                Some(name) => self.open_highlight_editor(Some(name)),
+                None => self.open_highlight_editor(None),
+            },
+            A::Keybinds => self.open_keybind_editor(),
+            A::MenuKeybinds => self.open_menu_keybind_editor(),
+            A::Controller => {
+                #[cfg(feature = "gamepad")]
+                self.open_controller_editor();
+                #[cfg(not(feature = "gamepad"))]
                 self.app_core
-                    .add_system_message("No window templates available to add.");
-            } else {
-                self.close_all_popup_menus();
-                self.app_core.ui_state.popup_menu = Some(PopupMenu::new(items, (8, 4)));
-                self.app_core.ui_state.input_mode = InputMode::Menu;
+                    .add_system_message("This build has no gamepad support.");
             }
-            return true;
+            A::Hotbars => self.open_hotbar_editor(),
+            A::AddKeybind => {
+                self.open_keybind_editor();
+                self.open_keybind_form_new();
+            }
+            A::Colors => self.open_colors_editor(),
+            A::AddColor => self.open_palette_form_new(),
+            A::UiColors => self.open_ui_colors_editor(),
+            A::SpellColors => self.open_spell_colors_editor(),
+            A::AddSpellColor => self.open_spell_form_new(),
+            A::Themes => self.open_theme_browser(),
+            A::EditTheme => {
+                let base = self.current_theme.clone();
+                self.open_theme_editor(&base);
+            }
+            A::EditWindow(name) => match name.as_deref() {
+                Some(name) => self.open_window_editor(Some(name)),
+                None => self.open_window_editor(None),
+            },
+            A::NextTab => self.cycle_tabbed_tabs(true),
+            A::PrevTab => self.cycle_tabbed_tabs(false),
+            A::NextUnread => self.goto_unread_tab(),
+            A::HideWindow(Some(name)) => {
+                let key = self
+                    .app_core
+                    .ui_state
+                    .windows
+                    .get(&name)
+                    .and_then(|window| Self::tab_key_for_window(&name, window));
+                match key {
+                    Some(key) => self.hide_tab(key),
+                    None => self
+                        .app_core
+                        .add_system_message(&format!("Window '{}' not found.", name)),
+                }
+            }
+            // Bare `.hidewindow` (no name) asks for a picker: the Windows
+            // manager IS the show/hide picker here.
+            A::HideWindow(None) => self.open_known_windows_editor(),
+            // `.streams` and the Streams & Custom Windows panel are the
+            // same surface; the TUI stream-menu actions land there too.
+            A::Streams
+            | A::CustomWindows
+            | A::StreamActions(_)
+            | A::StreamPickWindow(_)
+            | A::StreamRoute { .. }
+            | A::StreamSubscribe { .. }
+            | A::StreamNewWindow(_) => self.open_custom_windows_editor(),
+            A::Zone { zone, op } => {
+                let _ = self.handle_zone_action(&format!("{}:{}", zone.as_str(), op.as_str()));
+            }
+            A::SetPalette | A::ResetPalette => {
+                self.app_core.add_system_message(
+                    "Terminal palette commands do not apply to the GUI; use .themes instead.",
+                );
+            }
+            A::LoadLayoutToml(_) => {
+                // This action comes from the Layouts menu, which lists TUI TOML
+                // layouts — those don't apply here. GUI checkpoints are the
+                // .savelayout/.loadlayout commands below.
+                self.app_core.add_system_message(
+                    "TOML layouts are a TUI feature. In the GUI, use .savelayout <name> and .loadlayout <name> for named layouts.",
+                );
+            }
+            // Layout capability hooks (parity plan D3): same command
+            // names as the TUI, GUI-native window-snapshot checkpoints.
+            A::SaveLayout(name) => {
+                let name = name.unwrap_or_else(|| "default".to_string());
+                if !is_valid_layout_name(&name) {
+                    self.app_core.add_system_message(
+                        "Layout names use letters, digits, '-' and '_' only.",
+                    );
+                    return;
+                }
+                let Some(layout) = self.build_layout_snapshot() else {
+                    self.app_core
+                        .add_system_message("Could not snapshot the current layout.");
+                    return;
+                };
+                match save_named_layout(
+                    &layout,
+                    &self.layout_profile,
+                    &self.layout_character,
+                    &name,
+                ) {
+                    Ok(()) => self.app_core.add_system_message(&format!(
+                        "Saved GUI layout '{}'. Load it with .loadlayout {}",
+                        name, name
+                    )),
+                    Err(err) => self
+                        .app_core
+                        .add_system_message(&format!("Failed to save layout: {}", err)),
+                }
+            }
+            A::LoadLayout(None) => {
+                self.app_core
+                    .add_system_message("Usage: .loadlayout <name>");
+                self.list_layout_checkpoints();
+            }
+            A::LoadLayout(Some(name)) => {
+                match load_named_layout(&self.layout_profile, &self.layout_character, &name) {
+                    Ok(layout) => {
+                        self.apply_layout_snapshot(&layout);
+                        self.app_core
+                            .add_system_message(&format!("Loaded GUI layout '{}'.", name));
+                    }
+                    Err(err) => {
+                        self.app_core
+                            .add_system_message(&format!("Failed to load layout: {}", err));
+                        self.list_layout_checkpoints();
+                    }
+                }
+            }
+            A::ListLayouts => self.list_layout_checkpoints(),
+            A::ResizeLayout => {
+                self.app_core.add_system_message(
+                    ".resize refits the TUI's cell layout; the GUI has no cell grid.",
+                );
+            }
+            A::SaveSkin(name) => {
+                if !is_valid_layout_name(&name) {
+                    self.app_core.add_system_message(
+                        "Skin names use letters, digits, '-' and '_' only.",
+                    );
+                    return;
+                }
+                match self.compile_appearance_to_skin(&name) {
+                    Ok(()) => self.app_core.add_system_message(&format!(
+                        "Saved skin '{}' from the current appearance. Activate it with .setskin {}",
+                        name, name
+                    )),
+                    Err(err) => self
+                        .app_core
+                        .add_system_message(&format!("Failed to save skin: {}", err)),
+                }
+            }
+            // UI packs ride the core commands with the live GUI layout
+            // attached (export) / installed (import).
+            A::UiExport(args) => {
+                let extra = self
+                    .build_layout_snapshot()
+                    .and_then(|layout| serde_json::to_vec_pretty(&layout).ok())
+                    .map(|bytes| {
+                        vec![(
+                            crate::core::uipack::GUI_LAYOUT_ENTRY.to_string(),
+                            bytes,
+                        )]
+                    })
+                    .unwrap_or_default();
+                self.app_core.uiexport_with(&args, extra);
+            }
+            A::UiImport(args) => {
+                if let Some((pack_name, bytes)) = self.app_core.uiimport(&args) {
+                    match serde_json::from_slice(&bytes) {
+                        Ok(layout) => match save_named_layout(
+                            &layout,
+                            &self.layout_profile,
+                            &self.layout_character,
+                            &pack_name,
+                        ) {
+                            Ok(()) => self.app_core.add_system_message(&format!(
+                                "GUI layout installed — load it with .loadlayout {pack_name}"
+                            )),
+                            Err(err) => self.app_core.add_system_message(&format!(
+                                "Pack's GUI layout could not be saved: {err}"
+                            )),
+                        },
+                        Err(err) => self.app_core.add_system_message(&format!(
+                            "Pack's GUI layout did not parse: {err}"
+                        )),
+                    }
+                }
+            }
+            A::WebUiPicker => {
+                let _ = self.handle_webui_action("action:webui");
+            }
+            A::WebUiOff => {
+                let _ = self.handle_webui_action("action:webui:off");
+            }
+            A::WebUiOpen(page) => {
+                let _ = self.handle_webui_action(&format!("action:webui:open:{page}"));
+            }
+            A::KnownWindows => self.open_known_windows_editor(),
+            A::AddWindowPicker => {
+                let mut items = self.app_core.build_add_window_menu();
+                // Surface the custom-window authoring panel at the top of the
+                // Add Widget menu (GUI-local; the shared core menu builder stays
+                // untouched). The show/hide list lives under Windows > Show/Hide.
+                items.insert(
+                    0,
+                    PopupMenuItem {
+                        text: "Streams & Custom Windows…".to_string(),
+                        command: "action:customwindows".to_string(),
+                        disabled: false,
+                    },
+                );
+                if items.is_empty() {
+                    self.app_core
+                        .add_system_message("No window templates available to add.");
+                } else {
+                    self.close_all_popup_menus();
+                    self.app_core.ui_state.popup_menu = Some(PopupMenu::new(items, (8, 4)));
+                    self.app_core.ui_state.input_mode = InputMode::Menu;
+                }
+            }
+            // TUI-menu-only actions the GUI's own menus never emit; keep
+            // them meaningful if one ever arrives.
+            A::CreateWindow(_) | A::ShowWindow(_) => {
+                self.open_known_windows_editor();
+                self.app_core.add_system_message(
+                    "Use the Windows manager to add and show windows in the GUI.",
+                );
+            }
         }
-        false
     }
 
     fn should_send_to_network(command: &str) -> bool {
@@ -4238,10 +4838,82 @@ impl eframe::App for VellumGuiApp {
             ctx.request_repaint();
         }
         self.apply_theme_if_changed(&ctx);
+        // Pool frames referenced by per-window overrides load lazily; tell
+        // the skin state which ones are in use before it applies.
+        self.skin_state.set_needed_pool_frames(
+            self.tab_settings
+                .values()
+                .filter_map(|settings| settings.skin_frame.clone())
+                .chain(self.ui_settings.default_frame.clone()),
+        );
+        self.skin_state.set_status_icon_config(
+            self.ui_settings.status_icons.set.as_deref(),
+            &self.ui_settings.status_icons.overrides,
+        );
         self.skin_state
-            .apply_if_changed(&ctx, self.app_core.config.active_skin.as_deref());
+            .set_compass_set(self.ui_settings.compass_set.as_deref());
+        self.skin_state.set_needed_pool_backgrounds(
+            self.tab_settings
+                .values()
+                .filter_map(|settings| settings.background_image.clone())
+                .chain(self.ui_settings.default_background.clone()),
+        );
+        // Pool images named by hand-widget icon states and hotbar button
+        // icons load with the skin (declared loads, like frames).
+        let hand_state_images = self
+            .app_core
+            .layout
+            .windows
+            .iter()
+            .filter_map(|def| match def {
+                crate::config::WindowDef::Hand { data, .. } => Some(&data.states),
+                _ => None,
+            })
+            .flatten()
+            .filter_map(|state| match &state.icon {
+                Some(crate::data::IconRef::Image { path }) => Some(path.clone()),
+                _ => None,
+            });
+        let hotbar_images = self
+            .app_core
+            .config
+            .hotbars
+            .bars
+            .iter()
+            .flat_map(|bar| &bar.buttons)
+            .flat_map(|button| {
+                button
+                    .icon
+                    .iter()
+                    .chain(button.default_style.iter().filter_map(|s| s.icon.as_ref()))
+                    .chain(button.states.iter().filter_map(|s| s.style.icon.as_ref()))
+            })
+            .filter_map(|icon| match &icon.icon {
+                crate::data::IconRef::Image { path } => Some(path.clone()),
+                _ => None,
+            });
+        let needed_pool_icons: Vec<String> =
+            hand_state_images.chain(hotbar_images).collect();
+        self.skin_state.set_needed_pool_icons(needed_pool_icons);
+        self.skin_state.set_grayscale(
+            self.ui_settings.status_icons.any_gray(),
+            self.ui_settings.doll_grayscale,
+        );
+        self.skin_state.apply_if_changed(
+            &ctx,
+            self.ui_settings.active_skin.as_deref(),
+            self.ui_settings.doll_image.as_deref(),
+        );
         self.apply_ui_sizing(&ctx);
+        // Prime the item classifier while &mut self is available; render
+        // paths (hotbar/hand conditions) read the immutable cache.
+        let _ = self.app_core.gameobj_data();
         self.pump_server_messages();
+        // Feed-injected dot-commands (<vellumCmd> from Lich scripts) run
+        // through the same dispatch as typed commands.
+        for command in self.app_core.take_pending_client_commands() {
+            self.dispatch_command(command);
+        }
         // Keep painting while the map worker, mapdb download, or walk
         // executor is busy so results and progress appear without waiting
         // for user input or game text (travel needs ticks for RT waits).
@@ -4356,10 +5028,12 @@ impl eframe::App for VellumGuiApp {
                 });
             });
 
+        let separator_style = self.ui_settings.zone_separators;
         if self.shell_layout.header_visible {
             egui::Panel::top("gui_shell_header")
                 .resizable(false)
                 .exact_size(self.shell_layout.header_height)
+                .show_separator_line(separator_style == ZoneSeparatorStyle::Shown)
                 .frame(
                     egui::Frame::default()
                         .inner_margin(egui::Margin::ZERO)
@@ -4396,6 +5070,13 @@ impl eframe::App for VellumGuiApp {
                         );
                         if handle_response.hovered() || handle_response.dragged() {
                             ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
+                            if separator_style == ZoneSeparatorStyle::Hover {
+                                ui.painter().hline(
+                                    header_zone_rect.x_range(),
+                                    header_zone_rect.max.y - 0.75,
+                                    egui::Stroke::new(1.5, ui.visuals().window_stroke.color),
+                                );
+                            }
                         }
                         if handle_response.dragged() {
                             let dy = ui.ctx().input(|i| i.pointer.delta().y);
@@ -4407,44 +5088,24 @@ impl eframe::App for VellumGuiApp {
                 });
         }
 
-        egui::Panel::bottom("gui_command_input").show(ui, |ui| {
-            let response = ui.add(
-                egui::TextEdit::singleline(&mut self.command_input)
-                    .hint_text("Enter command...")
-                    .desired_width(ui.available_width()),
-            );
-            self.command_input_id = Some(response.id);
-
-            let pressed_enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
-            if response.lost_focus() && pressed_enter {
-                self.submit_command();
-                response.request_focus();
-            }
-
-            // History browsing: up = older, down = newer / clear at the
-            // newest. consume_key keeps the arrows from reaching anything
-            // else while the input has focus.
-            if response.has_focus() {
-                let up = ui.input_mut(|i| {
-                    i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp)
-                });
-                let down = ui.input_mut(|i| {
-                    i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown)
-                });
-                if up {
-                    self.history_previous();
-                    self.command_cursor_to_end(ui.ctx());
-                } else if down {
-                    self.history_next();
-                    self.command_cursor_to_end(ui.ctx());
-                }
-            }
-        });
+        // The command input is a normal dockable window now
+        // (TabKey::CommandInput). This fixed panel appears only when no such
+        // tab actually renders this frame — missing window def, hidden tab,
+        // or the tab parked in a collapsed/hidden shell zone — so the input
+        // can never be lost.
+        if !self.command_input_tab_rendered() {
+            egui::Panel::bottom("gui_command_input").show(ui, |ui| {
+                let seed = self.command_input.clone();
+                // Fixed fallback panel: not a movable window, no grip.
+                Self::render_command_input_widget(ui, &seed, false);
+            });
+        }
 
         if self.shell_layout.footer_visible {
             egui::Panel::bottom("gui_shell_footer")
                 .resizable(false)
                 .exact_size(self.shell_layout.footer_height)
+                .show_separator_line(separator_style == ZoneSeparatorStyle::Shown)
                 .frame(
                     egui::Frame::default()
                         .inner_margin(egui::Margin::ZERO)
@@ -4481,6 +5142,13 @@ impl eframe::App for VellumGuiApp {
                         );
                         if handle_response.hovered() || handle_response.dragged() {
                             ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
+                            if separator_style == ZoneSeparatorStyle::Hover {
+                                ui.painter().hline(
+                                    footer_zone_rect.x_range(),
+                                    footer_zone_rect.min.y + 0.75,
+                                    egui::Stroke::new(1.5, ui.visuals().window_stroke.color),
+                                );
+                            }
                         }
                         if handle_response.dragged() {
                             let dy = ui.ctx().input(|i| i.pointer.delta().y);
@@ -4506,34 +5174,27 @@ impl eframe::App for VellumGuiApp {
 
             self.shell_layout.sanitize(root.width());
             let min_center_width = 220.0;
-            let mut left_width = if self.shell_layout.left_sidebar_collapsed {
+            let left_width = if self.shell_layout.left_sidebar_collapsed {
                 0.0
             } else {
                 self.shell_layout.left_sidebar_width
             };
-            let mut right_width = if self.shell_layout.right_sidebar_collapsed {
+            let right_width = if self.shell_layout.right_sidebar_collapsed {
                 0.0
             } else {
                 self.shell_layout.right_sidebar_width
             };
-            if left_width + right_width > (root.width() - min_center_width).max(0.0) {
-                let overflow = left_width + right_width - (root.width() - min_center_width).max(0.0);
-                let shrink_left = (overflow * 0.5).min(left_width.max(0.0));
-                left_width = (left_width - shrink_left).max(220.0);
-                right_width = (right_width - (overflow - shrink_left)).max(220.0);
-            }
-            if !self.shell_layout.left_sidebar_collapsed
-                && (self.shell_layout.left_sidebar_width - left_width).abs() > 0.5
-            {
-                self.shell_layout.left_sidebar_width = left_width;
-                self.layout_dirty = true;
-            }
-            if !self.shell_layout.right_sidebar_collapsed
-                && (self.shell_layout.right_sidebar_width - right_width).abs() > 0.5
-            {
-                self.shell_layout.right_sidebar_width = right_width;
-                self.layout_dirty = true;
-            }
+            // Display-only squeeze on narrow windows; the persisted widths
+            // stay untouched so the layout springs back when the window
+            // grows again (the old math floored collapsed sidebars back to
+            // life, inverted the center, and baked the squeeze into the
+            // saved layout).
+            let (left_width, right_width) = zones::squeezed_sidebar_widths(
+                root.width(),
+                min_center_width,
+                left_width,
+                right_width,
+            );
 
             let left_rect = if left_width > 0.0 {
                 Some(Rect::from_min_max(
@@ -4563,13 +5224,15 @@ impl eframe::App for VellumGuiApp {
                 1.5,
                 ui.visuals().window_stroke.color,
             );
-            if let Some(rect) = left_rect {
-                ui.painter()
-                    .vline(rect.max.x, root.y_range(), sidebar_divider_stroke);
-            }
-            if let Some(rect) = right_rect {
-                ui.painter()
-                    .vline(rect.min.x, root.y_range(), sidebar_divider_stroke);
+            if separator_style == ZoneSeparatorStyle::Shown {
+                if let Some(rect) = left_rect {
+                    ui.painter()
+                        .vline(rect.max.x, root.y_range(), sidebar_divider_stroke);
+                }
+                if let Some(rect) = right_rect {
+                    ui.painter()
+                        .vline(rect.min.x, root.y_range(), sidebar_divider_stroke);
+                }
             }
 
             zone_actions.merge(self.render_zone_surface(
@@ -4586,13 +5249,28 @@ impl eframe::App for VellumGuiApp {
                     Pos2::new(rect.max.x - 6.0, rect.min.y),
                     Pos2::new(rect.max.x + 6.0, rect.max.y),
                 );
-                let splitter_response = ui.interact(
-                    splitter,
-                    egui::Id::new("gui_left_sidebar_splitter"),
-                    egui::Sense::click_and_drag(),
-                );
+                // D5 gutter: an always-on-top strip owned by the zone, so
+                // the grab survives windows parked flush on the boundary
+                // (free-placement sidebars have no per-window width band).
+                let splitter_response =
+                    egui::Area::new(egui::Id::new("gui_left_sidebar_splitter"))
+                        .order(egui::Order::Foreground)
+                        .fixed_pos(splitter.min)
+                        .show(ui.ctx(), |gutter_ui| {
+                            gutter_ui
+                                .allocate_exact_size(
+                                    splitter.size(),
+                                    egui::Sense::click_and_drag(),
+                                )
+                                .1
+                        })
+                        .inner;
                 if splitter_response.hovered() || splitter_response.dragged() {
                     ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+                    if separator_style == ZoneSeparatorStyle::Hover {
+                        ui.painter()
+                            .vline(rect.max.x, root.y_range(), sidebar_divider_stroke);
+                    }
                 }
                 if splitter_response.dragged() {
                     let dx = ui.ctx().input(|i| i.pointer.delta().x);
@@ -4615,13 +5293,26 @@ impl eframe::App for VellumGuiApp {
                     Pos2::new(rect.min.x - 6.0, rect.min.y),
                     Pos2::new(rect.min.x + 6.0, rect.max.y),
                 );
-                let splitter_response = ui.interact(
-                    splitter,
-                    egui::Id::new("gui_right_sidebar_splitter"),
-                    egui::Sense::click_and_drag(),
-                );
+                // D5 gutter — see the left-sidebar twin above.
+                let splitter_response =
+                    egui::Area::new(egui::Id::new("gui_right_sidebar_splitter"))
+                        .order(egui::Order::Foreground)
+                        .fixed_pos(splitter.min)
+                        .show(ui.ctx(), |gutter_ui| {
+                            gutter_ui
+                                .allocate_exact_size(
+                                    splitter.size(),
+                                    egui::Sense::click_and_drag(),
+                                )
+                                .1
+                        })
+                        .inner;
                 if splitter_response.hovered() || splitter_response.dragged() {
                     ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+                    if separator_style == ZoneSeparatorStyle::Hover {
+                        ui.painter()
+                            .vline(rect.min.x, root.y_range(), sidebar_divider_stroke);
+                    }
                 }
                 if splitter_response.dragged() {
                     let dx = ui.ctx().input(|i| i.pointer.delta().x);
@@ -4642,16 +5333,15 @@ impl eframe::App for VellumGuiApp {
         let detached_link_clicks = self.render_detached_viewports(&ctx);
         self.render_map_explorer(&ctx);
 
-        let zone_drop_result =
-            self.render_zone_drop_overlay(&ctx, &visible_zone_rects, &zone_window_rects);
-        self.render_window_move_overlay(&ctx, &visible_zone_rects, &zone_window_rects);
+        let zone_drop_result = self.render_zone_drop_overlay(&ctx, &visible_zone_rects);
+        self.render_window_move_overlay(&ctx, &visible_zone_rects);
         self.handle_link_drag_drop(&ctx, &zone_window_rects);
 
         if open_windows_manager {
             self.open_known_windows_editor();
         }
         if let Some(drop_result) = zone_drop_result {
-            self.apply_zone_drop(drop_result);
+            self.apply_zone_drop(drop_result, &visible_zone_rects);
         }
         if let Some(request) = zone_actions.window_menu_request {
             // While a window is in Move mode the pointer belongs to placement.
@@ -4743,6 +5433,36 @@ impl eframe::App for VellumGuiApp {
             if dirty_since.elapsed() >= LAYOUT_SAVE_DEBOUNCE {
                 self.save_layout_state();
                 self.layout_dirty_since = None;
+            }
+        }
+        // Same debounce for the core TOML layout (WindowDef data: streams,
+        // added/removed windows). Previously only written on exit, so a
+        // crash lost window-def edits; this mirrors the TUI's autosave tick.
+        self.app_core.tick_layout_autosave();
+
+        // Drain the command-input echo (see render_command_input_widget):
+        // the widget renders inside &self paths, so buffer edits and
+        // history/submit events arrive here once per frame.
+        let echo: Option<CommandInputEcho> = ctx.data_mut(|data| {
+            let value = data.get_temp(CommandInputEcho::id());
+            if value.is_some() {
+                data.remove::<CommandInputEcho>(CommandInputEcho::id());
+            }
+            value
+        });
+        if let Some(echo) = echo {
+            if let Some(text) = echo.text {
+                self.command_input = text;
+            }
+            if echo.history_prev {
+                self.history_previous();
+                self.command_cursor_to_end(&ctx);
+            } else if echo.history_next {
+                self.history_next();
+                self.command_cursor_to_end(&ctx);
+            }
+            if echo.submit {
+                self.submit_command();
             }
         }
 
@@ -5304,7 +6024,9 @@ mod tests {
     }
 
     #[test]
-    fn test_should_filter_target_creature_filters_dead_and_excluded_nouns() {
+    fn test_is_valid_target_filters_dead_and_excluded_nouns() {
+        // Filtering is now canonical on Creature::is_valid_target; the GUI
+        // routes through it. Default excluded_nouns = ["arm", "coal"].
         let cfg = TargetListConfig::default();
         let dead_creature = Creature {
             name: "a dead goblin".to_string(),
@@ -5321,18 +6043,12 @@ mod tests {
             flags: None,
         };
 
-        assert!(VellumGuiApp::should_filter_target_creature(
-            &dead_creature,
-            &cfg
-        ));
-        assert!(VellumGuiApp::should_filter_target_creature(
-            &body_part_creature,
-            &cfg
-        ));
+        assert!(!dead_creature.is_valid_target(&cfg.excluded_nouns));
+        assert!(!body_part_creature.is_valid_target(&cfg.excluded_nouns));
     }
 
     #[test]
-    fn test_should_filter_target_creature_keeps_live_creatures() {
+    fn test_is_valid_target_keeps_live_creatures() {
         let cfg = TargetListConfig::default();
         let live_creature = Creature {
             name: "a forest troll".to_string(),
@@ -5342,10 +6058,7 @@ mod tests {
             flags: None,
         };
 
-        assert!(!VellumGuiApp::should_filter_target_creature(
-            &live_creature,
-            &cfg
-        ));
+        assert!(live_creature.is_valid_target(&cfg.excluded_nouns));
     }
 
     fn migration_test_layout() -> crate::config::Layout {

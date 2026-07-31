@@ -132,7 +132,7 @@ pub fn install_asset(
         ));
     }
 
-    let dest = plain_file_dest(kind, &name)?;
+    let dest = plain_file_dest(asset)?;
 
     if let Some(dest) = &dest {
         // Idempotence: an on-disk file whose digest already matches is a no-op,
@@ -158,6 +158,12 @@ pub fn install_asset(
     match dest {
         Some(dest) => {
             write_atomic(&dest, &bytes)?;
+            // Render metadata (frame slice/scale, sheet cell) lands in the
+            // image's pool sidecar so the art arrives ready to use.
+            // Best-effort: a sidecar failure doesn't undo the install.
+            if let Err(e) = write_pool_sidecar(&dest, asset) {
+                tracing::warn!("installed {name} but couldn't write its sidecar: {e}");
+            }
             record(db, &name, repo, asset);
             Ok(InstallOutcome::Installed { path: dest })
         }
@@ -203,7 +209,9 @@ fn install_bundle(kind: &str, name: &str, zip_bytes: &[u8]) -> Result<PathBuf, S
 
 /// Destination path for a plain single-file asset, or `None` for a kind that is
 /// a composed bundle needing extraction (`skin`, `layout`, `uipack`).
-fn plain_file_dest(kind: &str, name: &str) -> Result<Option<PathBuf>, String> {
+fn plain_file_dest(asset: &Asset) -> Result<Option<PathBuf>, String> {
+    let name = asset.basename();
+    let kind = asset.kind();
     // mapdb.json is `data`-typed but belongs in the map dir the map subsystem
     // reads, not the game-data store. The mapdb downloader versions its own
     // filenames; a direct .jinx install lands the plain name there and J3's
@@ -223,12 +231,67 @@ fn plain_file_dest(kind: &str, name: &str) -> Result<Option<PathBuf>, String> {
         // Standalone injury-doll base images drop into the doll pool; a skin's
         // [injury_doll] base references one by (absolute) path.
         "doll" => Config::global_dolls_dir(),
+        // Established per-file pool categories keep their fixed mapping;
+        // skins (and the per-window frame picker's [frames.*] entries)
+        // reference them by pool-relative path ("frames/iron.png").
+        "frame" => Config::global_image_category_dir("frames"),
+        "background" => Config::global_image_category_dir("backgrounds"),
+        "compass" => Config::global_image_category_dir("compass"),
+        "statusicon" => Config::global_image_category_dir("statusicons"),
+        // Hand-widget icons (static picker + status-driven states).
+        "hand" => Config::global_image_category_dir("hands"),
         // Composed bundles: extracted elsewhere, not a plain write.
         "skin" | "layout" | "uipack" => return Ok(None),
-        other => return Err(format!("unknown asset kind '{other}' for '{name}'")),
+        // Anything else installs into the pool folder the manifest names
+        // (sanitized by pool_category), so new categories need no client
+        // change. is_installable already gated on the pool being present.
+        other => match asset.pool_category() {
+            Some(pool) => Config::global_image_category_dir(pool),
+            None => return Err(format!("unknown asset kind '{other}' for '{name}'")),
+        },
     };
     let dir = dir.map_err(|e| format!("cannot resolve install dir: {e}"))?;
     Ok(Some(dir.join(name)))
+}
+
+/// Merge the asset's render metadata (slice/scale/cell) into the installed
+/// image's sidecar toml, preserving everything else — a locally-calibrated
+/// doll keeps its anchors when the image updates. No metadata = no write.
+fn write_pool_sidecar(dest: &Path, asset: &Asset) -> Result<(), String> {
+    use toml_edit::{value, Array, DocumentMut};
+
+    let Some(vellum) = &asset.vellum else {
+        return Ok(());
+    };
+    if vellum.slice.is_none() && vellum.scale.is_none() && vellum.cell.is_none() {
+        return Ok(());
+    }
+    let path = dest.with_extension("toml");
+    let contents = std::fs::read_to_string(&path).unwrap_or_default();
+    let mut doc: DocumentMut = contents
+        .parse()
+        .map_err(|e| format!("{} is not valid TOML: {e}", path.display()))?;
+    if let Some(slice) = &vellum.slice {
+        match slice {
+            crate::config::pool::SliceSpec::Uniform(inset) => {
+                doc["slice"] = value(*inset as f64);
+            }
+            crate::config::pool::SliceSpec::PerSide(insets) => {
+                let mut array = Array::new();
+                for inset in insets {
+                    array.push(*inset as f64);
+                }
+                doc["slice"] = value(array);
+            }
+        }
+    }
+    if let Some(scale) = vellum.scale {
+        doc["scale"] = value(scale as f64);
+    }
+    if let Some(cell) = vellum.cell {
+        doc["cell"] = value(cell as i64);
+    }
+    write_atomic(&path, doc.to_string().as_bytes())
 }
 
 fn record(db: &mut InstalledDb, name: &str, repo: &RepoSource, asset: &Asset) {
@@ -455,8 +518,8 @@ mod tests {
             InstallOutcome::Installed { path } => path,
             other => panic!("expected Installed, got {other:?}"),
         };
-        assert!(dest.ends_with("global/icons/runes.png") ||
-                dest.ends_with("global\\icons\\runes.png"), "{}", dest.display());
+        assert!(dest.ends_with("global/images/icons/runes.png") ||
+                dest.ends_with("global\\images\\icons\\runes.png"), "{}", dest.display());
         assert_eq!(db.get("runes.png").unwrap().kind, "iconmap");
 
         std::env::remove_var("VELLUM_FE_DIR");
@@ -480,9 +543,84 @@ mod tests {
             InstallOutcome::Installed { path } => path,
             other => panic!("expected Installed, got {other:?}"),
         };
-        assert!(dest.ends_with("global/dolls/soldier.png") ||
-                dest.ends_with("global\\dolls\\soldier.png"), "{}", dest.display());
+        assert!(dest.ends_with("global/images/dolls/soldier.png") ||
+                dest.ends_with("global\\images\\dolls\\soldier.png"), "{}", dest.display());
         assert_eq!(db.get("soldier.png").unwrap().kind, "doll");
+
+        std::env::remove_var("VELLUM_FE_DIR");
+    }
+
+    #[test]
+    fn install_pool_kinds_land_in_their_category_dirs() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let cfg = tempfile::tempdir().unwrap();
+        std::env::set_var("VELLUM_FE_DIR", cfg.path());
+
+        let ag = agent().unwrap();
+        for (kind, dir) in [
+            ("frame", "frames"),
+            ("background", "backgrounds"),
+            ("compass", "compass"),
+            ("statusicon", "statusicons"),
+            ("hand", "hands"),
+        ] {
+            let mut db = InstalledDb::default();
+            let body = format!("PNG-{kind}").into_bytes();
+            let base = spawn_stub(body.clone());
+            let mut a = asset(&format!("/asset-{kind}.png"), &digest_b64(&body));
+            a.kind = Some(kind.into());
+
+            let out = install_asset(&ag, &repo(&base), &a, &mut db, false).unwrap();
+            let dest = match out {
+                InstallOutcome::Installed { path } => path,
+                other => panic!("expected Installed for {kind}, got {other:?}"),
+            };
+            let unix = format!("global/images/{dir}/asset-{kind}.png");
+            let win = unix.replace('/', "\\");
+            assert!(
+                dest.ends_with(&unix) || dest.ends_with(&win),
+                "{kind}: {}",
+                dest.display()
+            );
+            assert_eq!(db.get(&format!("asset-{kind}.png")).unwrap().kind, kind);
+        }
+
+        std::env::remove_var("VELLUM_FE_DIR");
+    }
+
+    #[test]
+    fn install_unknown_kind_with_pool_tag_lands_in_named_pool() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let cfg = tempfile::tempdir().unwrap();
+        std::env::set_var("VELLUM_FE_DIR", cfg.path());
+
+        let ag = agent().unwrap();
+        let mut db = InstalledDb::default();
+        let body = b"BANNERPNG".to_vec();
+        let base = spawn_stub(body.clone());
+        let mut a = asset("/parade.png", &digest_b64(&body));
+        a.kind = Some("banner".into());
+        a.vellum = Some(crate::core::jinx::protocol::VellumMeta {
+            pool: Some("banners".into()),
+            ..Default::default()
+        });
+
+        let out = install_asset(&ag, &repo(&base), &a, &mut db, false).unwrap();
+        let dest = match out {
+            InstallOutcome::Installed { path } => path,
+            other => panic!("expected Installed, got {other:?}"),
+        };
+        assert!(
+            dest.ends_with("global/images/banners/parade.png")
+                || dest.ends_with("global\\images\\banners\\parade.png"),
+            "{}",
+            dest.display()
+        );
+
+        // Same kind without the pool tag: refused (not installable).
+        let mut bare = asset("/parade2.png", &digest_b64(&body));
+        bare.kind = Some("banner".into());
+        assert!(install_asset(&ag, &repo(&base), &bare, &mut db, false).is_err());
 
         std::env::remove_var("VELLUM_FE_DIR");
     }

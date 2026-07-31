@@ -9,6 +9,10 @@ use eframe::egui;
 
 pub(in super::super) struct IndicatorTemplatesEditorState {
     entries: Vec<EntryBuffer>,
+    /// Indicator id being typed into the "add icon override" row.
+    new_override_id: String,
+    /// Indicator id being typed into the "add grayscale exception" row.
+    new_gray_id: String,
     error: Option<String>,
 }
 
@@ -88,6 +92,8 @@ impl VellumGuiApp {
             .collect();
         self.indicator_templates_editor = Some(IndicatorTemplatesEditorState {
             entries,
+            new_override_id: String::new(),
+            new_gray_id: String::new(),
             error: None,
         });
     }
@@ -101,8 +107,44 @@ impl VellumGuiApp {
         let mut save_request = false;
         let mut remove_index: Option<usize> = None;
 
+        // GUI icon art inputs, gathered up front; changes collected in the
+        // closure and applied to ui_settings afterwards.
+        let icon_sets = crate::config::pool::set_names("statusicons");
+        let pool_images: Vec<(String, String)> =
+            crate::config::pool::list_category("statusicons")
+                .iter()
+                .map(|image| (image.pool_path.clone(), image.stem().to_string()))
+                .collect();
+        let art = self.skin_state.widget_art();
+        let sheets: Vec<String> = art.as_ref().map(|a| a.sheet_names()).unwrap_or_default();
+        let current_set = self.ui_settings.status_icons.set.clone();
+        let mut sorted_overrides: Vec<(String, crate::data::IconRef)> = self
+            .ui_settings
+            .status_icons
+            .overrides
+            .iter()
+            .map(|(id, icon)| (id.clone(), icon.clone()))
+            .collect();
+        sorted_overrides.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut set_change: Option<Option<String>> = None;
+        // (id, Some(new)) = upsert; (id, None) = remove.
+        let mut override_changes: Vec<(String, Option<crate::data::IconRef>)> = Vec::new();
+        let current_gray = self.ui_settings.status_icons.gray_inactive;
+        let mut gray_change: Option<bool> = None;
+        let mut sorted_gray_overrides: Vec<(String, bool)> = self
+            .ui_settings
+            .status_icons
+            .gray_overrides
+            .iter()
+            .map(|(id, on)| (id.clone(), *on))
+            .collect();
+        sorted_gray_overrides.sort_by(|a, b| a.0.cmp(&b.0));
+        // (id, Some(on)) = upsert; (id, None) = back to the global toggle.
+        let mut gray_override_changes: Vec<(String, Option<bool>)> = Vec::new();
+
         egui::Window::new("Indicator Templates")
             .id(egui::Id::new("gui_indicator_templates"))
+            .order(egui::Order::Foreground)
             .open(&mut open)
             .default_width(520.0)
             .default_height(420.0)
@@ -159,10 +201,182 @@ impl VellumGuiApp {
                             });
                     });
 
+                ui.separator();
+                ui.strong("GUI icon art");
+                ui.weak(
+                    "Pool sets and per-indicator icons; the Icon column above is the TUI glyph.",
+                );
+                ui.horizontal(|ui| {
+                    ui.label("Icon set");
+                    let selected = current_set.as_deref().unwrap_or("None");
+                    egui::ComboBox::from_id_salt("statusicon_set")
+                        .selected_text(selected)
+                        .show_ui(ui, |ui| {
+                            if ui.selectable_label(current_set.is_none(), "None").clicked() {
+                                set_change = Some(None);
+                            }
+                            for set in &icon_sets {
+                                let is_current = current_set.as_deref() == Some(set.as_str());
+                                if ui.selectable_label(is_current, set).clicked() {
+                                    set_change = Some(Some(set.clone()));
+                                }
+                            }
+                        });
+                    if icon_sets.is_empty() {
+                        ui.weak("(no sets in the pool — install with .jinx)");
+                    }
+                });
+                let mut gray = current_gray;
+                if ui
+                    .checkbox(&mut gray, "Grayscale when inactive")
+                    .on_hover_text(
+                        "Inactive statuses show a desaturated copy of their icon instead of \
+                         fading it. Grayscale copies are built only while this is on.",
+                    )
+                    .changed()
+                {
+                    gray_change = Some(gray);
+                }
+                // Per-indicator exceptions to the grayscale toggle.
+                for (id, on) in &sorted_gray_overrides {
+                    ui.horizontal(|ui| {
+                        ui.monospace(id);
+                        let mut on = *on;
+                        egui::ComboBox::from_id_salt(format!("statusicon_gray_{id}"))
+                            .width(140.0)
+                            .selected_text(if on { "Grayscale" } else { "Alpha dim" })
+                            .show_ui(ui, |ui| {
+                                if ui.selectable_label(on, "Grayscale").clicked() && !on {
+                                    on = true;
+                                    gray_override_changes.push((id.clone(), Some(true)));
+                                }
+                                if ui.selectable_label(!on, "Alpha dim").clicked() && on {
+                                    on = false;
+                                    gray_override_changes.push((id.clone(), Some(false)));
+                                }
+                            });
+                        if ui
+                            .small_button("✕")
+                            .on_hover_text("Follow the global toggle again")
+                            .clicked()
+                        {
+                            gray_override_changes.push((id.clone(), None));
+                        }
+                    });
+                }
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut state.new_gray_id)
+                            .hint_text("indicator id for a grayscale exception")
+                            .desired_width(160.0),
+                    );
+                    if ui.button("Add grayscale exception").clicked()
+                        && !state.new_gray_id.trim().is_empty()
+                    {
+                        // Exceptions start as the opposite of the global
+                        // toggle — that's why you'd add one.
+                        gray_override_changes.push((
+                            state.new_gray_id.trim().to_ascii_uppercase(),
+                            Some(!current_gray),
+                        ));
+                        state.new_gray_id.clear();
+                    }
+                });
+                for (id, icon) in &sorted_overrides {
+                    ui.horizontal(|ui| {
+                        ui.monospace(id);
+                        match super::icon_ref_picker(
+                            ui,
+                            format!("statusicon_override_{id}"),
+                            Some(icon),
+                            &pool_images,
+                            &sheets,
+                            None,
+                            Some("Default"),
+                            Some("None (hidden)"),
+                        ) {
+                            Some(super::IconRefPick::Ref(picked)) => {
+                                override_changes.push((id.clone(), Some(picked)));
+                            }
+                            Some(super::IconRefPick::Unset) | None => {}
+                        }
+                        if let crate::data::IconRef::SheetCell { sheet, cell } = icon {
+                            let max = art
+                                .as_ref()
+                                .and_then(|a| a.sheet_cell_count(sheet))
+                                .unwrap_or(u32::MAX)
+                                .max(1);
+                            let mut value = *cell;
+                            if ui
+                                .add(egui::DragValue::new(&mut value).range(1..=max).prefix("#"))
+                                .changed()
+                            {
+                                override_changes.push((
+                                    id.clone(),
+                                    Some(crate::data::IconRef::SheetCell {
+                                        sheet: sheet.clone(),
+                                        cell: value,
+                                    }),
+                                ));
+                            }
+                        }
+                        if ui.small_button("✕").clicked() {
+                            override_changes.push((id.clone(), None));
+                        }
+                    });
+                }
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut state.new_override_id)
+                            .hint_text("indicator id (e.g. STUNNED)")
+                            .desired_width(160.0),
+                    );
+                    if ui.button("Add icon override").clicked()
+                        && !state.new_override_id.trim().is_empty()
+                    {
+                        override_changes.push((
+                            state.new_override_id.trim().to_ascii_uppercase(),
+                            Some(crate::data::IconRef::Default),
+                        ));
+                        state.new_override_id.clear();
+                    }
+                });
+
                 if let Some(error) = &state.error {
                     ui.colored_label(ui.visuals().error_fg_color, error);
                 }
             });
+
+        if let Some(set) = set_change {
+            self.ui_settings.status_icons.set = set;
+            self.layout_dirty = true;
+        }
+        if let Some(gray) = gray_change {
+            self.ui_settings.status_icons.gray_inactive = gray;
+            self.layout_dirty = true;
+        }
+        for (id, change) in gray_override_changes {
+            match change {
+                Some(on) => {
+                    self.ui_settings.status_icons.gray_overrides.insert(id, on);
+                }
+                None => {
+                    self.ui_settings.status_icons.gray_overrides.remove(&id);
+                }
+            }
+            self.layout_dirty = true;
+        }
+        for (id, change) in override_changes {
+            match change {
+                Some(icon) => {
+                    self.ui_settings.status_icons.overrides.insert(id, icon);
+                }
+                None => {
+                    self.ui_settings.status_icons.overrides.remove(&id);
+                }
+            }
+            self.layout_dirty = true;
+        }
 
         if let Some(index) = remove_index {
             if index < state.entries.len() {

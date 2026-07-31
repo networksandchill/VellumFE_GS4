@@ -58,6 +58,8 @@
   - [Sound Alerts](./customization/sounds.md)
   - [Themes](./customization/themes.md)
   - [Skins (GUI Graphics)](./customization/skins.md)
+  - [Generating Skin Art with AI](./customization/skin-art-prompts.md)
+  - [Submitting Art to the Community Repo](./customization/submitting-art.md)
 
 ---
 
