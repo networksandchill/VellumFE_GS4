@@ -178,7 +178,10 @@ impl ConfigSyncSnapshot {
 pub(crate) struct WindowOrderCache {
     /// Sorted names with ephemeral windows, then performance_overlay, at the end
     pub render_order: Vec<String>,
-    /// Window name -> position in render_order (z-index for selection logic)
+    /// Window name -> position in the plain sorted name list. This is the
+    /// selection identity token, NOT a position in render_order — the two
+    /// differ because render_order shuffles command_input, ephemerals, and
+    /// the perf overlay to the end for z-order.
     pub render_index: std::collections::HashMap<String, usize>,
     /// Ephemeral membership snapshot used for the validity check
     ephemeral: Vec<String>,
@@ -209,6 +212,18 @@ impl WindowOrderCache {
         let mut order: Vec<String> = ui_state.windows.keys().cloned().collect();
         order.sort();
 
+        // Selection identity is the position in the plain sorted name list.
+        // It must be captured here, before the z-order shuffling below: the
+        // mouse handler derives the same number by binary-searching its own
+        // sorted name list, and a selection only highlights when the two
+        // agree. (Copy-to-clipboard keys off window_name, so a mismatch shows
+        // up as "the copy works but nothing looks selected".)
+        self.render_index = order
+            .iter()
+            .enumerate()
+            .map(|(idx, name)| (name.clone(), idx))
+            .collect();
+
         // The command input always renders above regular windows (typed text
         // must not be overwritten by overlapping widgets, e.g. a roundtime
         // bar sharing its row); ephemeral windows/popups still go above it.
@@ -231,11 +246,6 @@ impl WindowOrderCache {
             order.push(overlay);
         }
 
-        self.render_index = order
-            .iter()
-            .enumerate()
-            .map(|(idx, name)| (name.clone(), idx))
-            .collect();
         self.render_order = order;
         self.ephemeral = ephemeral;
     }
@@ -513,5 +523,78 @@ impl TuiFrontend {
         backend.flush()?;
         tracing::info!("Reset terminal palette to defaults");
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod window_order_cache_tests {
+    use super::WindowOrderCache;
+    use crate::data::ui_state::UiState;
+    use crate::data::window::WindowState;
+
+    fn ui_with(names: &[&str]) -> UiState {
+        let mut ui = UiState::new();
+        for name in names {
+            ui.windows
+                .insert((*name).to_string(), WindowState::new_text(*name, 100));
+        }
+        ui
+    }
+
+    /// The mouse handler identifies the selected window by binary-searching a
+    /// plain sorted name list; the renderer looks the same number up in
+    /// render_index. If these drift, selections copy but never highlight.
+    fn assert_matches_sorted_convention(ui: &UiState) {
+        let mut sorted: Vec<String> = ui.windows.keys().cloned().collect();
+        sorted.sort();
+
+        let mut cache = WindowOrderCache::default();
+        cache.refresh(ui);
+
+        for name in &sorted {
+            let input_side = sorted.binary_search(name).unwrap();
+            let render_side = cache.render_index.get(name).copied();
+            assert_eq!(
+                render_side,
+                Some(input_side),
+                "index for '{name}' disagrees between mouse and render sides"
+            );
+        }
+    }
+
+    #[test]
+    fn selection_index_survives_command_input_z_reorder() {
+        // "command_input" sorts early but renders last; every window after it
+        // would shift by one if the index were taken from render_order.
+        let ui = ui_with(&["command_input", "main", "thoughts", "alpha"]);
+        assert_matches_sorted_convention(&ui);
+    }
+
+    #[test]
+    fn selection_index_survives_ephemeral_and_overlay_reorder() {
+        let mut ui = ui_with(&[
+            "command_input",
+            "main",
+            "performance_overlay",
+            "popup",
+            "zebra",
+        ]);
+        ui.ephemeral_windows.insert("popup".to_string());
+        assert_matches_sorted_convention(&ui);
+    }
+
+    #[test]
+    fn render_order_still_puts_chrome_on_top() {
+        let mut ui = ui_with(&["command_input", "main", "performance_overlay", "popup"]);
+        ui.ephemeral_windows.insert("popup".to_string());
+
+        let mut cache = WindowOrderCache::default();
+        cache.refresh(&ui);
+
+        let order = &cache.render_order;
+        let pos = |n: &str| order.iter().position(|w| w == n).unwrap();
+        assert!(pos("main") < pos("command_input"));
+        assert!(pos("command_input") < pos("popup"));
+        assert_eq!(order.last().unwrap(), "performance_overlay");
     }
 }
