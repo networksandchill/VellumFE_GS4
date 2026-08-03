@@ -810,6 +810,30 @@ async fn async_run(
                     } => {
                         app_core.handle_remote_colors_put(client_id, request_id, scope, colors);
                     }
+                    crate::core::remote::RemoteEvent::TouchWheelGet {
+                        client_id,
+                        request_id,
+                        scope,
+                    } => {
+                        app_core.handle_remote_touch_wheel_get(client_id, request_id, scope);
+                    }
+                    crate::core::remote::RemoteEvent::TouchWheelPut {
+                        client_id,
+                        request_id,
+                        scope,
+                        slices,
+                    } => {
+                        app_core.handle_remote_touch_wheel_put(client_id, request_id, scope, slices);
+                    }
+                    crate::core::remote::RemoteEvent::WebUiSubscribe { page } => {
+                        app_core.webui_subscribe(&page);
+                    }
+                    crate::core::remote::RemoteEvent::WebUiUnsubscribe { page } => {
+                        app_core.webui_unsubscribe(&page);
+                    }
+                    crate::core::remote::RemoteEvent::WebUiEvent { page, cid, value } => {
+                        app_core.webui_send_event(page, cid, value);
+                    }
                     crate::core::remote::RemoteEvent::MapLocations {
                         client_id,
                         request_id,
@@ -901,13 +925,11 @@ async fn async_run(
                     app_core
                         .perf_stats
                         .record_bytes_received((line.len() + 1) as u64);
-                    let parse_start = Instant::now();
-                    // Process incoming server data through parser
+                    // Process incoming server data through parser (parse
+                    // timing is recorded inside process_server_data).
                     if let Err(e) = app_core.process_server_data(&line) {
                         tracing::error!("Error processing server data: {}", e);
                     }
-                    let parse_duration = parse_start.elapsed();
-                    app_core.perf_stats.record_parse(parse_duration);
 
                     // Adjust content-driven window sizes (e.g., Betrayer auto-resize)
                     app_core.adjust_content_driven_windows();

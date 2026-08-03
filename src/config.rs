@@ -35,25 +35,28 @@ mod widgets;
 mod window_def;
 
 pub use colors::{
-    ColorConfig, PaletteColor, PresetColor, PromptColor, SpellColorRange, SpellColorStyle,
-    UiColors,
+    ColorConfig, HarmonyRecipe, PaletteColor, PresetColor, PromptColor, SpellColorRange,
+    SpellColorStyle, UiColors,
 };
 pub use highlights::{
     highlight_web_fields, EventAction, EventPattern, HighlightPattern, RedirectMode,
 };
-pub use conditions::{Cmp, Condition, EffectCategory, HandSlot, NameMatch, VitalKind, VitalUnit};
+pub use conditions::{
+    Cmp, Condition, EffectCategory, HandSlot, NameMatch, VitalKind, VitalUnit, INJURY_AREAS,
+};
 pub use hotbars::{
     GradientDir, HotbarButton, HotbarButtonState, HotbarCountdownSource, HotbarDef, HotbarIcon,
     HotbarStyle, HotbarsConfig, IconMode,
 };
 pub use keybinds::{
-    parse_key_string, validate_wheel_spans, AppKeybinds, KeyAction, KeyBindAction, MacroAction,
-    MenuKeybindField, MenuKeybinds, RumbleConfig, RumblePattern, TuningConfig, WheelMeta,
-    WheelSlice, WheelSpanIssue, WHEEL_MIN_SPAN_DEG,
+    parse_key_string, touch_wheel_action_catalog, validate_wheel_spans, AppKeybinds, KeyAction,
+    KeyBindAction, MacroAction, MenuKeybindField, MenuKeybinds, RumbleConfig, RumblePattern,
+    TuningConfig, WheelMeta, WheelSlice, WheelSpanIssue, TOUCH_WHEEL_CLIENT_ACTIONS,
+    WHEEL_MIN_SPAN_DEG,
 };
 pub use layout::{ContentAlign, Layout, LayoutConfig};
 pub use macros::{MacroButton, MacroGroup, MacroOption, MacrosConfig};
-pub use paths::{write_atomic, DialogPosition, SavedDialogPositions};
+pub use paths::{is_valid_layout_name, write_atomic, DialogPosition, SavedDialogPositions};
 #[cfg(test)]
 pub use paths::VELLUM_FE_DIR_TEST_LOCK;
 pub use settings::{
@@ -61,12 +64,13 @@ pub use settings::{
     SorterConfig, SorterRule, SoundConfig, StreamRoute, StreamsConfig, TargetListConfig,
     TtsConfig, TtsSubstitution, UiConfig, WebConfig,
 };
-pub use templates::{IndicatorTemplateEntry, IndicatorTemplateStore};
+pub use templates::{IndicatorTemplateEntry, IndicatorTemplateStore, StatusIconState};
 pub use widgets::{
     apply_compiled_text_replacements, compile_text_replacements, default_minivitals_bar_order,
     ActiveEffectsWidgetData, BetrayerWidgetData, BorderSides, CommandInputWidgetData,
     CompassWidgetData, CompiledTextReplacement, ContainerWidgetData, CountdownWidgetData,
-    DashboardIndicatorDef, DashboardWidgetData, DialogPanelWidgetData, EncumbranceWidgetData,
+    DashboardIndicatorDef, DashboardLayout, DashboardWidgetData, DialogPanelWidgetData,
+    EncumbranceWidgetData,
     ExperienceWidgetData,
     GS4ExperienceWidgetData, HandIconState, HandWidgetData, HotkeybarWidgetData, IndicatorWidgetData,
     InjuryDollWidgetData, InventoryWidgetData, ItemsWidgetData, MapWidgetData,
@@ -286,6 +290,12 @@ pub struct Config {
     pub controller_wheel: Vec<WheelSlice>,
     #[serde(skip)] // Loaded from [controller_wheels.<name>] (named radial wheels)
     pub controller_wheels: HashMap<String, Vec<WheelSlice>>,
+    /// The phone's touch radial wheel (long-press navigation). Loaded from
+    /// touch_wheel.toml (per-character, roams); shipped to the phone as the
+    /// named "touch" wheel and editable from both frontends. Slices carry a
+    /// `client` action (open a window, focus input) or a game `command`.
+    #[serde(skip)]
+    pub touch_wheel: Vec<WheelSlice>,
     #[serde(skip)] // Loaded from [controller_wheels_meta.<name>] (per-wheel button/stick)
     pub controller_wheels_meta: HashMap<String, WheelMeta>,
     #[serde(skip)] // Loaded from [controller_overlay] (curated HUD legend entries)

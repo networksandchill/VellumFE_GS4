@@ -50,6 +50,7 @@ mod room_window_ops;
 mod runtime;
 mod scrollable_container;
 mod search;
+pub mod pack_editor;
 pub mod settings_editor;
 mod spacer;
 pub mod menu_keybind_editor;
@@ -125,6 +126,8 @@ pub struct TuiFrontend {
     pub settings_editor: Option<settings_editor::SettingsEditor>,
     /// Window whose map pane is being click-hold dragged (pan), if any
     map_drag_window: Option<String>,
+    /// Active pack editor (.packs) for export/import of UI packs
+    pub pack_editor: Option<pack_editor::PackEditorWidget>,
     /// Debouncer for terminal resize events (100ms debounce)
     resize_debouncer: ResizeDebouncer,
     /// Theme cache to avoid HashMap lookup + clone every render
@@ -299,6 +302,7 @@ impl TuiFrontend {
             theme_editor: None,
             settings_editor: None,
             map_drag_window: None,
+            pack_editor: None,
             resize_debouncer: ResizeDebouncer::new(300), // 300ms debounce
             theme_cache: ThemeCache::new(),
             window_order_cache: WindowOrderCache::default(),

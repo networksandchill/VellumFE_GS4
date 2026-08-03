@@ -6,7 +6,9 @@ mod colors;
 #[cfg(feature = "gamepad")]
 mod controller;
 mod custom_windows;
+mod dashboard;
 mod doll_calibration;
+mod jinx;
 mod hand_icons;
 mod highlights;
 mod hotbars;
@@ -14,16 +16,20 @@ mod indicators;
 mod keybinds;
 mod known_windows;
 mod menu_keybinds;
+mod packs;
 mod settings;
 mod sorter;
 mod themes;
+mod touch_wheel;
 mod windows;
 
 pub(super) use colors::ColorsEditorState;
 #[cfg(feature = "gamepad")]
 pub(super) use controller::ControllerEditorState;
 pub(super) use custom_windows::CustomWindowsEditorState;
+pub(super) use dashboard::DashboardEditorState;
 pub(super) use doll_calibration::DollCalibrationState;
+pub(super) use jinx::JinxPanelState;
 pub(super) use hand_icons::HandIconsEditorState;
 pub(super) use highlights::HighlightEditorState;
 pub(super) use hotbars::HotbarEditorState;
@@ -31,9 +37,11 @@ pub(super) use indicators::IndicatorTemplatesEditorState;
 pub(super) use keybinds::KeybindEditorState;
 pub(super) use known_windows::KnownWindowsEditorState;
 pub(super) use menu_keybinds::MenuKeybindEditorState;
+pub(super) use packs::PackEditorState;
 pub(super) use settings::SettingsEditorState;
 pub(super) use sorter::SorterEditorState;
 pub(super) use themes::{ThemeBrowserState, ThemeEditorState};
+pub(super) use touch_wheel::TouchWheelEditorState;
 pub(super) use windows::WindowEditorState;
 
 use super::{theme, VellumGuiApp};
@@ -75,8 +83,12 @@ impl VellumGuiApp {
         self.render_hand_icons_editor(ctx);
         self.render_custom_windows_editor(ctx);
         self.render_known_windows_editor(ctx);
+        self.render_dashboard_editor(ctx);
+        self.render_jinx_panel(ctx);
         self.render_sorter_editor(ctx);
+        self.render_touch_wheel_editor(ctx);
         self.render_doll_calibration(ctx);
+        self.render_pack_editor(ctx);
     }
 }
 
@@ -177,6 +189,74 @@ pub(super) fn icon_ref_picker(
             }
         });
     picked
+}
+
+/// A clickable thumbnail grid of a sheet's cells (barbar-style "Browse
+/// Icons"): renders every cell, highlights the current one, and writes the
+/// clicked cell into `current_cell`. Returns true when the selection
+/// changed. Shared by the hotbar and indicator editors so both pick sheet
+/// cells visually instead of guessing a number.
+pub(super) fn sheet_cell_grid(
+    ui: &mut egui::Ui,
+    id_salt: &str,
+    sheet: &str,
+    current_cell: &mut u32,
+    art: &crate::frontend::gui::skin::SkinWidgetArt,
+    count: u32,
+    grayscale: bool,
+) -> bool {
+    const THUMB: f32 = 36.0;
+    const PER_ROW: u32 = 8;
+    let mut changed = false;
+    egui::ScrollArea::vertical()
+        .id_salt(format!("{id_salt}_cell_grid_scroll"))
+        .max_height(3.5 * (THUMB + 6.0))
+        .show(ui, |ui| {
+            let rows = count.div_ceil(PER_ROW);
+            for row in 0..rows {
+                ui.horizontal(|ui| {
+                    for col in 0..PER_ROW {
+                        let cell = row * PER_ROW + col + 1;
+                        if cell > count {
+                            break;
+                        }
+                        let Some((texture, uv)) = art.sheet_cell(sheet, cell, grayscale) else {
+                            continue;
+                        };
+                        let (rect, response) = ui
+                            .allocate_exact_size(egui::vec2(THUMB, THUMB), egui::Sense::click());
+                        if ui.is_rect_visible(rect) {
+                            ui.painter().image(
+                                texture.texture,
+                                rect,
+                                uv,
+                                egui::Color32::WHITE,
+                            );
+                            let selected = *current_cell == cell;
+                            if selected || response.hovered() {
+                                let stroke = if selected {
+                                    egui::Stroke::new(2.0, ui.visuals().selection.stroke.color)
+                                } else {
+                                    ui.visuals().widgets.hovered.bg_stroke
+                                };
+                                ui.painter().rect_stroke(
+                                    rect,
+                                    2.0,
+                                    stroke,
+                                    egui::StrokeKind::Inside,
+                                );
+                            }
+                        }
+                        let response = response.on_hover_text(format!("cell {}", cell));
+                        if response.clicked() && *current_cell != cell {
+                            *current_cell = cell;
+                            changed = true;
+                        }
+                    }
+                });
+            }
+        });
+    changed
 }
 
 /// Pool images of one category as (pool-relative path, display stem) rows

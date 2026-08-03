@@ -171,6 +171,11 @@ impl Default for RemoteWheelTuning {
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct RemoteWheelSlice {
     pub label: String,
+    /// Client-side action for the touch wheel (`open:room`, `focus:input`,
+    /// …). Ships to the phone (safe UI verb); game commands never do — they
+    /// resolve server-side by index. Absent on gamepad-wheel slices.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub color: Option<String>,
     /// Explicit wedge width in degrees; absent = an even share of the
@@ -196,6 +201,7 @@ impl RemoteWheels {
                 .iter()
                 .map(|slice| RemoteWheelSlice {
                     label: slice.label.clone(),
+                    client: slice.client.clone(),
                     color: slice
                         .color
                         .as_deref()
@@ -213,11 +219,21 @@ impl RemoteWheels {
                 .wheel_level_slices("", &[])
                 .map(|slices| wire_slices(config, slices))
                 .unwrap_or_default(),
-            named: config
-                .controller_wheels
-                .iter()
-                .map(|(name, slices)| (name.clone(), wire_slices(config, slices)))
-                .collect(),
+            named: {
+                let mut named: std::collections::HashMap<String, Vec<RemoteWheelSlice>> = config
+                    .controller_wheels
+                    .iter()
+                    .map(|(name, slices)| (name.clone(), wire_slices(config, slices)))
+                    .collect();
+                // The phone's touch wheel rides along as the reserved "touch"
+                // named wheel (the client already prefers named.touch). Only
+                // shipped when configured — an empty touch_wheel lets the
+                // client fall back to its built-in default.
+                if !config.touch_wheel.is_empty() {
+                    named.insert("touch".to_string(), wire_slices(config, &config.touch_wheel));
+                }
+                named
+            },
             tuning: RemoteWheelTuning {
                 movement_stick: t.movement_stick.clone(),
                 back_slice: t.back_slice.clone(),
@@ -334,6 +350,11 @@ pub struct RemoteSessionInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     pub session_control: bool,
+    /// True when Lich WebUI is reachable (a Lich-attached session). The phone
+    /// shows its WebUI affordance only when this is set — a direct eAccess
+    /// connection has no Lich, so no WebUI. Defaults false.
+    #[serde(default)]
+    pub webui_available: bool,
 }
 
 /// A state change broadcast to all connected remote clients.
@@ -347,6 +368,8 @@ pub enum RemoteDelta {
         /// Room number when known (nav tag in direct mode, extracted from
         /// the room name under Lich).
         id: Option<String>,
+        /// Room description prose as styled lines (color + scenery links).
+        description: Vec<crate::data::widget::StyledLine>,
     },
     Hands {
         left: Option<String>,
@@ -374,6 +397,8 @@ pub enum RemoteDelta {
     /// Active effects changed (spells/buffs/debuffs/cooldowns), in fixed
     /// category order.
     Effects(Vec<crate::data::ActiveEffectsContent>),
+    /// The full spellbook ("Spells" stream) changed, as styled lines.
+    Spells(Vec<crate::data::widget::StyledLine>),
     /// Body-part injuries changed: id -> level (1-3 wounds, 4-6 scars);
     /// cleared parts are absent.
     Injuries(std::collections::HashMap<String, u8>),
@@ -431,6 +456,18 @@ pub enum RemoteDelta {
         error: Option<String>,
         saved: bool,
     },
+    /// Reply to one client's touch-wheel get/put (addressed). `slices` is the
+    /// wheel's slice list (Null on put replies); `catalog` is the client-
+    /// action vocabulary the editor renders from; `saved` marks a write.
+    TouchWheel {
+        client_id: u64,
+        request_id: u64,
+        scope: String,
+        slices: serde_json::Value,
+        catalog: serde_json::Value,
+        error: Option<String>,
+        saved: bool,
+    },
     /// Reply to one client's structured highlight get/put/delete: the full
     /// rule map for the scope (or an error), plus the available sound
     /// files for the editor's dropdown.
@@ -465,6 +502,24 @@ pub enum RemoteDelta {
         error: Option<String>,
         saved: bool,
     },
+    /// A Lich WebUI page's component tree changed. Broadcast to every client
+    /// (the phone renders only pages it has subscribed to). `tree` is the
+    /// serialized WebUiNode; `seq` orders renders so stale ones drop.
+    WebUiRender {
+        page: String,
+        seq: u64,
+        tree: crate::data::webui::WebUiNode,
+    },
+    /// The registered-page list changed (script registered/unregistered a
+    /// page). The phone updates its WebUI page picker.
+    WebUiPages(Vec<crate::data::webui::WebUiPageDescriptor>),
+    /// A WebUI page ended (script exited / page replaced).
+    WebUiPageClosed { page: String },
+    /// A WebUI notice ("info" | "warn" | "error") for the user.
+    WebUiNotice { level: String, text: String },
+    /// The WebUI bridge connected or dropped; the phone shows/clears a
+    /// "connecting…" state and re-subscribes on reconnect.
+    WebUiConnected { connected: bool },
 }
 
 /// Input from a remote client, drained by the active frontend's main loop
@@ -630,6 +685,32 @@ pub enum RemoteEvent {
         scope: String,
         colors: serde_json::Value,
     },
+    /// Fetch the touch wheel's slices + the client-action vocabulary catalog.
+    TouchWheelGet {
+        client_id: u64,
+        request_id: u64,
+        scope: String,
+    },
+    /// Validate and write the touch wheel's slice list, then hot-reload and
+    /// re-broadcast the `wheels` message so the change applies live.
+    TouchWheelPut {
+        client_id: u64,
+        request_id: u64,
+        scope: String,
+        slices: serde_json::Value,
+    },
+    /// A phone client subscribed to a Lich WebUI page (opened its panel):
+    /// core forwards a `subscribe` to Lich so renders start flowing.
+    WebUiSubscribe { page: String },
+    /// A phone client closed a WebUI panel: core `unsubscribe`s from Lich.
+    WebUiUnsubscribe { page: String },
+    /// A phone WebUI interaction (button/input/row): core forwards it to
+    /// Lich as a `WebUiClientMessage::Event`. `value` is component-specific.
+    WebUiEvent {
+        page: String,
+        cid: String,
+        value: serde_json::Value,
+    },
 }
 
 /// Latest coalesced game state, published via `watch` so the server can
@@ -643,6 +724,9 @@ pub struct RemoteStateSnapshot {
     /// (nav/lich ids live on AppCore, not GameState).
     pub room_id: Option<String>,
     pub exits: Vec<String>,
+    /// Room description prose as styled lines (color + clickable scenery
+    /// links) so remote clients get the full room "look" without a window.
+    pub room_description: Vec<crate::data::widget::StyledLine>,
     pub left_hand: Option<String>,
     pub right_hand: Option<String>,
     pub indicators: StatusInfo,
@@ -651,6 +735,10 @@ pub struct RemoteStateSnapshot {
     pub server_time: i64,
     /// Active effects in fixed category order (empty categories omitted).
     pub effects: Vec<crate::data::ActiveEffectsContent>,
+    /// Full spellbook (the "Spells" stream) as styled lines (spell colors +
+    /// links), so remote clients get the whole active-spell list without a
+    /// Spells window.
+    pub spellbook: Vec<crate::data::widget::StyledLine>,
     /// Body-part injuries: id -> level (1-3 wounds, 4-6 scars).
     pub injuries: std::collections::HashMap<String, u8>,
     /// Targetable creatures in the room (tap-to-target list).
@@ -666,6 +754,10 @@ pub struct RemoteStateSnapshot {
     /// Session status + session-control capability. Overlaid by the sink in
     /// `flush_state` (the sink owns it, not GameState).
     pub session: RemoteSessionInfo,
+    /// Lich WebUI registered pages (overlaid by the sink). Empty when no
+    /// Lich WebUI, so it costs nothing on the wire for direct sessions.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub webui_pages: Vec<crate::data::webui::WebUiPageDescriptor>,
     /// Drawable map scene (overlaid by AppCore::flush_remote_state — the
     /// map lives on AppCore, not GameState). Pointer-compared.
     pub map_scene: RemoteMapSceneRef,
@@ -877,6 +969,7 @@ impl RemoteStateSnapshot {
             room_name: game_state.room_name.clone(),
             room_id: game_state.room_id.clone(),
             exits: game_state.exits.clone(),
+            room_description: game_state.room_description.clone(),
             left_hand: game_state.left_hand.clone(),
             right_hand: game_state.right_hand.clone(),
             indicators: game_state.status.clone(),
@@ -888,6 +981,7 @@ impl RemoteStateSnapshot {
                 .filter_map(|category| game_state.effects.get(*category))
                 .cloned()
                 .collect(),
+            spellbook: game_state.spellbook.clone(),
             injuries: game_state.injuries.clone(),
             targets: {
                 // Lich Creature.targets, matching the TUI/GUI widgets: a room
@@ -980,6 +1074,7 @@ impl RemoteStateSnapshot {
                 info
             },
             session: RemoteSessionInfo::default(),
+            webui_pages: Vec::new(), // overlaid by the sink
             // Overlaid by AppCore::flush_remote_state (the map — and the
             // portal resolution that needs it — live there).
             portals: Vec::new(),
@@ -1022,6 +1117,9 @@ pub struct RemoteSink {
     /// Session status owned by the serving runtime (headless supervisor);
     /// overlaid onto every snapshot/flush.
     session: RemoteSessionInfo,
+    /// Latest Lich WebUI page list, so a connecting client's snapshot carries
+    /// it (broadcasts only reach already-connected clients).
+    webui_pages: Vec<crate::data::webui::WebUiPageDescriptor>,
 }
 
 impl RemoteSink {
@@ -1067,6 +1165,7 @@ impl RemoteSink {
                 bound_port,
                 last: RemoteStateSnapshot::default(),
                 session: RemoteSessionInfo::default(),
+                webui_pages: Vec::new(),
             },
             handles,
             event_rx,
@@ -1083,12 +1182,22 @@ impl RemoteSink {
         }
     }
 
+    /// Set whether Lich WebUI is reachable this session (the sink owns this
+    /// capability flag like session_control; overlaid onto session info).
+    pub fn set_webui_available(&mut self, available: bool) {
+        if self.session.webui_available != available {
+            self.session.webui_available = available;
+            self.publish_session();
+        }
+    }
+
     /// Publish a session status change (state machine transitions in the
     /// headless supervisor). Broadcast immediately — session changes must
     /// not wait for the next game-text batch — and folded into the watch
     /// so connect-time snapshots agree.
     pub fn set_session_state(&mut self, mut info: RemoteSessionInfo) {
         info.session_control = self.session.session_control;
+        info.webui_available = self.session.webui_available;
         if self.session == info {
             return;
         }
@@ -1102,6 +1211,7 @@ impl RemoteSink {
             .send(RemoteDelta::Session(self.session.clone()));
         self.state_tx.send_modify(|snap| {
             snap.session = self.session.clone();
+            snap.webui_pages = self.webui_pages.clone();
         });
         self.last.session = self.session.clone();
     }
@@ -1128,6 +1238,38 @@ impl RemoteSink {
         let wheels = Arc::new(RemoteWheels::from_config(config));
         self.wheels_tx.send_replace(wheels.clone());
         let _ = self.delta_tx.send(RemoteDelta::Wheels(wheels));
+    }
+
+    /// Broadcast a Lich WebUI page render to phone clients.
+    pub fn push_webui_render(
+        &mut self,
+        page: String,
+        seq: u64,
+        tree: crate::data::webui::WebUiNode,
+    ) {
+        let _ = self.delta_tx.send(RemoteDelta::WebUiRender { page, seq, tree });
+    }
+
+    /// Broadcast the WebUI registered-page list to phone clients, and store
+    /// it so a later connect-time snapshot carries it.
+    pub fn push_webui_pages(&mut self, pages: Vec<crate::data::webui::WebUiPageDescriptor>) {
+        self.webui_pages = pages.clone();
+        let _ = self.delta_tx.send(RemoteDelta::WebUiPages(pages));
+    }
+
+    /// Broadcast that a WebUI page ended.
+    pub fn push_webui_page_closed(&mut self, page: String) {
+        let _ = self.delta_tx.send(RemoteDelta::WebUiPageClosed { page });
+    }
+
+    /// Broadcast a WebUI notice to phone clients.
+    pub fn push_webui_notice(&mut self, level: String, text: String) {
+        let _ = self.delta_tx.send(RemoteDelta::WebUiNotice { level, text });
+    }
+
+    /// Broadcast the WebUI bridge's connected state to phone clients.
+    pub fn push_webui_connected(&mut self, connected: bool) {
+        let _ = self.delta_tx.send(RemoteDelta::WebUiConnected { connected });
     }
 
     /// Reply to one client's map-locations request.
@@ -1224,6 +1366,29 @@ impl RemoteSink {
         });
     }
 
+    /// Route a touch-wheel get/put reply to the requesting client.
+    #[allow(clippy::too_many_arguments)]
+    pub fn push_touch_wheel(
+        &mut self,
+        client_id: u64,
+        request_id: u64,
+        scope: String,
+        slices: serde_json::Value,
+        catalog: serde_json::Value,
+        error: Option<String>,
+        saved: bool,
+    ) {
+        let _ = self.delta_tx.send(RemoteDelta::TouchWheel {
+            client_id,
+            request_id,
+            scope,
+            slices,
+            catalog,
+            error,
+            saved,
+        });
+    }
+
     /// Route a structured highlights reply to the requesting client.
     #[allow(clippy::too_many_arguments)]
     pub fn push_highlights(
@@ -1311,6 +1476,7 @@ impl RemoteSink {
         // The sink owns session status; AppCore builds snapshots from
         // GameState which knows nothing about it.
         snap.session = self.session.clone();
+            snap.webui_pages = self.webui_pages.clone();
         if snap == self.last {
             return;
         }
@@ -1321,11 +1487,13 @@ impl RemoteSink {
         if snap.room_name != self.last.room_name
             || snap.exits != self.last.exits
             || snap.room_id != self.last.room_id
+            || snap.room_description != self.last.room_description
         {
             let _ = self.delta_tx.send(RemoteDelta::Room {
                 name: snap.room_name.clone(),
                 exits: snap.exits.clone(),
                 id: snap.room_id.clone(),
+                description: snap.room_description.clone(),
             });
         }
         if snap.left_hand != self.last.left_hand || snap.right_hand != self.last.right_hand {
@@ -1343,6 +1511,11 @@ impl RemoteSink {
             let _ = self
                 .delta_tx
                 .send(RemoteDelta::Effects(snap.effects.clone()));
+        }
+        if snap.spellbook != self.last.spellbook {
+            let _ = self
+                .delta_tx
+                .send(RemoteDelta::Spells(snap.spellbook.clone()));
         }
         if snap.injuries != self.last.injuries {
             let _ = self
@@ -1415,6 +1588,36 @@ mod tests {
             stream: "main".to_string(),
             timestamp: None,
         })
+    }
+
+    #[test]
+    fn touch_wheel_rides_the_wheels_message_as_named_touch() {
+        use crate::config::{Config, WheelSlice};
+        let mut config = Config::default();
+        // A configured touch wheel with a client-action slice + a command
+        // slice; the wheels message must expose it as named["touch"], with
+        // the client action shipped (game commands never ship).
+        config.touch_wheel = vec![
+            WheelSlice { label: "Room".into(), client: Some("open:room".into()), ..Default::default() },
+            WheelSlice { label: "Look".into(), command: "look".into(), ..Default::default() },
+        ];
+        let wheels = RemoteWheels::from_config(&config);
+        let touch = wheels.named.get("touch").expect("touch wheel must be named 'touch'");
+        assert_eq!(touch.len(), 2);
+        assert_eq!(touch[0].label, "Room");
+        assert_eq!(touch[0].client.as_deref(), Some("open:room"), "client action must ship");
+        // The command slice ships its label but never its command (resolves
+        // server-side by index, like every wheel slice).
+        assert_eq!(touch[1].label, "Look");
+        assert_eq!(touch[1].client, None);
+
+        // An empty touch_wheel is NOT injected — the phone falls back to its
+        // built-in default ring.
+        let empty = Config::default();
+        assert!(
+            !RemoteWheels::from_config(&empty).named.contains_key("touch"),
+            "unset touch_wheel must not create a named 'touch' wheel"
+        );
     }
 
     #[test]

@@ -788,7 +788,9 @@ impl VellumGuiApp {
             .id(egui::Id::new("gui_window_editor"))
             .order(egui::Order::Foreground)
             .open(&mut open)
-            .default_width(380.0)
+            // Wide enough for the Tabs grid (Name + Streams + Quiet/TS +
+            // reorder + Remove) so the Name field isn't squeezed to a few chars.
+            .default_width(560.0)
             .show(ctx, |ui| {
                 if state.selected.is_none() {
                     ui.weak("Pick a window to edit.");
@@ -1055,6 +1057,15 @@ impl VellumGuiApp {
                                     }
                                 });
                             ui.end_row();
+                            ui.label("Depleted color")
+                                .on_hover_text("Color of the unfilled portion of each bar.");
+                            // Buffered through a plain string; empty = theme track color.
+                            let mut depleted =
+                                vitals.depleted_color.clone().unwrap_or_default();
+                            super::color_field(ui, &mut depleted);
+                            vitals.depleted_color = Some(depleted.trim().to_string())
+                                .filter(|value| !value.is_empty());
+                            ui.end_row();
                         });
                     ui.label("Bars shown (in display order):");
                     let bars = &mut vitals.bars;
@@ -1263,7 +1274,8 @@ impl VellumGuiApp {
                             for (index, tab) in tabs.iter_mut().enumerate() {
                                 ui.add(
                                     egui::TextEdit::singleline(&mut tab.name)
-                                        .desired_width(130.0),
+                                        .desired_width(120.0)
+                                        .clip_text(false),
                                 );
                                 ui.horizontal(|ui| {
                                     ui.add(

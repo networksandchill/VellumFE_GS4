@@ -72,6 +72,9 @@ pub(super) enum GuiWindowMenuCommand {
     /// Open the hand-icons editor (hand windows): status-driven icon
     /// states (empty hand, held weapon, prepared spell, ...).
     EditHandIcons,
+    /// Open the dashboard editor (dashboard windows): which status ids to
+    /// show plus layout/spacing/hide-inactive.
+    EditDashboard,
     /// Render doll art in grayscale (dots keep their colors).
     SetDollGrayscale(bool),
     /// Global compass art set from the pool; None reverts to the skin's.
@@ -122,6 +125,8 @@ pub(super) enum GuiWindowMenuCommand {
     /// Toggle whether the slot this member opens anchors its content to
     /// the end of the perpendicular axis (bottom of a column).
     ToggleSlotAnchor(TabKey),
+    /// Set a member's relative size weight along the group's stack axis.
+    SetMemberWeight { member: TabKey, weight: f32 },
 }
 
 /// Everything the window context menu needs to render, resolved up front so
@@ -139,6 +144,8 @@ struct WindowMenuView<'a> {
     group_merged: &'a [TabKey],
     /// Slot-opening members whose slot content anchors to the end.
     group_end_anchored: &'a [TabKey],
+    /// Per-member relative size weights (defaults to 1.0 when absent).
+    group_weights: &'a [(TabKey, f32)],
     /// Windows this one could be grouped with (visible, ungrouped).
     group_candidates: &'a [(TabKey, String)],
 }
@@ -207,6 +214,8 @@ pub(super) struct WindowAppearanceView {
     doll_grayscale: bool,
     /// Compass widget: offer the pool compass-set picker.
     is_compass: bool,
+    /// Dashboard widget: offer the "Edit Dashboard…" pop-out.
+    is_dashboard: bool,
     /// Pool compass sets.
     compass_sets: Vec<String>,
     /// Global compass set override; None = skin default.
@@ -367,18 +376,21 @@ impl VellumGuiApp {
                 }
             }
             GuiWindowMenuCommand::Hide => {
-                // Hiding a grouped window hides the whole group; otherwise
-                // the group would keep rendering without its leader.
+                // Hide IS the Windows-window uncheck (one visibility layer):
+                // core WindowVisibility flips, auto-spawn is suppressed, and
+                // the catalog checkbox reflects it. Hiding a grouped window
+                // hides every member — same as unchecking each in the catalog
+                // (which, like this, dissolves the group).
                 let members = self
                     .group_for_tab(&request.tab_key)
                     .map(|group| group.members.clone());
                 match members {
                     Some(members) => {
                         for member in members {
-                            self.hide_tab(member);
+                            self.core_hide_tab(&member);
                         }
                     }
-                    None => self.hide_tab(request.tab_key.clone()),
+                    None => self.core_hide_tab(&request.tab_key.clone()),
                 }
             }
             GuiWindowMenuCommand::Detach => self.detach_tab(request.tab_key.clone()),
@@ -422,6 +434,15 @@ impl VellumGuiApp {
                     .map(|tab| tab.window_name.clone())
                 {
                     self.open_hand_icons_editor(name);
+                }
+            }
+            GuiWindowMenuCommand::EditDashboard => {
+                if let Some(name) = self
+                    .available_tabs
+                    .get(&request.tab_key)
+                    .map(|tab| tab.window_name.clone())
+                {
+                    self.open_dashboard_editor(name);
                 }
             }
             GuiWindowMenuCommand::StartMove => {
@@ -538,6 +559,22 @@ impl VellumGuiApp {
                         group.end_anchored.remove(index);
                     } else {
                         group.end_anchored.push(member);
+                    }
+                    self.layout_dirty = true;
+                }
+            }
+            GuiWindowMenuCommand::SetMemberWeight { member, weight } => {
+                if let Some(group) = self
+                    .tab_groups
+                    .iter_mut()
+                    .find(|group| group.members.contains(&member))
+                {
+                    // Weight 1.0 is the neutral default — drop the entry
+                    // rather than storing it, so a reset-to-1 group serializes
+                    // exactly like a never-weighted one.
+                    group.weights.retain(|(key, _)| *key != member);
+                    if (weight - 1.0).abs() > f32::EPSILON && weight > 0.0 {
+                        group.weights.push((member, weight));
                     }
                     self.layout_dirty = true;
                 }
@@ -806,6 +843,7 @@ impl VellumGuiApp {
             doll_override: self.ui_settings.doll_image.clone(),
             doll_grayscale: self.ui_settings.doll_grayscale,
             is_compass,
+            is_dashboard: widget_type == Some(WidgetType::Dashboard),
             compass_sets,
             compass_override: self.ui_settings.compass_set.clone(),
             hand_icon_override: hand_id.as_ref().and_then(|id| {
@@ -883,9 +921,15 @@ impl VellumGuiApp {
                     .collect()
             })
             .unwrap_or_default();
-        let (group_merged, group_end_anchored) = self
+        let (group_merged, group_end_anchored, group_weights) = self
             .group_for_tab(&request.tab_key)
-            .map(|group| (group.merged.clone(), group.end_anchored.clone()))
+            .map(|group| {
+                (
+                    group.merged.clone(),
+                    group.end_anchored.clone(),
+                    group.weights.clone(),
+                )
+            })
             .unwrap_or_default();
         let view = WindowMenuView {
             zone: request.zone,
@@ -897,6 +941,7 @@ impl VellumGuiApp {
             group_members: &group_members,
             group_merged: &group_merged,
             group_end_anchored: &group_end_anchored,
+            group_weights: &group_weights,
             group_candidates: &group_candidates,
         };
 
@@ -927,6 +972,7 @@ impl VellumGuiApp {
                     | GuiWindowMenuCommand::UngroupMember(_)
                     | GuiWindowMenuCommand::ToggleMemberMerge(_)
                     | GuiWindowMenuCommand::ToggleSlotAnchor(_)
+                    | GuiWindowMenuCommand::SetMemberWeight { .. }
                     | GuiWindowMenuCommand::SetCornerRadius(_)
                     | GuiWindowMenuCommand::SetSkinFrame(_)
                     | GuiWindowMenuCommand::SetDollImage(_)
@@ -1097,6 +1143,34 @@ impl VellumGuiApp {
         self.app_core.ui_state.input_mode = InputMode::Menu;
     }
 
+    /// The Layouts submenu, GUI edition: core's builder lists the TUI's
+    /// TOML cell layouts, which don't apply here, so this lists the GUI's
+    /// JSON checkpoints from the same shared ~/.vellum-fe/layouts/ pool.
+    fn build_gui_layouts_submenu(&self) -> Vec<crate::data::ui_state::PopupMenuItem> {
+        let mut items: Vec<crate::data::ui_state::PopupMenuItem> =
+            list_named_layouts()
+                .into_iter()
+                .map(|name| crate::data::ui_state::PopupMenuItem {
+                    text: name.clone(),
+                    command: format!("action:layout:load:{}", name),
+                    disabled: false,
+                })
+                .collect();
+        if items.is_empty() {
+            items.push(crate::data::ui_state::PopupMenuItem {
+                text: "No layouts found (.savelayout <name>)".to_string(),
+                command: String::new(),
+                disabled: true,
+            });
+        }
+        items.push(crate::data::ui_state::PopupMenuItem {
+            text: "Close menu".to_string(),
+            command: String::new(),
+            disabled: true,
+        });
+        items
+    }
+
     fn handle_popup_menu_command(&mut self, menu_command: GuiMenuCommand) {
         let command = menu_command.command;
 
@@ -1106,12 +1180,17 @@ impl VellumGuiApp {
             // highlights/keybinds/layouts/windows) are built on demand by
             // build_submenu. Try the cache first, then fall back — without
             // the fallback the whole .menu tree is dead in the GUI.
-            let items = self
-                .app_core
-                .menu_categories
-                .get(category)
-                .cloned()
-                .unwrap_or_else(|| self.app_core.build_submenu(category));
+            // Layouts are frontend-owned (core would list the TUI's TOML
+            // cell layouts), so the GUI builds that one itself.
+            let items = if category == "layouts" {
+                self.build_gui_layouts_submenu()
+            } else {
+                self.app_core
+                    .menu_categories
+                    .get(category)
+                    .cloned()
+                    .unwrap_or_else(|| self.app_core.build_submenu(category))
+            };
             if items.is_empty() {
                 tracing::warn!("Missing GUI menu category: {}", category);
             } else {
@@ -1128,7 +1207,11 @@ impl VellumGuiApp {
                 self.close_menus_to_normal();
                 return;
             }
-            let items = self.app_core.build_submenu(submenu);
+            let items = if submenu == "layouts" {
+                self.build_gui_layouts_submenu()
+            } else {
+                self.app_core.build_submenu(submenu)
+            };
             if items.is_empty() {
                 self.app_core
                     .add_system_message(&format!("Menu '{}' has no entries.", submenu));
@@ -1387,6 +1470,14 @@ impl VellumGuiApp {
         {
             return Some(GuiWindowMenuCommand::CalibrateDoll);
         }
+        if view.appearance.is_dashboard
+            && ui
+                .selectable_label(false, "Edit dashboard…")
+                .on_hover_text("Which statuses to show, plus layout and spacing")
+                .clicked()
+        {
+            return Some(GuiWindowMenuCommand::EditDashboard);
+        }
         if view.appearance.hand_id.is_some()
             && ui
                 .selectable_label(false, "Hand icons…")
@@ -1534,6 +1625,42 @@ impl VellumGuiApp {
                                         command = Some(
                                             GuiWindowMenuCommand::ToggleSlotAnchor(key.clone()),
                                         );
+                                    }
+                                }
+                                // Relative size weight along the stack axis:
+                                // a member with weight 2 takes twice the
+                                // growable space of a weight-1 sibling (buffs
+                                // 6 lines / cooldowns 3). Only flexible
+                                // members grow, so this is inert for one-row
+                                // widgets (bars/timers), which is why it's
+                                // always offered — no need to know which is
+                                // which. Merged members size on the OTHER
+                                // axis, so hide it for them.
+                                if !merged {
+                                    let mut weight = view
+                                        .group_weights
+                                        .iter()
+                                        .find(|(k, _)| k == key)
+                                        .map(|(_, w)| *w)
+                                        .filter(|w| *w > 0.0)
+                                        .unwrap_or(1.0);
+                                    if ui
+                                        .add(
+                                            egui::Slider::new(&mut weight, 0.25..=4.0)
+                                                .text("size weight")
+                                                .step_by(0.25),
+                                        )
+                                        .on_hover_text(
+                                            "Relative share of the group's growable \
+                                             space. 2 = twice a sibling at 1. \
+                                             One-row widgets ignore this.",
+                                        )
+                                        .changed()
+                                    {
+                                        command = Some(GuiWindowMenuCommand::SetMemberWeight {
+                                            member: key.clone(),
+                                            weight,
+                                        });
                                     }
                                 }
                             });

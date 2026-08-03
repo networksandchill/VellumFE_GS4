@@ -114,6 +114,41 @@ fn send_to_back_raise_order(
         .collect()
 }
 
+/// How far the pointer must travel from its press origin before a press
+/// counts as a real drag (rather than a click). Matches egui's own default
+/// click/drag threshold closely enough to feel native.
+const PRESS_DRAG_THRESHOLD: f32 = 6.0;
+
+/// Whether a press on a window has become a genuine drag, and so may relax
+/// that window's size pin and hand resizing to egui. A stationary click
+/// (press origin == current pointer, within the threshold) must NOT relax
+/// the pin: relaxing lets egui fall back to its remembered `desired_size`,
+/// which — for grouped windows, whose max height is the whole zone with no
+/// compact cap — snaps the window to a different height on a mere title-bar
+/// click. Requiring travel keeps a click inert while leaving real
+/// resize/move drags fully native.
+///
+/// `latched_drag` short-circuits to true once THIS window owns the
+/// engagement latch and a drag has already been observed this press, so a
+/// resize drag that briefly slows to a stop mid-gesture does not re-pin and
+/// stall. Callers pass the window's engagement state; the pure travel test
+/// is all this helper decides.
+fn press_became_drag(
+    press_origin: Option<egui::Pos2>,
+    pointer_pos: Option<egui::Pos2>,
+    latched_drag: bool,
+) -> bool {
+    if latched_drag {
+        return true;
+    }
+    match (press_origin, pointer_pos) {
+        (Some(origin), Some(current)) => {
+            (current - origin).length() > PRESS_DRAG_THRESHOLD
+        }
+        _ => false,
+    }
+}
+
 pub(super) fn effective_sidebar_gaps(zone_height: f32, items: &[(f32, f32)]) -> Vec<f32> {
     let occupied: f32 = items.iter().map(|(_, height)| height.max(0.0)).sum();
     let mut free = (zone_height - occupied).max(0.0);
@@ -312,10 +347,10 @@ impl VellumGuiApp {
     ) -> Option<f32> {
         use crate::frontend::gui::persistence::VitalsOrientation;
         let row = match window.widget_type {
-            // Hand rows grow with the configured icon size.
-            WidgetType::Hand => {
-                (self.ui_settings.hand_icon_size.clamp(16.0, 48.0) + 6.0).max(28.0)
-            }
+            // Hands are freely resizable — no height cap. The icon scales to
+            // fill the window (render_hand_content), so a taller window means a
+            // bigger icon (2 lines, 4 lines, ...), a shorter one a small icon.
+            WidgetType::Hand => return None,
             WidgetType::Countdown
             | WidgetType::Progress
             | WidgetType::Indicator
@@ -330,6 +365,36 @@ impl VellumGuiApp {
                         rows * bar + (rows - 1.0) * 6.0
                     }
                 }
+            }
+            // A dashboard's height is its row count × the icon row, so the
+            // frame hugs the grid instead of leaving a slab below the last
+            // row. Rows come from the config (indicator count + layout): a
+            // vertical stack is N rows, a grid is ceil(N/cols), horizontal is
+            // one. Flow wraps by width — not knowable here — so it stays
+            // uncapped (grows as content needs). Empty/absent config: 1 row.
+            WidgetType::Dashboard => {
+                use crate::config::DashboardLayout;
+                let data = self
+                    .app_core
+                    .layout
+                    .windows
+                    .iter()
+                    .find(|def| def.name() == window.name)
+                    .and_then(|def| match def {
+                        crate::config::WindowDef::Dashboard { data, .. } => Some(data),
+                        _ => None,
+                    });
+                let Some(data) = data else { return None };
+                let count = data.cell_count().max(1);
+                let rows = match DashboardLayout::from_str(&data.layout) {
+                    DashboardLayout::Flow => return None,
+                    DashboardLayout::Horizontal => 1,
+                    DashboardLayout::Vertical => count,
+                    DashboardLayout::Grid { cols, .. } => count.div_ceil(cols.max(1)),
+                };
+                let icon_row = 24.0;
+                let spacing = data.spacing as f32 * icon_row * 0.35;
+                rows as f32 * icon_row + (rows.saturating_sub(1) as f32) * spacing
             }
             _ => return None,
         };
@@ -357,8 +422,12 @@ impl VellumGuiApp {
     fn min_window_height_for_zone(zone: GuiShellZone, window: &WindowState) -> f32 {
         // Center and the sidebars share the free-placement minimums;
         // header/footer strips accept anything down to the docked floor.
+        // Dashboards are content-height (capped to their row count), so they
+        // get the docked floor too — otherwise the 90px text-window minimum
+        // leaves irreducible padding below a short grid.
         if matches!(zone, GuiShellZone::Header | GuiShellZone::Footer)
             || Self::is_compact_center_widget(&window.widget_type)
+            || matches!(window.widget_type, WidgetType::Dashboard)
         {
             MIN_DOCKED_WINDOW_HEIGHT
         } else {
@@ -543,6 +612,68 @@ impl VellumGuiApp {
             ctx.move_to_top(egui::LayerId::new(egui::Order::Middle, id));
         }
         ctx.request_repaint();
+    }
+
+    /// Map every live main-surface tab to the egui layer id its window renders
+    /// under, across all zones. The inverse of `zone_window_id` (which hashes,
+    /// so it can't be reversed) — built forward so a layer id from
+    /// `mem.layer_ids()` can be resolved back to a TabKey.
+    fn surface_layer_to_tab(&self) -> HashMap<egui::Id, TabKey> {
+        self.available_tabs
+            .keys()
+            .filter(|key| {
+                !self.hidden_tabs.contains(key) && !self.detached_tabs.contains_key(key)
+            })
+            .map(|key| (Self::zone_window_id(self.zone_for_tab(key), key), key.clone()))
+            .collect()
+    }
+
+    /// Cache the live front-to-back stacking order (topmost last) of the
+    /// main-surface windows from egui's layer order. Read by the save snapshot
+    /// so `visible_tabs` records true z-order. Only refreshes when the order
+    /// actually changed, to avoid churning `current_zorder` every frame.
+    pub(super) fn refresh_zorder_cache(&mut self, ctx: &egui::Context) {
+        let layer_to_tab = self.surface_layer_to_tab();
+        // layer_ids() is back-to-front (top is last) — the order we persist.
+        let ordered: Vec<TabKey> = ctx.memory(|mem| {
+            mem.layer_ids()
+                .filter(|layer| layer.order == egui::Order::Middle)
+                .filter_map(|layer| layer_to_tab.get(&layer.id).cloned())
+                .collect()
+        });
+        // A frame before any surface window has been laid out yields nothing;
+        // don't clobber a good cache with an empty read.
+        if !ordered.is_empty() && ordered != self.current_zorder {
+            self.current_zorder = ordered;
+        }
+    }
+
+    /// Replay a saved stacking order: raise each window in back-to-front order
+    /// so the last-listed ends up on top. Keys not currently on the main
+    /// surface (hidden/detached/absent) are skipped. Deferred one frame from
+    /// the load because the windows must exist as layers first.
+    pub(super) fn apply_stacking_order(&mut self, ctx: &egui::Context, order: &[TabKey]) {
+        let mut raised_any = false;
+        for key in order {
+            if self.hidden_tabs.contains(key)
+                || self.detached_tabs.contains_key(key)
+                || !self.available_tabs.contains_key(key)
+            {
+                continue;
+            }
+            let layer = egui::LayerId::new(
+                egui::Order::Middle,
+                Self::zone_window_id(self.zone_for_tab(key), key),
+            );
+            ctx.move_to_top(layer);
+            raised_any = true;
+        }
+        if raised_any {
+            // Seed the cache so a save right after load re-persists this order
+            // even before the next capture pass runs.
+            self.current_zorder = order.to_vec();
+            ctx.request_repaint();
+        }
     }
 
     fn zone_surface_tabs(&self, detached_tabs: &HashSet<TabKey>, zone: GuiShellZone) -> Vec<GuiTab> {
@@ -963,10 +1094,6 @@ impl VellumGuiApp {
         zone_window_rects: &mut Vec<GuiZoneWindowRect>,
     ) -> GuiWindowActions {
         let mut actions = GuiWindowActions::default();
-        let primary_down = ctx.input(|i| i.pointer.button_down(egui::PointerButton::Primary));
-        if !primary_down {
-            self.hand_resize_tab = None;
-        }
         if !root_rect.is_finite() || root_rect.width() <= 24.0 || root_rect.height() <= 24.0 {
             return actions;
         }
@@ -1013,8 +1140,15 @@ impl VellumGuiApp {
         // Where the current press started, for telling "user is engaging
         // this window" apart from "user clicked a toolbar toggle".
         let press_origin = ctx.input(|i| i.pointer.press_origin());
+        // Current pointer position, paired with the press origin to tell a
+        // stationary click apart from a real drag (see `press_became_drag`).
+        let pointer_pos = ctx.input(|i| i.pointer.interact_pos());
         // The engagement latch lives for one press; release clears it.
         let pointer_down = ctx.input(|i| i.pointer.any_down());
+        // True only on the frame the primary button goes down — used to raise a
+        // window whose resize edge sits under an overlapping neighbor, so the
+        // grabbed handle wins the interaction instead of the neighbor on top.
+        let just_pressed = ctx.input(|i| i.pointer.button_pressed(egui::PointerButton::Primary));
         if !pointer_down {
             self.zone_engaged_tab = None;
             // The snap drag must survive the RELEASE frame: the hook's
@@ -1184,7 +1318,8 @@ impl VellumGuiApp {
                         ),
                     )
                 });
-            let initial_rect = if zone == GuiShellZone::Center {
+            let is_compact_widget = Self::is_compact_center_widget(&window.widget_type);
+            let mut initial_rect = if zone == GuiShellZone::Center {
                 center_displays
                     .get(&tab.id.key)
                     .copied()
@@ -1200,46 +1335,26 @@ impl VellumGuiApp {
             if !initial_rect.is_finite() {
                 continue;
             }
+            // Fold the live height cap into the fed rect for compact
+            // single-row widgets: egui renders them capped (max_size), so a
+            // taller stored/canonical height would leave the fed rect and
+            // egui's reported rect disagreeing on the Y axis for the whole
+            // session. That desync made `classify_axis` (which measures
+            // gesture totals against the fed rect) see a phantom vertical
+            // delta and draw guides for edges the user never dragged. Cap
+            // here and the two rects agree at gesture start. Grouped windows
+            // manage their own (uncapped) height, matching the sibling
+            // candidate list above.
+            if is_compact_widget && !grouped {
+                let capped = initial_rect.height().min(max_window_size.y);
+                initial_rect.set_height(capped);
+            }
 
             let mut clicked_link = None;
-            let mut hand_resize_delta_x = 0.0f32;
-            // Grouped hands lose the fixed-size hand behavior; the group is a
-            // normal resizable window sized for all members.
-            let is_hand_widget =
-                matches!(window.content, WindowContent::Hand { .. }) && group_shape.is_none();
             // WebUI windows get a title-bar close button: unlike layout
             // widgets (hidden/restored via the Windows menu), script pages
             // are transient - closing one removes it and unsubscribes.
             let is_webui_window = matches!(window.content, WindowContent::WebUi(_));
-            let hand_resize_handle_width = 10.0f32;
-            let pointer_over_hand_resize_handle = if is_hand_widget && primary_down {
-                let handle_rect = Rect::from_min_max(
-                    Pos2::new(initial_rect.max.x - hand_resize_handle_width, initial_rect.min.y),
-                    initial_rect.max,
-                );
-                ctx.input(|i| {
-                    i.pointer
-                        .interact_pos()
-                        .or(i.pointer.latest_pos())
-                        .is_some_and(|pos| handle_rect.contains(pos))
-                })
-            } else {
-                false
-            };
-            if is_hand_widget
-                && primary_down
-                && pointer_over_hand_resize_handle
-                && !window_locked
-                && self.hand_resize_tab.is_none()
-            {
-                self.hand_resize_tab = Some(tab.id.key.clone());
-            }
-            let hand_resize_active = is_hand_widget
-                && primary_down
-                && self
-                    .hand_resize_tab
-                    .as_ref()
-                    .is_some_and(|key| key == &tab.id.key);
             let window_id = Self::zone_window_id(zone, &tab.id.key);
             let mut docked_window_frame = egui::Frame::window(ctx.global_style().as_ref())
                 .outer_margin(egui::Margin::ZERO)
@@ -1266,9 +1381,7 @@ impl VellumGuiApp {
                 .min_size(min_window_size)
                 .max_size(max_window_size)
                 .resizable(!window_locked)
-                .movable(
-                    !ctx.input(|i| i.modifiers.alt) && !hand_resize_active && !window_locked,
-                )
+                .movable(!ctx.input(|i| i.modifiers.alt) && !window_locked)
                 // Drag from anywhere — body and title bar alike — so every
                 // move goes through the anchored area-move path. Title-bar
                 // drag mode routes through a separate pre-`Area::begin`
@@ -1290,16 +1403,6 @@ impl VellumGuiApp {
                 // The placement click must not land in this window's content.
                 window_builder = window_builder.interactable(false);
             }
-            if is_hand_widget {
-                // Width comes from the stored rect (user-set via the side
-                // handle); height follows the icon-size-aware row cap so a
-                // larger hand icon setting can never clip inside a stale
-                // stored height.
-                window_builder = window_builder
-                    .fixed_size(Vec2::new(initial_rect.size().x, max_window_size.y))
-                    .resizable(false);
-            }
-            let is_compact_widget = Self::is_compact_center_widget(&window.widget_type);
             if !is_compact_widget {
                 // Prevent content-driven growth by making the window scroll instead of expanding.
                 window_builder = window_builder.scroll([true, true]);
@@ -1317,15 +1420,41 @@ impl VellumGuiApp {
             // the grabbed edge away from the press origin, and re-testing
             // the origin against the shrinking rect would re-pin the size
             // mid-drag, stalling the resize after ~12px per grab.
+            // Claim the engagement latch only if no window has claimed it this
+            // press. Overlapping edge bands mean a press near a shared border
+            // is inside BOTH windows' expand(12) rings; without the
+            // "unclaimed" guard the later-rendered window stole the latch, the
+            // earlier one re-pinned, and its resize stalled after ~12px (grab
+            // again for another ~12px — the reported symptom). First claim
+            // wins and holds for the whole press; the raise-on-edge-grab below
+            // puts the actually-grabbed window on top so egui resizes the same
+            // one that holds the latch.
+            // The latch is claimed post-show (topmost-at-press, egui-correct);
+            // here we only READ it to relax the pin for the latched window, or
+            // to catch a press on a non-overlapping window on its first frame
+            // (the common case, where topmost is unambiguous anyway). The
+            // post-show claim corrects any ambiguous edge-band press.
+            let engaging_press = press_origin
+                .is_some_and(|pos| initial_rect.expand(12.0).contains(pos));
+            let already_latched = self.zone_engaged_tab.as_ref() == Some(&tab.id.key);
             let user_engaging_window = !window_locked
                 && pointer_interacting
-                && (self.zone_engaged_tab.as_ref() == Some(&tab.id.key)
-                    || press_origin
-                        .is_some_and(|pos| initial_rect.expand(12.0).contains(pos)));
-            if user_engaging_window && pointer_down {
-                self.zone_engaged_tab = Some(tab.id.key.clone());
-            }
-            if !is_compact_widget && !is_hand_widget && !being_moved && !user_engaging_window {
+                && (already_latched || (self.zone_engaged_tab.is_none() && engaging_press));
+            // The size pin only relaxes once the press becomes a real drag —
+            // a stationary title-bar click keeps the pin, so egui can't snap
+            // the window (grouped windows especially, whose max height is the
+            // whole zone) to its remembered desired_size. `user_engaging_window`
+            // still gates position feed and rect tracking below; this narrower
+            // gate governs the SIZE pin alone.
+            let relax_size_pin = user_engaging_window
+                && press_became_drag(press_origin, pointer_pos, already_latched);
+            if !being_moved && !relax_size_pin {
+                // Pin every window to its display size when the user isn't
+                // engaging it: egui's Resize state re-clamps its remembered
+                // desired_size each frame, so without this a release-snap's new
+                // size (or a .loadlayout restore) wouldn't stick. Compact
+                // widgets carry their capped height in `initial_rect`; hands
+                // (now freely resizable) pin to whatever size the user set.
                 window_builder = window_builder
                     .min_size(initial_rect.size())
                     .max_size(initial_rect.size());
@@ -1353,34 +1482,41 @@ impl VellumGuiApp {
             if is_webui_window && !title_bar_hidden {
                 window_builder = window_builder.open(&mut webui_open);
             }
-            if let Some(inner) = window_builder.show(ctx, |ui| {
-                    ui.push_id(&tab.id.key, |ui| {
-                        self.render_window_or_group_content(ui, &tab)
-                    })
-                    .inner
-                }) {
+            // Per-window render cost for the performance monitor (chrome +
+            // content; detached viewports are not timed).
+            let window_render_start = std::time::Instant::now();
+            let window_shown = window_builder.show(ctx, |ui| {
+                ui.push_id(&tab.id.key, |ui| {
+                    self.render_window_or_group_content(ui, &tab)
+                })
+                .inner
+            });
+            self.app_core
+                .perf_stats
+                .record_window_render(&tab.window_name, window_render_start.elapsed());
+            if let Some(inner) = window_shown {
                 self.paint_skin_border(ctx, &tab.id.key, skin_sides, &inner.response);
                 self.paint_border_plan(ctx, &border_plan, &inner.response);
-                if is_hand_widget {
-                    let handle_rect = Rect::from_min_max(
-                        Pos2::new(
-                            inner.response.rect.max.x - hand_resize_handle_width,
-                            inner.response.rect.min.y,
-                        ),
-                        inner.response.rect.max,
-                    );
-                    if hand_resize_active
-                        || ctx.input(|i| {
-                            i.pointer
-                                .interact_pos()
-                                .or(i.pointer.latest_pos())
-                                .is_some_and(|pos| handle_rect.contains(pos))
-                        })
-                    {
-                        ctx.set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
-                    }
-                    if hand_resize_active {
-                        hand_resize_delta_x += ctx.input(|i| i.pointer.delta().x);
+                // Claim the engagement latch here, where the real rendered rect
+                // and layer id are known, gated on this window being TOPMOST at
+                // the press origin — i.e. the window egui actually resizes. The
+                // pre-show `engaging_press` test can't tell overlapping windows
+                // apart (both contain the press in their edge ring), which let
+                // the wrong window latch, re-pin the resized one, and stall it
+                // after ~12px. Topmost-at-press is exactly egui's own choice,
+                // so the latch and egui's resize target always agree.
+                if just_pressed && !window_locked && self.zone_engaged_tab.is_none() {
+                    const RESIZE_GRAB: f32 = 6.0;
+                    let rect = inner.response.rect;
+                    if let Some(pos) = press_origin {
+                        // The press hits this window's body or its resize ring
+                        // (the edge band extends a few px outside the frame).
+                        let in_window = rect.expand(RESIZE_GRAB).contains(pos);
+                        let topmost = ctx.layer_id_at(pos) == Some(inner.response.layer_id);
+                        if in_window && topmost {
+                            self.zone_engaged_tab = Some(tab.id.key.clone());
+                            ctx.request_repaint();
+                        }
                     }
                 }
                 // `.snapdebug`: the three rects whose divergence explains
@@ -1415,7 +1551,11 @@ impl VellumGuiApp {
                 // click-anywhere (the old gate) baked the displaced rect in,
                 // so windows never sprang back when the zone closed and a
                 // loaded layout was overwritten by the on-screen geometry.
-                let should_track_rect = rect_changed && user_engaging_window;
+                // Track only when the press became a real drag (resize or
+                // move): a stationary click never relaxes the pin, so any rect
+                // divergence on a click is egui noise, not user intent, and
+                // must not be baked in.
+                let should_track_rect = rect_changed && relax_size_pin;
                 // While a snap drag is live the hook runs every frame — even
                 // when the pointer holds still (guides must not flicker off)
                 // and on the release frame, where the engagement gate is
@@ -1425,10 +1565,21 @@ impl VellumGuiApp {
                     .zone_snap_drag
                     .as_ref()
                     .is_some_and(|drag| drag.tab_key == tab.id.key);
-                if !is_hand_widget
-                    && !being_moved
-                    && (snap_drag_live || (rect_changed && user_engaging_window))
-                {
+                // Compact single-row widgets are height-derived: their
+                // canonical height is always the live cap, never a stored
+                // value. Normalizing here — the one choke point where a rect
+                // becomes canonical — means `.savelayout`, the snap candidate
+                // list, and next frame's fed rect all read the same capped
+                // height. Nothing downstream can resurrect a stale height
+                // (e.g. a layout saved under a larger icon-size setting).
+                let compact_derived = is_compact_widget && !grouped;
+                let normalize_height = |mut rect: Rect| -> Rect {
+                    if compact_derived {
+                        rect.set_height(rect.height().min(max_window_size.y));
+                    }
+                    rect
+                };
+                if !being_moved && (snap_drag_live || (rect_changed && relax_size_pin)) {
                     let tracked = self.apply_zone_snap(
                         zone,
                         &tab.id.key,
@@ -1441,9 +1592,17 @@ impl VellumGuiApp {
                         snap_suspended,
                         pointer_down,
                     );
-                    self.track_main_window_rect(&tab.id.key, tracked, window_bounds);
+                    self.track_main_window_rect(
+                        &tab.id.key,
+                        normalize_height(tracked),
+                        window_bounds,
+                    );
                 } else if should_track_rect {
-                    self.track_main_window_rect(&tab.id.key, inner.response.rect, window_bounds);
+                    self.track_main_window_rect(
+                        &tab.id.key,
+                        normalize_height(inner.response.rect),
+                        window_bounds,
+                    );
                 }
                 if zone == GuiShellZone::Center && pointer_interacting {
                     // Mirror the CANONICAL rect (post-tracking), not the
@@ -1485,18 +1644,6 @@ impl VellumGuiApp {
                             window_rect: inner.response.rect,
                         });
                     }
-                }
-                if is_hand_widget && hand_resize_delta_x.abs() > 0.0 {
-                    let resized_width =
-                        (inner.response.rect.width() + hand_resize_delta_x).clamp(min_window_size.x, max_window_size.x);
-                    let entry = self.main_window_rects.entry(tab.id.key.clone()).or_insert([
-                        inner.response.rect.min.x,
-                        inner.response.rect.min.y,
-                        inner.response.rect.width(),
-                        inner.response.rect.height(),
-                    ]);
-                    entry[2] = resized_width;
-                    self.layout_dirty = true;
                 }
                 occupied_rects.push(inner.response.rect);
                 if self.zone_drag_state.is_none() && !window_locked {
@@ -1547,6 +1694,44 @@ mod tests {
             VellumGuiApp::default_zone_for_tab_key(&TabKey::TextMain),
             super::GuiShellZone::Center
         );
+    }
+
+    #[test]
+    fn stationary_click_does_not_relax_size_pin() {
+        // A title-bar click: press origin and current pointer coincide. This
+        // must NOT count as a drag, so the size pin stays and the (grouped)
+        // window can't jump to egui's remembered desired_size. Regression
+        // guard for "clicking the title bar resizes a grouped window".
+        let origin = egui::pos2(100.0, 50.0);
+        assert!(!super::press_became_drag(Some(origin), Some(origin), false));
+        // Tiny jitter under the threshold is still a click, not a drag.
+        let jitter = egui::pos2(102.0, 51.0);
+        assert!(!super::press_became_drag(Some(origin), Some(jitter), false));
+    }
+
+    #[test]
+    fn real_drag_relaxes_size_pin() {
+        // Pointer traveled well past the threshold: a genuine resize/move
+        // drag, so the pin relaxes and egui owns the geometry.
+        let origin = egui::pos2(100.0, 50.0);
+        let dragged = egui::pos2(140.0, 90.0);
+        assert!(super::press_became_drag(Some(origin), Some(dragged), false));
+    }
+
+    #[test]
+    fn latched_drag_stays_relaxed_when_pointer_stalls() {
+        // Once this window owns the drag latch, a mid-gesture pause (pointer
+        // momentarily back near the origin) must not re-pin and stall the
+        // resize — the latch short-circuits the travel test.
+        let origin = egui::pos2(100.0, 50.0);
+        assert!(super::press_became_drag(Some(origin), Some(origin), true));
+    }
+
+    #[test]
+    fn missing_pointer_is_not_a_drag() {
+        // No press origin or no pointer position → not a drag (pin holds).
+        assert!(!super::press_became_drag(None, Some(egui::pos2(1.0, 1.0)), false));
+        assert!(!super::press_became_drag(Some(egui::pos2(1.0, 1.0)), None, false));
     }
 
     #[test]

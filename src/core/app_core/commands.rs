@@ -513,23 +513,47 @@ impl AppCore {
         } else {
             crate::core::uipack::PARTS.iter().map(|s| s.to_string()).collect()
         };
+        self.uiexport_pack(&name, &parts, None, extra_files);
+    }
+
+    /// Build a pack; shared by `.uiexport` and the pack editor panels
+    /// (which pass an explicit destination folder). Returns success.
+    pub fn uiexport_pack(
+        &mut self,
+        name: &str,
+        parts: &[String],
+        dest_dir: Option<std::path::PathBuf>,
+        extra_files: Vec<(String, Vec<u8>)>,
+    ) -> bool {
         let layout_toml = self.layout.clone().to_share_toml().ok();
         let base = match crate::config::Config::base_dir() {
             Ok(base) => base,
             Err(e) => {
                 self.add_system_message(&format!("Export failed: {e:#}"));
-                return;
+                return false;
             }
         };
-        match crate::core::uipack::export(
-            &base,
-            &name,
-            &parts,
-            self.config.character.as_deref(),
+        let quickbars_toml = toml::to_string_pretty(&crate::core::uipack::QuickbarsFile {
+            quickbars: self.config.quickbars.clone(),
+        })
+        .ok();
+        let settings_toml = toml::to_string_pretty(
+            &crate::core::uipack::ShareableSettings::from_config(&self.config),
+        )
+        .ok();
+        let request = crate::core::uipack::ExportRequest {
+            name,
+            parts,
+            character: self.config.character.as_deref(),
             layout_toml,
-            self.config.active_skin.as_deref(),
-            &extra_files,
-        ) {
+            active_skin: self.config.active_skin.as_deref(),
+            active_theme: Some(self.config.active_theme.as_str()),
+            quickbars_toml,
+            settings_toml,
+            extra_files: &extra_files,
+            dest_dir: dest_dir.as_deref(),
+        };
+        match crate::core::uipack::export(&base, &request) {
             Ok((path, included)) => {
                 self.add_system_message(&format!(
                     "Exported UI pack '{}' ({}) to {}",
@@ -540,8 +564,12 @@ impl AppCore {
                 self.add_system_message(
                     "Share the file anywhere — it carries no account or connection settings.",
                 );
+                true
             }
-            Err(e) => self.add_system_message(&format!("Export failed: {e:#}")),
+            Err(e) => {
+                self.add_system_message(&format!("Export failed: {e:#}"));
+                false
+            }
         }
     }
 
@@ -588,7 +616,7 @@ impl AppCore {
                             .unwrap_or_default()
                     ));
                     self.add_system_message(&format!(
-                        "{} file(s). Run `.uiimport {} apply` to install — replaced files are backed up.",
+                        "{} file(s). Run `.uiimport {} apply [parts...]` to install — replaced files are backed up.",
                         preview.entries.len(),
                         target
                     ));
@@ -598,7 +626,33 @@ impl AppCore {
             return None;
         }
 
-        match crate::core::uipack::apply(&base, &path, self.config.character.as_deref()) {
+        // `.uiimport <name> apply [parts...]` — extra args limit the
+        // install to those parts.
+        let selected: Option<Vec<String>> = (args.len() > 2)
+            .then(|| args[2..].iter().map(|s| s.to_lowercase()).collect());
+        self.uiimport_apply(&path, selected.as_deref())
+    }
+
+    /// Install a pack from a resolved path; shared by `.uiimport ... apply`
+    /// and the pack editor panels. `selected` limits to those parts.
+    pub fn uiimport_apply(
+        &mut self,
+        path: &std::path::Path,
+        selected: Option<&[String]>,
+    ) -> Option<(String, Vec<u8>)> {
+        let base = match crate::config::Config::base_dir() {
+            Ok(base) => base,
+            Err(e) => {
+                self.add_system_message(&format!("Import failed: {e:#}"));
+                return None;
+            }
+        };
+        match crate::core::uipack::apply(
+            &base,
+            path,
+            self.config.character.as_deref(),
+            selected,
+        ) {
             Ok(outcome) => {
                 for note in &outcome.notes {
                     self.add_system_message(&format!("uiimport: {note}"));
@@ -608,6 +662,35 @@ impl AppCore {
                         "Replaced files backed up to {}",
                         dir.display()
                     ));
+                }
+                // Config-merging parts first, so the hot reloads below see
+                // the merged state.
+                if let Some(text) = &outcome.quickbars_toml {
+                    match toml::from_str::<crate::core::uipack::QuickbarsFile>(text) {
+                        Ok(file) => {
+                            self.config.quickbars = file.quickbars;
+                            let _ = self.save_config();
+                            self.add_system_message("Quickbars installed.");
+                        }
+                        Err(e) => self.add_system_message(&format!(
+                            "Pack's quickbars did not parse: {e:#}"
+                        )),
+                    }
+                }
+                if let Some(text) = &outcome.settings_toml {
+                    match toml::from_str::<crate::core::uipack::ShareableSettings>(text) {
+                        Ok(settings) => {
+                            settings.apply_to(&mut self.config);
+                            let _ = self.save_config();
+                            self.apply_tts_settings();
+                            self.add_system_message(
+                                "General settings installed (connection settings are never touched; some take effect on restart).",
+                            );
+                        }
+                        Err(e) => self.add_system_message(&format!(
+                            "Pack's settings did not parse: {e:#}"
+                        )),
+                    }
                 }
                 // Hot-reload everything the pack can touch.
                 self.reload_keybinds();
@@ -636,11 +719,17 @@ impl AppCore {
                         "Active skin set to '{skin}' (the GUI applies it on next load or via Settings > Appearance)"
                     ));
                 }
+                if let Some(theme) = &outcome.theme {
+                    self.config.active_theme = theme.clone();
+                    let _ = self.save_config();
+                    self.add_system_message(&format!("Active theme set to '{theme}'."));
+                }
                 if let Some(layout) = &outcome.layout_name {
                     self.add_system_message(&format!(
                         "TUI layout installed — load it with .loadlayout {layout}"
                     ));
                 }
+                self.needs_render = true;
                 let pack_name = path
                     .file_stem()
                     .map(|s| s.to_string_lossy().to_string())
@@ -1386,6 +1475,159 @@ impl AppCore {
         self.tick_foreach();
     }
 
+    /// Harmony parameters for this session: the stored recipe when it was
+    /// generated against the current theme background (so a saved look stays
+    /// re-tunable), else theme-derived defaults seeded from the most vivid
+    /// theme swatch. Shared by `.harmony`, `.harmony skin`, and the GUI
+    /// Generate tab's action handler.
+    pub fn harmony_params(&self) -> crate::core::harmony::HarmonyParams {
+        use crate::core::harmony::{HarmonyParams, Scheme};
+        let theme = self.config.get_theme();
+        let background = theme.background_primary.to_hex();
+        // A stored recipe re-tunes the same look; ignore it once the theme
+        // background changed, since its seed was chosen against the old one.
+        let recipe = self
+            .config
+            .colors
+            .harmony
+            .clone()
+            .filter(|r| r.background.eq_ignore_ascii_case(&background));
+        let seed = recipe
+            .as_ref()
+            .map(|r| r.seed.clone())
+            .or_else(|| theme.seed_swatches().into_iter().next())
+            .unwrap_or_else(|| theme.link_color.to_hex());
+        let defaults = HarmonyParams::default();
+        HarmonyParams {
+            seed,
+            background,
+            scheme: recipe
+                .as_ref()
+                .and_then(|r| Scheme::parse(&r.scheme))
+                .unwrap_or(defaults.scheme),
+            variance: recipe.as_ref().map_or(defaults.variance, |r| r.variance),
+            min_contrast: recipe
+                .as_ref()
+                .map_or(defaults.min_contrast, |r| r.min_contrast),
+            separation: recipe
+                .as_ref()
+                .map_or(defaults.separation, |r| r.separation),
+            room_title_spread: recipe
+                .as_ref()
+                .map_or(defaults.room_title_spread, |r| r.room_title_spread),
+            pins: recipe.as_ref().map(|r| r.pins.clone()).unwrap_or_default(),
+        }
+    }
+
+    /// `.harmony [scheme|schemes]` — regenerate the game-text preset colors
+    /// from the active theme with the harmony engine (`core::harmony`). The
+    /// GUI Colors editor's Generate tab is the interactive version; this
+    /// command gives the TUI the same engine with sensible defaults.
+    fn handle_harmony(&mut self, args: &[String]) {
+        use crate::config::{ColorConfig, HarmonyRecipe};
+        use crate::core::harmony::{self, Scheme};
+
+        if args.first().is_some_and(|a| a.eq_ignore_ascii_case("schemes")) {
+            self.add_system_message("=== Harmony schemes ===");
+            for scheme in Scheme::ALL {
+                self.add_system_message(&format!(
+                    "  {:<14} {}",
+                    scheme.name(),
+                    scheme.description()
+                ));
+            }
+            self.add_system_message(
+                "Usage: .harmony [scheme] - regenerate preset colors from the active \
+                 theme; .harmony skin <name> - write a matching skin",
+            );
+            return;
+        }
+
+        let mut params = self.harmony_params();
+        if let Some(arg) = args.first() {
+            match Scheme::parse(arg) {
+                Some(scheme) => params.scheme = scheme,
+                None => {
+                    self.add_system_message(&format!(
+                        "Unknown scheme '{}'. Try .harmony schemes for the list.",
+                        arg
+                    ));
+                    return;
+                }
+            }
+        }
+
+        let result = harmony::generate(&params);
+        let new_recipe = HarmonyRecipe {
+            seed: params.seed.clone(),
+            background: params.background.clone(),
+            scheme: params.scheme.name().to_string(),
+            variance: params.variance,
+            min_contrast: params.min_contrast,
+            separation: params.separation,
+            room_title_spread: params.room_title_spread,
+            pins: params.pins.clone(),
+        };
+        let character = self.config.character.clone();
+        if let Err(err) = ColorConfig::persist_generated_presets(
+            &result.colors,
+            &result.room_bg,
+            &result.prompts,
+            &new_recipe,
+            character.as_deref(),
+        ) {
+            self.add_system_message(&format!("Harmony generation failed to save: {}", err));
+            return;
+        }
+        self.reload_colors();
+
+        self.add_system_message(&format!(
+            "=== Harmony: {} from seed {} on {} ===",
+            params.scheme.name(),
+            params.seed,
+            params.background
+        ));
+        for (role, hex) in &result.colors {
+            let contrast = harmony::wcag_contrast(hex, &params.background);
+            let pinned = if params.pins.contains_key(role) {
+                "  (pinned)"
+            } else {
+                ""
+            };
+            self.add_system_message(&format!(
+                "  {:<17} {}  {:.1}:1{}",
+                role, hex, contrast, pinned
+            ));
+        }
+        let plate_contrast = result
+            .color_for("roomName")
+            .map(|room| harmony::wcag_contrast(room, &result.room_bg))
+            .unwrap_or(1.0);
+        self.add_system_message(&format!(
+            "  {:<17} {}  {:.1}:1 vs room title (plate)",
+            "roomName bg", result.room_bg, plate_contrast
+        ));
+        for (character, hex) in &result.prompts {
+            let label = harmony::PROMPT_ROLES
+                .iter()
+                .find(|r| r.character == character)
+                .map(|r| r.label)
+                .unwrap_or("prompt");
+            self.add_system_message(&format!(
+                "  {:<17} {}  {:.1}:1  (prompt '{}')",
+                label,
+                hex,
+                harmony::wcag_contrast(hex, &params.background),
+                character
+            ));
+        }
+        self.add_system_message(
+            "Presets updated (previous colors.toml kept as .bak). \
+             .harmony schemes lists schemes; the GUI Colors editor's Generate \
+             tab offers seeds, pins, and preview.",
+        );
+    }
+
     fn handle_dot_command(&mut self, command: &str) -> Result<CommandOutcome> {
         let parts: Vec<&str> = command[1..].split_whitespace().collect();
         let cmd = parts.first().map(|s| s.to_lowercase()).unwrap_or_default();
@@ -1497,6 +1739,11 @@ impl AppCore {
             // instant and inline.
             "jinx" => {
                 let args: Vec<String> = parts[1..].iter().map(|s| s.to_string()).collect();
+                // `.jinx gui` opens the native asset panel (GUI-only); every
+                // other subcommand runs inline / off-thread here.
+                if args.first().map(|s| s.as_str()) == Some("gui") {
+                    return Ok(CommandOutcome::Ui(UiAction::JinxPanel));
+                }
                 self.handle_jinx(&args);
             }
 
@@ -1601,6 +1848,10 @@ impl AppCore {
                 let args: Vec<String> = parts[1..].iter().map(|s| s.to_string()).collect();
                 return Ok(CommandOutcome::Ui(UiAction::UiImport(args)));
             }
+            // The guided panel over .uiexport/.uiimport (desktop frontends).
+            "packs" | "packeditor" => {
+                return Ok(CommandOutcome::Ui(UiAction::PackEditor));
+            }
 
             // Text-to-speech control from any frontend (the GUI also has
             // Settings > Speech; on the TUI and phones this is THE way).
@@ -1618,6 +1869,22 @@ impl AppCore {
                 }
             }
 
+            // Toggling is core-side (the overlay window lives in ui_state,
+            // shared by every frontend); `dump` is a UiAction so each
+            // frontend can append its own report sections.
+            "performance" | "perf" => {
+                if parts.get(1).map(|s| s.eq_ignore_ascii_case("dump")) == Some(true) {
+                    return Ok(CommandOutcome::Ui(UiAction::PerformanceDump));
+                }
+                let enabled = self.toggle_performance_overlay();
+                self.add_system_message(if enabled {
+                    "Performance monitor shown (.performance again to hide, .performance dump for a report)."
+                } else {
+                    "Performance monitor hidden."
+                });
+                return Ok(CommandOutcome::Handled);
+            }
+
             // Layout commands are capability hooks (parity plan D3): core
             // owns the command names, each frontend owns its persistence
             // model — TOML cell layouts in the TUI, window-snapshot
@@ -1629,9 +1896,30 @@ impl AppCore {
                 )));
             }
             "loadlayout" => {
-                return Ok(CommandOutcome::Ui(UiAction::LoadLayout(
-                    parts.get(1).map(|name| name.to_string()),
-                )));
+                // `.loadlayout <name> [--keep-skin]` — the flag keeps the
+                // loader's appearance (skin/theme/art) and takes only the
+                // arrangement. Lenient spellings: --keep-skin / --keep-skins /
+                // --keep_my_skins / --keepskin all normalize the same.
+                let mut name = None;
+                let mut keep_skin = false;
+                for part in &parts[1..] {
+                    let normalized: String = part
+                        .trim_start_matches('-')
+                        .chars()
+                        .filter(|c| c.is_ascii_alphanumeric())
+                        .collect::<String>()
+                        .to_ascii_lowercase();
+                    if part.starts_with('-')
+                        && matches!(normalized.as_str(), "keepskin" | "keepskins" | "keepmyskins")
+                    {
+                        keep_skin = true;
+                    } else if name.is_none() {
+                        name = Some(part.to_string());
+                    }
+                }
+                // The flag is meaningless without a name (bare form lists).
+                let keep_skin = keep_skin && name.is_some();
+                return Ok(CommandOutcome::Ui(UiAction::LoadLayout { name, keep_skin }));
             }
             "layouts" => {
                 return Ok(CommandOutcome::Ui(UiAction::ListLayouts));
@@ -1796,6 +2084,11 @@ impl AppCore {
             "hotbars" | "hotbar" => {
                 return Ok(CommandOutcome::Ui(UiAction::Hotbars));
             }
+            // Indicator template builder: create/edit every status indicator,
+            // its conditions, and condition-driven icons in one place.
+            "indicators" | "indicator" => {
+                return Ok(CommandOutcome::Ui(UiAction::EditIndicators));
+            }
             // Streams (per-stream routing: every known stream and where it goes)
             "streams" => {
                 return Ok(CommandOutcome::Ui(UiAction::Streams));
@@ -1878,6 +2171,24 @@ impl AppCore {
             }
             "resetpalette" => {
                 return Ok(CommandOutcome::Ui(UiAction::ResetPalette));
+            }
+            "harmony" => {
+                if parts.get(1).is_some_and(|s| s.eq_ignore_ascii_case("skin")) {
+                    match parts.get(2) {
+                        Some(name) => {
+                            return Ok(CommandOutcome::Ui(UiAction::HarmonySkin(
+                                name.to_string(),
+                            )));
+                        }
+                        None => self.add_system_message(
+                            "Usage: .harmony skin <name> - write a skin (panel + frame \
+                             images) rendered from the harmony recipe",
+                        ),
+                    }
+                } else {
+                    let args: Vec<String> = parts[1..].iter().map(|s| s.to_string()).collect();
+                    self.handle_harmony(&args);
+                }
             }
 
             // Themes
@@ -2837,6 +3148,32 @@ mod tests {
                 op: ZoneOp::Off
             })
         );
+    }
+
+    #[test]
+    fn loadlayout_parses_keep_skin_flag() {
+        // `.loadlayout <name> [--keep-skin]` — lenient flag spellings, any
+        // argument order; the flag is meaningless without a name.
+        let cases: Vec<(&str, Option<&str>, bool)> = vec![
+            (".loadlayout combat", Some("combat"), false),
+            (".loadlayout combat --keep-skin", Some("combat"), true),
+            (".loadlayout --keep-skin combat", Some("combat"), true),
+            (".loadlayout combat --keep_my_skins", Some("combat"), true),
+            (".loadlayout combat --keepskin", Some("combat"), true),
+            (".loadlayout combat --keep-skins", Some("combat"), true),
+            (".loadlayout", None, false),
+            (".loadlayout --keep-skin", None, false), // flag without a name is dropped
+        ];
+        for (command, name, keep_skin) in cases {
+            assert_eq!(
+                ui_outcome(command),
+                CommandOutcome::Ui(UiAction::LoadLayout {
+                    name: name.map(str::to_string),
+                    keep_skin,
+                }),
+                "wrong outcome for {command}"
+            );
+        }
     }
 
     #[test]

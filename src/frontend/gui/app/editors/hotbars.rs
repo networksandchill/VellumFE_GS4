@@ -70,6 +70,7 @@ const LEAF_KINDS: &[&str] = &[
     "Casttime active",
     "Indicator",
     "Vital",
+    "Injury",
     "Spell affordable",
     "Hand empty",
     "Hand holds",
@@ -85,10 +86,11 @@ fn leaf_kind_index(cond: &Condition) -> usize {
         Condition::CtActive => 4,
         Condition::Indicator { .. } => 5,
         Condition::Vital { .. } => 6,
-        Condition::SpellAffordable { .. } => 7,
-        Condition::HandEmpty { .. } => 8,
-        Condition::HandHolds { .. } => 9,
-        Condition::SpellPrepared { .. } => 10,
+        Condition::Injury { .. } => 7,
+        Condition::SpellAffordable { .. } => 8,
+        Condition::HandEmpty { .. } => 9,
+        Condition::HandHolds { .. } => 10,
+        Condition::SpellPrepared { .. } => 11,
         Condition::All { .. } | Condition::Any { .. } => 0,
     }
 }
@@ -124,11 +126,16 @@ fn default_leaf(kind: usize) -> Condition {
             value: 25,
             unit: VitalUnit::Percent,
         },
-        7 => Condition::SpellAffordable { number: 101 },
-        8 => Condition::HandEmpty {
+        7 => Condition::Injury {
+            area: "neck".to_string(),
+            cmp: Cmp::Ge,
+            level: 1,
+        },
+        8 => Condition::SpellAffordable { number: 101 },
+        9 => Condition::HandEmpty {
             hand: crate::config::HandSlot::Right,
         },
-        9 => Condition::HandHolds {
+        10 => Condition::HandHolds {
             hand: crate::config::HandSlot::Right,
             item_type: Some("weapon".to_string()),
             name: None,
@@ -1335,6 +1342,24 @@ fn render_leaf_condition(
                     }
                 });
         }
+        Condition::Injury { area, cmp, level } => {
+            egui::ComboBox::from_id_salt(format!("{}_area", id))
+                .selected_text(area.as_str())
+                .show_ui(ui, |ui| {
+                    for candidate in crate::config::INJURY_AREAS {
+                        if ui.selectable_label(area == candidate, *candidate).clicked() {
+                            *area = candidate.to_string();
+                            changed = true;
+                        }
+                    }
+                });
+            changed |= cmp_combo(ui, &format!("{}_cmp", id), cmp);
+            // Levels: 1-3 wounds, 4-6 scars (0 = healthy).
+            changed |= ui
+                .add(egui::DragValue::new(level).range(0..=6))
+                .on_hover_text("1-3 = wounds, 4-6 = scars, 0 = healthy")
+                .changed();
+        }
         Condition::SpellAffordable { number } => {
             ui.label("spell #:");
             changed |= ui
@@ -1710,76 +1735,19 @@ fn render_icon_editor(
 }
 
 /// The clickable cell grid for one sheet ref. Returns true when a cell is
-/// picked; no-op for non-sheet refs.
+/// picked; no-op for non-sheet refs. Delegates to the shared
+/// `sheet_cell_grid` (also used by the indicator editor).
 fn cell_grid(
     ui: &mut egui::Ui,
     icon: &mut HotbarIcon,
     art: &SkinWidgetArt,
     count: u32,
 ) -> bool {
-    const THUMB: f32 = 36.0;
-    const PER_ROW: u32 = 8;
     let grayscale = icon.grayscale;
     let crate::data::IconRef::SheetCell { sheet, cell: current_cell } = &mut icon.icon else {
         return false;
     };
-    let mut changed = false;
-    egui::ScrollArea::vertical()
-        .id_salt("hotbar_cell_grid_scroll")
-        .max_height(3.5 * (THUMB + 6.0))
-        .show(ui, |ui| {
-            let rows = count.div_ceil(PER_ROW);
-            for row in 0..rows {
-                ui.horizontal(|ui| {
-                    for col in 0..PER_ROW {
-                        let cell = row * PER_ROW + col + 1;
-                        if cell > count {
-                            break;
-                        }
-                        let Some((texture, uv)) = art.sheet_cell(sheet, cell, grayscale)
-                        else {
-                            continue;
-                        };
-                        let (rect, response) = ui.allocate_exact_size(
-                            egui::vec2(THUMB, THUMB),
-                            egui::Sense::click(),
-                        );
-                        if ui.is_rect_visible(rect) {
-                            ui.painter().image(
-                                texture.texture,
-                                rect,
-                                uv,
-                                egui::Color32::WHITE,
-                            );
-                            let selected = *current_cell == cell;
-                            if selected || response.hovered() {
-                                let stroke = if selected {
-                                    egui::Stroke::new(
-                                        2.0,
-                                        ui.visuals().selection.stroke.color,
-                                    )
-                                } else {
-                                    ui.visuals().widgets.hovered.bg_stroke
-                                };
-                                ui.painter().rect_stroke(
-                                    rect,
-                                    2.0,
-                                    stroke,
-                                    egui::StrokeKind::Inside,
-                                );
-                            }
-                        }
-                        let response =
-                            response.on_hover_text(format!("cell {}", cell));
-                        if response.clicked() && *current_cell != cell {
-                            *current_cell = cell;
-                            changed = true;
-                        }
-                    }
-                });
-            }
-        });
-    changed
+    super::sheet_cell_grid(ui, "hotbar", sheet, current_cell, art, count, grayscale)
 }
 
 /// Style fields: label override, fg/bg colors, dim. Returns true when edited.

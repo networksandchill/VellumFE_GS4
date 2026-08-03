@@ -609,6 +609,44 @@ pub struct IndicatorWidgetData {
     pub default_color: Option<String>,  // legacy
 }
 
+/// Resolved dashboard layout, parsed from the config `layout` string. Shared
+/// so both frontends interpret `dashboard_layout` identically (the config
+/// stores the raw string; each renderer parses it through here).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum DashboardLayout {
+    Horizontal,
+    Vertical,
+    Grid { rows: usize, cols: usize },
+    Flow,
+}
+
+impl DashboardLayout {
+    /// Parse a `dashboard_layout` string: `horizontal`/`vertical`/`flow`, or
+    /// `grid:RxC` (e.g. `grid:2x3`). Anything unrecognized falls back to
+    /// horizontal.
+    pub fn from_str(value: &str) -> Self {
+        let lower = value.to_lowercase();
+        if lower.starts_with("grid") {
+            if let Some(spec) = lower.split(':').nth(1) {
+                let parts: Vec<_> = spec.split('x').collect();
+                if parts.len() == 2 {
+                    if let (Ok(r), Ok(c)) = (parts[0].parse::<usize>(), parts[1].parse::<usize>()) {
+                        if r > 0 && c > 0 {
+                            return DashboardLayout::Grid { rows: r, cols: c };
+                        }
+                    }
+                }
+            }
+        }
+        match lower.as_str() {
+            "vertical" => DashboardLayout::Vertical,
+            "flow" => DashboardLayout::Flow,
+            "horizontal" => DashboardLayout::Horizontal,
+            _ => DashboardLayout::Horizontal,
+        }
+    }
+}
+
 /// Dashboard widget specific data
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DashboardWidgetData {
@@ -636,6 +674,34 @@ pub struct DashboardIndicatorDef {
     pub icon: String,
     #[serde(default)]
     pub colors: Vec<String>,
+    /// Optional layer-stack group. Entries sharing a `stack` name render into
+    /// ONE cell, their active icons painted over each other (Wrayth-style:
+    /// blood/poison/disease share a square, each PNG authored to sit in a
+    /// different part of it so they don't collide). Empty = its own cell.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub stack: String,
+}
+
+impl DashboardWidgetData {
+    /// Number of rendered cells: unstacked entries each count once; entries
+    /// sharing a `stack` name collapse into one cell. Used for row-count
+    /// height math in both frontends so a stacked dashboard hugs its content.
+    pub fn cell_count(&self) -> usize {
+        let mut seen: Vec<String> = Vec::new();
+        let mut count = 0;
+        for def in &self.indicators {
+            if def.stack.is_empty() {
+                count += 1;
+            } else {
+                let key = def.stack.to_lowercase();
+                if !seen.contains(&key) {
+                    seen.push(key);
+                    count += 1;
+                }
+            }
+        }
+        count
+    }
 }
 
 fn default_indicator_active_color() -> Option<String> {
@@ -699,8 +765,6 @@ pub struct PerformanceWidgetData {
     #[serde(default = "default_true")]
     pub show_fps: bool,
     #[serde(default = "default_true")]
-    pub show_frame_times: bool,
-    #[serde(default = "default_true")]
     pub show_render_times: bool,
     #[serde(default = "default_true")]
     pub show_ui_times: bool,
@@ -713,19 +777,42 @@ pub struct PerformanceWidgetData {
     #[serde(default = "default_true")]
     pub show_events: bool,
     #[serde(default = "default_true")]
+    pub show_cpu: bool,
+    #[serde(default = "default_true")]
     pub show_memory: bool,
     #[serde(default = "default_true")]
     pub show_lines: bool,
     #[serde(default = "default_true")]
     pub show_uptime: bool,
     #[serde(default = "default_true")]
-    pub show_jitter: bool,
+    pub show_spike_log: bool,
     #[serde(default = "default_true")]
-    pub show_frame_spikes: bool,
+    pub show_per_window: bool,
+    /// Draw trend sparklines next to rows that have a series.
     #[serde(default = "default_true")]
-    pub show_event_lag: bool,
-    #[serde(default = "default_true")]
-    pub show_memory_delta: bool,
+    pub sparklines: bool,
+}
+
+impl Default for PerformanceWidgetData {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            show_fps: true,
+            show_render_times: true,
+            show_ui_times: true,
+            show_wrap_times: true,
+            show_net: true,
+            show_parse: true,
+            show_events: true,
+            show_cpu: true,
+            show_memory: true,
+            show_lines: true,
+            show_uptime: true,
+            show_spike_log: true,
+            show_per_window: true,
+            sparklines: true,
+        }
+    }
 }
 
 /// Targets widget specific data
@@ -1076,6 +1163,10 @@ pub struct MiniVitalsWidgetData {
     /// Concentration bar color (default: cyan) - DR specific
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub concentration_color: Option<String>,
+    /// Background color for unfilled cells inside each vital bar.
+    /// When unset, the window background or terminal default is used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub depleted_color: Option<String>,
 }
 
 /// Betrayer widget data (blood pool progress bar + item list) - GS4 only
@@ -1110,6 +1201,78 @@ fn is_default_bar_order(order: &Vec<String>) -> bool {
     *order == default_minivitals_bar_order()
 }
 
+#[cfg(test)]
+mod tests {
+    use super::MiniVitalsWidgetData;
+
+    #[test]
+    fn minivitals_depleted_color_defaults_to_none() {
+        let data: MiniVitalsWidgetData = toml::from_str("numbers_only = false").unwrap();
+
+        assert_eq!(data.depleted_color, None);
+    }
+
+    #[test]
+    fn minivitals_depleted_color_round_trips_and_none_is_omitted() {
+        let data: MiniVitalsWidgetData =
+            toml::from_str("depleted_color = \"#202020\"").unwrap();
+        assert_eq!(data.depleted_color.as_deref(), Some("#202020"));
+
+        let serialized = toml::to_string(&MiniVitalsWidgetData::default()).unwrap();
+        assert!(!serialized.contains("depleted_color"));
+    }
+}
+
+#[cfg(test)]
+mod dashboard_layout_tests {
+    use super::*;
+
+    #[test]
+    fn parses_named_layouts() {
+        assert_eq!(DashboardLayout::from_str("horizontal"), DashboardLayout::Horizontal);
+        assert_eq!(DashboardLayout::from_str("VERTICAL"), DashboardLayout::Vertical);
+        assert_eq!(DashboardLayout::from_str("Flow"), DashboardLayout::Flow);
+    }
+
+    #[test]
+    fn parses_grid_spec() {
+        assert_eq!(
+            DashboardLayout::from_str("grid:2x3"),
+            DashboardLayout::Grid { rows: 2, cols: 3 }
+        );
+    }
+
+    #[test]
+    fn unrecognized_and_bad_grid_fall_back_to_horizontal() {
+        assert_eq!(DashboardLayout::from_str("nonsense"), DashboardLayout::Horizontal);
+        assert_eq!(DashboardLayout::from_str("grid:0x3"), DashboardLayout::Horizontal);
+        assert_eq!(DashboardLayout::from_str("grid:2"), DashboardLayout::Horizontal);
+    }
+
+    #[test]
+    fn cell_count_collapses_stack_groups() {
+        let ind = |id: &str, stack: &str| DashboardIndicatorDef {
+            id: id.to_string(),
+            icon: String::new(),
+            colors: Vec::new(),
+            stack: stack.to_string(),
+        };
+        let data = DashboardWidgetData {
+            layout: "grid:2x3".to_string(),
+            spacing: 0,
+            hide_inactive: true,
+            indicators: vec![
+                ind("BLEEDING", "affliction"),
+                ind("POISONED", "affliction"),
+                ind("DISEASED", "affliction"),
+                ind("STUNNED", ""),
+                ind("WEBBED", ""),
+            ],
+        };
+        // Three afflictions collapse to one cell; two singletons = 3 cells.
+        assert_eq!(data.cell_count(), 3);
+    }
+}
 
 #[cfg(test)]
 mod visibility_tests {

@@ -53,6 +53,7 @@ impl Config {
         config.controller_wheels = Self::load_controller_wheels(character).unwrap_or_default();
         config.controller_wheels_meta =
             Self::load_controller_wheels_meta(character).unwrap_or_default();
+        config.touch_wheel = Self::load_touch_wheel(character).unwrap_or_default();
         config.controller_overlay = Self::load_controller_overlay(character).unwrap_or_default();
         config.controller_rumble = Self::load_controller_rumble(character).unwrap_or_default();
         config.controller_tuning = Self::load_controller_tuning(character).unwrap_or_default();
@@ -581,6 +582,7 @@ impl Config {
         config.controller_wheels = Self::load_controller_wheels(character).unwrap_or_default();
         config.controller_wheels_meta =
             Self::load_controller_wheels_meta(character).unwrap_or_default();
+        config.touch_wheel = Self::load_touch_wheel(character).unwrap_or_default();
         config.controller_overlay = Self::load_controller_overlay(character).unwrap_or_default();
         config.controller_rumble = Self::load_controller_rumble(character).unwrap_or_default();
         config.controller_tuning = Self::load_controller_tuning(character).unwrap_or_default();
@@ -759,20 +761,19 @@ impl Default for Config {
                 perf_stats_width: default_perf_stats_width(),
                 perf_stats_height: default_perf_stats_height(),
                 perf_show_fps: true,
-                perf_show_frame_times: false,
                 perf_show_render_times: true,
                 perf_show_ui_times: true,
                 perf_show_wrap_times: true,
                 perf_show_net: true,
                 perf_show_parse: true,
                 perf_show_events: true,
+                perf_show_cpu: true,
                 perf_show_memory: true,
                 perf_show_lines: true,
                 perf_show_uptime: true,
-                perf_show_jitter: false,
-                perf_show_frame_spikes: false,
-                perf_show_event_lag: false,
-                perf_show_memory_delta: true,
+                perf_show_spike_log: true,
+                perf_show_per_window: true,
+                perf_sparklines: true,
                 color_mode: ColorMode::default(),
                 timestamp_position: TimestampPosition::default(),
                 command_echo: default_command_echo(),
@@ -788,6 +789,8 @@ impl Default for Config {
             controller_shift_binds: HashMap::new(), // Loaded from [controller_shift]
             controller_wheel: Vec::new(),   // Loaded from [[controller_wheel]]
             controller_wheels: HashMap::new(), // Loaded from [controller_wheels.<name>]
+            touch_wheel: Vec::new(),        // Loaded from [touch_wheel] slices
+
             controller_wheels_meta: HashMap::new(), // Loaded from [controller_wheels_meta.<name>]
             controller_overlay: Vec::new(), // Loaded from [controller_overlay]
             controller_rumble: RumbleConfig::default(),

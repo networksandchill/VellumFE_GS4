@@ -2,7 +2,7 @@
 //!
 //! ## File Locations
 //!
-//! Per-character GUI state:
+//! Per-character GUI state (live autosave slot):
 //! ```text
 //! ~/.vellum-fe/gui/<profile>/<character>/layout_v1.json
 //! ```
@@ -12,12 +12,17 @@
 //! ~/.vellum-fe/gui/<profile>/<character>/layout_v1.bak.json
 //! ```
 //!
+//! Named checkpoints (`.savelayout <name>`) live in the shared pool
+//! `~/.vellum-fe/layouts/<name>.json`, next to the TUI's `<name>.toml`
+//! layouts — any character can load a layout any character saved.
+//!
 //! ## Schema Versioning
 //!
 //! Layout files are versioned via `schema_version` field. The migration system
 //! allows loading older versions and upgrading to current.
 
 use super::tab_id::TabKey;
+use crate::config::is_valid_layout_name;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -228,6 +233,11 @@ pub struct VitalsConfig {
     /// Enabled bars, in display order
     #[serde(default = "default_vital_bars")]
     pub bars: Vec<VitalKind>,
+
+    /// Color for the unfilled (depleted) portion of each bar, as a hex or
+    /// palette-name string. None follows the theme's track color.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub depleted_color: Option<String>,
 }
 
 fn default_vitals_bar_height() -> f32 {
@@ -250,6 +260,7 @@ impl Default for VitalsConfig {
             bar_height: default_vitals_bar_height(),
             text_format: VitalsTextFormat::default(),
             bars: default_vital_bars(),
+            depleted_color: None,
         }
     }
 }
@@ -281,6 +292,16 @@ pub struct TabGroup {
     /// member to absorb the leftover. Stale keys are ignored.
     #[serde(default)]
     pub end_anchored: Vec<TabKey>,
+    /// Per-member relative size weight for FLEXIBLE members (buffs, spells,
+    /// doll, text) along the group's stack axis. A member absent from this
+    /// map, or with a non-positive weight, defaults to 1.0. The leftover
+    /// (after fixed bars take their natural height) splits in proportion to
+    /// these weights, so e.g. buffs=2.0 / cooldowns=1.0 gives buffs twice
+    /// the height of cooldowns. Empty = the historical equal split, so
+    /// existing saved groups load unchanged. Fixed one-row members ignore
+    /// their weight. Stale keys are ignored.
+    #[serde(default)]
+    pub weights: Vec<(TabKey, f32)>,
 }
 
 /// Application-wide GUI sizing/accessibility settings.
@@ -347,6 +368,14 @@ pub struct GuiUiSettings {
     /// web doll endpoint and the headless/TUI frontends.
     #[serde(default)]
     pub active_skin: Option<String>,
+
+    /// Theme (preset or custom name) at save time, so a checkpoint loaded on
+    /// another profile reproduces the saver's look. The live source of truth
+    /// is config.active_theme; the save path stamps this and the load path
+    /// mirrors it back into config. None = legacy file from before themes
+    /// rode with layouts — loading one keeps the current theme.
+    #[serde(default)]
+    pub active_theme: Option<String>,
 
     /// Injury doll image override as a pool-relative path
     /// ("dolls/dwarf_ranger.png"); None follows the active skin's
@@ -552,6 +581,7 @@ impl Default for GuiUiSettings {
             auto_contrast_bar_text: default_true(),
             vitals: VitalsConfig::default(),
             active_skin: None,
+            active_theme: None,
             doll_image: None,
             status_icons: StatusIconSettings::default(),
             compass_set: None,
@@ -637,12 +667,22 @@ pub struct MainViewportState {
     #[serde(default)]
     pub outer_pos: Option<[f32; 2]>,
 
-    /// Inner (client area) size [width, height]
+    /// Inner (client area) size [width, height]. When `maximized`, this is
+    /// the last UN-maximized size (the restore geometry), NOT the canvas the
+    /// rects were captured against — see `canvas_size`.
     pub inner_size: [f32; 2],
 
     /// Whether the window was maximized
     #[serde(default)]
     pub maximized: bool,
+
+    /// The ACTUAL inner size at save time, even while maximized. This is the
+    /// reference canvas for rescaling the saved rects; using `inner_size`
+    /// for a maximized save scaled rects from the smaller restore size and
+    /// blew them past the screen. None = file predates the field; fall back
+    /// to `inner_size`.
+    #[serde(default)]
+    pub canvas_size: Option<[f32; 2]>,
 }
 
 /// Per-tab settings entry for serialization.
@@ -698,6 +738,16 @@ pub struct GuiLayoutFileV1 {
     /// Main OS window geometry, restored at launch
     #[serde(default)]
     pub main_viewport: Option<MainViewportState>,
+
+    /// Full core window definitions captured at save time. The dock snapshot
+    /// only references windows by TabKey; without the defs, loading a named
+    /// layout into a profile that lacks those windows (a fresh character)
+    /// would silently drop them. `.loadlayout` recreates any missing window
+    /// from this list before reconciling the arrangement. Empty on files
+    /// saved before this field existed (serde default), which fall back to
+    /// the old arrangement-only behavior.
+    #[serde(default)]
+    pub window_defs: Vec<crate::config::WindowDef>,
 }
 
 impl GuiLayoutFileV1 {
@@ -715,6 +765,7 @@ impl GuiLayoutFileV1 {
             ui_settings: GuiUiSettings::default(),
             detached_viewports: HashMap::new(),
             main_viewport: None,
+            window_defs: Vec::new(),
         }
     }
 
@@ -985,50 +1036,38 @@ fn write_layout_atomically(
 // (`layout_v1.json`): loading one replaces the live arrangement, and the
 // autosave keeps writing the live slot afterward — fiddling never rewrites
 // a checkpoint.
+//
+// Checkpoints live in the SHARED pool `~/.vellum-fe/layouts/` next to the
+// TUI's TOML layouts (`<name>.json` vs `<name>.toml`), so — exactly like
+// the TUI — any character can load a layout any character saved. Loading
+// already tolerates foreign checkpoints: the profile/character stamp is
+// not validated and unknown tabs drop out during reconciliation.
 
-/// Directory holding a character's named layout checkpoints.
-pub fn named_layouts_dir(profile: &str, character: &str) -> Result<PathBuf> {
-    Ok(layout_dir(profile, character)?.join("layouts"))
+/// Directory holding named layout checkpoints: the shared pool, common to
+/// every profile and character.
+pub fn named_layouts_dir() -> Result<PathBuf> {
+    crate::config::Config::layouts_dir()
 }
 
-/// True when a checkpoint name is safe to use as a file stem (also blocks
-/// path traversal, since names become `<name>.json`).
-pub fn is_valid_layout_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() <= 64
-        && name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-}
-
-/// Save a snapshot as a named checkpoint.
-pub fn save_named_layout(
-    layout: &GuiLayoutFileV1,
-    profile: &str,
-    character: &str,
-    name: &str,
-) -> Result<()> {
+/// Save a snapshot as a named checkpoint in the shared pool.
+pub fn save_named_layout(layout: &GuiLayoutFileV1, name: &str) -> Result<()> {
     if !is_valid_layout_name(name) {
         anyhow::bail!("Layout names use letters, digits, '-' and '_' only");
     }
-    let dir = named_layouts_dir(profile, character)?;
-    std::fs::create_dir_all(&dir).context("Failed to create named layouts directory")?;
+    let dir = named_layouts_dir()?;
+    std::fs::create_dir_all(&dir).context("Failed to create layouts directory")?;
     let path = dir.join(format!("{name}.json"));
     write_layout_atomically(layout, &dir, &format!("{name}.tmp.json"), &path)?;
     tracing::info!("Saved named GUI layout to {:?}", path);
     Ok(())
 }
 
-/// Load a named checkpoint (with schema migration).
-///
-/// Unlike the live slot, the profile/character stamp is not validated:
-/// a checkpoint copied from another character loads fine — tabs that don't
-/// exist in this session are dropped during reconciliation.
-pub fn load_named_layout(profile: &str, character: &str, name: &str) -> Result<GuiLayoutFileV1> {
+/// Load a named checkpoint from the shared pool (with schema migration).
+pub fn load_named_layout(name: &str) -> Result<GuiLayoutFileV1> {
     if !is_valid_layout_name(name) {
         anyhow::bail!("Layout names use letters, digits, '-' and '_' only");
     }
-    let path = named_layouts_dir(profile, character)?.join(format!("{name}.json"));
+    let path = named_layouts_dir()?.join(format!("{name}.json"));
     if !path.exists() {
         anyhow::bail!("No saved layout named '{name}'");
     }
@@ -1036,9 +1075,9 @@ pub fn load_named_layout(profile: &str, character: &str, name: &str) -> Result<G
     load_from_path(&path)
 }
 
-/// List a character's named checkpoints, sorted.
-pub fn list_named_layouts(profile: &str, character: &str) -> Vec<String> {
-    let Ok(dir) = named_layouts_dir(profile, character) else {
+/// List the shared pool's named checkpoints, sorted.
+pub fn list_named_layouts() -> Vec<String> {
+    let Ok(dir) = named_layouts_dir() else {
         return Vec::new();
     };
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -1058,9 +1097,206 @@ pub fn list_named_layouts(profile: &str, character: &str) -> Vec<String> {
     names
 }
 
+// ---- Legacy checkpoint migration -------------------------------------------
+//
+// Before the shared pool, checkpoints were buried per character at
+// `gui/<profile>/<character>/layouts/<name>.json`, invisible to everyone
+// else. Sweep every profile and character at startup and move them into
+// the pool. The sweep runs each launch (a cheap read_dir when nothing is
+// left), which also rescues checkpoints written by an old build run after
+// the first migration.
+
+/// Move all legacy per-character checkpoints into the shared pool.
+///
+/// Returns `(old_name, pool_name)` per moved file. A name already taken in
+/// the pool by identical content is deduplicated silently; different
+/// content lands as `<name>_<character>` (then `_2`, `_3`, ...).
+pub fn migrate_legacy_named_layouts() -> Vec<(String, String)> {
+    let Ok(base) = crate::config::Config::base_dir() else {
+        return Vec::new();
+    };
+    migrate_legacy_named_layouts_in(&base)
+}
+
+/// Testable body of [`migrate_legacy_named_layouts`], rooted at `base`
+/// instead of the real config dir.
+fn migrate_legacy_named_layouts_in(base: &std::path::Path) -> Vec<(String, String)> {
+    let pool = base.join("layouts");
+    let mut moved = Vec::new();
+    let Ok(profiles) = std::fs::read_dir(base.join("gui")) else {
+        return moved;
+    };
+    for profile in profiles.flatten() {
+        let Ok(characters) = std::fs::read_dir(profile.path()) else {
+            continue;
+        };
+        for character in characters.flatten() {
+            let legacy = character.path().join("layouts");
+            if !legacy.is_dir() {
+                continue;
+            }
+            let character_name = character.file_name().to_string_lossy().to_string();
+            let Ok(entries) = std::fs::read_dir(&legacy) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let src = entry.path();
+                if src.extension().and_then(|e| e.to_str()) != Some("json") {
+                    continue;
+                }
+                let Some(stem) = src.file_stem().and_then(|s| s.to_str()) else {
+                    continue;
+                };
+                // Skips stray `<name>.tmp.json` leftovers too (their stem
+                // contains a '.').
+                if !is_valid_layout_name(stem) {
+                    continue;
+                }
+                if let Some(pool_name) = move_into_pool(&src, &pool, stem, &character_name) {
+                    moved.push((stem.to_string(), pool_name));
+                }
+            }
+            // Best-effort: an emptied legacy dir disappears; one with
+            // strays stays behind harmlessly.
+            let _ = std::fs::remove_dir(&legacy);
+        }
+    }
+    moved
+}
+
+/// Move one legacy checkpoint into the pool, resolving name collisions.
+/// Returns the pool name it ended up under, or None when it was a
+/// duplicate of an existing pool file (source still removed) or could not
+/// be moved.
+fn move_into_pool(
+    src: &std::path::Path,
+    pool: &std::path::Path,
+    stem: &str,
+    character: &str,
+) -> Option<String> {
+    if std::fs::create_dir_all(pool).is_err() {
+        return None;
+    }
+    let suffix: String = character
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .take(20)
+        .collect();
+    let suffix = if suffix.is_empty() {
+        "legacy".to_string()
+    } else {
+        suffix
+    };
+    let base_stem: String = stem.chars().take(40).collect();
+    let mut candidates = vec![stem.to_string(), format!("{base_stem}_{suffix}")];
+    for n in 2..=9 {
+        candidates.push(format!("{base_stem}_{suffix}_{n}"));
+    }
+    for candidate in candidates {
+        let dest = pool.join(format!("{candidate}.json"));
+        if dest.exists() {
+            // Same bytes already pooled (e.g. the same checkpoint saved by
+            // several characters): drop the copy.
+            let same = match (std::fs::read(src), std::fs::read(&dest)) {
+                (Ok(a), Ok(b)) => a == b,
+                _ => false,
+            };
+            if same {
+                let _ = std::fs::remove_file(src);
+                return None;
+            }
+            continue;
+        }
+        let renamed = std::fs::rename(src, &dest).is_ok()
+            || (std::fs::copy(src, &dest).is_ok() && std::fs::remove_file(src).is_ok());
+        if renamed {
+            tracing::info!("Migrated legacy GUI layout {:?} -> {:?}", src, dest);
+            return Some(candidate);
+        }
+        return None;
+    }
+    tracing::warn!("Could not find a free pool name for legacy layout {:?}", src);
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn legacy_checkpoint(base: &std::path::Path, profile: &str, character: &str, name: &str) {
+        let dir = base.join("gui").join(profile).join(character).join("layouts");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut layout = GuiLayoutFileV1::new(profile, character);
+        layout.saved_at_utc = format!("stamp-{profile}-{character}-{name}");
+        std::fs::write(
+            dir.join(format!("{name}.json")),
+            serde_json::to_string_pretty(&layout).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_migrate_legacy_checkpoints_into_pool() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path();
+        legacy_checkpoint(base, "prime", "Alpha", "combat");
+        legacy_checkpoint(base, "prime", "Beta", "town");
+
+        let moved = migrate_legacy_named_layouts_in(base);
+        assert_eq!(moved.len(), 2);
+
+        let pool = base.join("layouts");
+        assert!(pool.join("combat.json").exists());
+        assert!(pool.join("town.json").exists());
+        // Legacy dirs emptied out and removed
+        assert!(!base.join("gui/prime/Alpha/layouts").exists());
+        assert!(!base.join("gui/prime/Beta/layouts").exists());
+        // Live autosave slots untouched by the sweep
+        assert!(base.join("gui/prime/Alpha").exists());
+
+        // Re-running is a no-op
+        assert!(migrate_legacy_named_layouts_in(base).is_empty());
+    }
+
+    #[test]
+    fn test_migrate_legacy_checkpoint_collision_gets_character_suffix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path();
+        // Two characters saved DIFFERENT content under the same name
+        legacy_checkpoint(base, "prime", "Alpha", "combat");
+        legacy_checkpoint(base, "prime", "Beta", "combat");
+
+        let moved = migrate_legacy_named_layouts_in(base);
+        assert_eq!(moved.len(), 2);
+
+        let pool = base.join("layouts");
+        assert!(pool.join("combat.json").exists());
+        assert!(
+            pool.join("combat_Alpha.json").exists() || pool.join("combat_Beta.json").exists(),
+            "loser of the name race lands under a character suffix"
+        );
+    }
+
+    #[test]
+    fn test_migrate_legacy_checkpoint_identical_content_deduped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path();
+        let dir_a = base.join("gui/prime/Alpha/layouts");
+        let dir_b = base.join("gui/prime/Beta/layouts");
+        std::fs::create_dir_all(&dir_a).unwrap();
+        std::fs::create_dir_all(&dir_b).unwrap();
+        let layout = GuiLayoutFileV1::new("prime", "Shared");
+        let bytes = serde_json::to_string_pretty(&layout).unwrap();
+        std::fs::write(dir_a.join("combat.json"), &bytes).unwrap();
+        std::fs::write(dir_b.join("combat.json"), &bytes).unwrap();
+
+        let moved = migrate_legacy_named_layouts_in(base);
+        // Only the first copy counts as moved; the twin is dropped.
+        assert_eq!(moved.len(), 1);
+        assert!(base.join("layouts/combat.json").exists());
+        assert!(!base.join("layouts/combat_Alpha.json").exists());
+        assert!(!base.join("layouts/combat_Beta.json").exists());
+    }
 
     #[test]
     fn test_layout_name_validation() {

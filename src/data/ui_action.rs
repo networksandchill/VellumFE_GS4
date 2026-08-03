@@ -89,6 +89,8 @@ pub enum UiAction {
     MenuKeybinds,
     Controller,
     Hotbars,
+    /// The Jinx asset-manager panel (`.jinx gui`). GUI-only.
+    JinxPanel,
     Streams,
     Colors,
     AddColor,
@@ -99,11 +101,16 @@ pub enum UiAction {
     SetTheme(String),
     EditTheme,
     SorterEdit,
+    /// Open the touch-wheel editor (the phone's long-press radial wheel).
+    TouchWheelEditor,
 
     // Skins (GUI graphics)
     Skins,
     SetSkin(String),
     MakeSkin(String),
+    /// Write a skin (panel + frame images and manifest) rendered from the
+    /// current harmony recipe.
+    HarmonySkin(String),
     ReloadSkin,
 
     // Terminal palette (TUI)
@@ -128,6 +135,11 @@ pub enum UiAction {
     WindowList,
     CustomWindows,
     KnownWindows,
+    /// Open the indicator template builder (`.indicators`): create/edit all
+    /// status indicators, their conditions, and condition-driven icons in
+    /// one place. First-class entry point so the builder is reachable even
+    /// when every indicator is already placed.
+    EditIndicators,
 
     // Stream routing menu entries (TUI `.streams` menu)
     StreamActions(String),
@@ -144,12 +156,21 @@ pub enum UiAction {
     // .uiexport/.uiimport), each frontend owns its persistence model —
     // TOML cell layouts in the TUI, window snapshots in the GUI.
     SaveLayout(Option<String>),
-    LoadLayout(Option<String>),
+    /// `keep_skin` (`.loadlayout <name> --keep-skin`): keep the loader's
+    /// appearance (skin/theme/art) and take only the arrangement. Meaningless
+    /// without a name (bare `.loadlayout` just lists checkpoints).
+    LoadLayout {
+        name: Option<String>,
+        keep_skin: bool,
+    },
     ListLayouts,
     ResizeLayout,
     SaveSkin(String),
     UiExport(Vec<String>),
     UiImport(Vec<String>),
+    /// The pack editor panel (.packs): guided export/import of
+    /// .vellumpack files.
+    PackEditor,
 
     // GUI shell zones
     Zone { zone: ShellZoneTarget, op: ZoneOp },
@@ -161,6 +182,9 @@ pub enum UiAction {
 
     // Diagnostics
     SnapDebug,
+    /// Write a `.performance dump` report; each frontend appends its own
+    /// sections (the GUI adds graphics-toolkit internals) before writing.
+    PerformanceDump,
 }
 
 impl UiAction {
@@ -181,6 +205,9 @@ impl UiAction {
         }
         if let Some(name) = body.strip_prefix("makeskin:") {
             return Some(UiAction::MakeSkin(name.to_string()));
+        }
+        if let Some(name) = body.strip_prefix("harmonyskin:") {
+            return Some(UiAction::HarmonySkin(name.to_string()));
         }
         if let Some(name) = body.strip_prefix("editwindow:") {
             return Some(UiAction::EditWindow(Some(name.to_string())));
@@ -223,8 +250,17 @@ impl UiAction {
         if let Some(name) = body.strip_prefix("layout:save:") {
             return Some(UiAction::SaveLayout(Some(name.to_string())));
         }
-        if let Some(name) = body.strip_prefix("layout:load:") {
-            return Some(UiAction::LoadLayout(Some(name.to_string())));
+        if let Some(rest) = body.strip_prefix("layout:load:") {
+            // Layout names are letters/digits/-/_ only, so a ":keep-skin"
+            // suffix is unambiguous.
+            let (name, keep_skin) = match rest.strip_suffix(":keep-skin") {
+                Some(name) => (name, true),
+                None => (rest, false),
+            };
+            return Some(UiAction::LoadLayout {
+                name: Some(name.to_string()),
+                keep_skin,
+            });
         }
         if let Some(name) = body.strip_prefix("saveskin:") {
             return Some(UiAction::SaveSkin(name.to_string()));
@@ -259,6 +295,7 @@ impl UiAction {
             "menukeybinds" => UiAction::MenuKeybinds,
             "controller" => UiAction::Controller,
             "hotbars" => UiAction::Hotbars,
+            "jinxpanel" => UiAction::JinxPanel,
             "streams" => UiAction::Streams,
             "colors" => UiAction::Colors,
             "addcolor" => UiAction::AddColor,
@@ -268,6 +305,7 @@ impl UiAction {
             "themes" => UiAction::Themes,
             "edittheme" => UiAction::EditTheme,
             "sorteredit" => UiAction::SorterEdit,
+            "touchwheel" => UiAction::TouchWheelEditor,
             "skins" => UiAction::Skins,
             "reloadskin" => UiAction::ReloadSkin,
             "setpalette" => UiAction::SetPalette,
@@ -282,15 +320,21 @@ impl UiAction {
             "windows" | "listwindows" => UiAction::WindowList,
             "customwindows" => UiAction::CustomWindows,
             "knownwindows" => UiAction::KnownWindows,
+            "indicators" => UiAction::EditIndicators,
             "webui" => UiAction::WebUiPicker,
             "webui:off" => UiAction::WebUiOff,
             "snapdebug" => UiAction::SnapDebug,
+            "performance:dump" => UiAction::PerformanceDump,
             "layout:save" => UiAction::SaveLayout(None),
-            "layout:load" => UiAction::LoadLayout(None),
+            "layout:load" => UiAction::LoadLayout {
+                name: None,
+                keep_skin: false,
+            },
             "layout:list" => UiAction::ListLayouts,
             "layout:resize" => UiAction::ResizeLayout,
             "uiexport" => UiAction::UiExport(Vec::new()),
             "uiimport" => UiAction::UiImport(Vec::new()),
+            "packeditor" => UiAction::PackEditor,
             _ => return None,
         })
     }
@@ -311,6 +355,7 @@ impl std::fmt::Display for UiAction {
             UiAction::MenuKeybinds => write!(f, "action:menukeybinds"),
             UiAction::Controller => write!(f, "action:controller"),
             UiAction::Hotbars => write!(f, "action:hotbars"),
+            UiAction::JinxPanel => write!(f, "action:jinxpanel"),
             UiAction::Streams => write!(f, "action:streams"),
             UiAction::Colors => write!(f, "action:colors"),
             UiAction::AddColor => write!(f, "action:addcolor"),
@@ -321,9 +366,11 @@ impl std::fmt::Display for UiAction {
             UiAction::SetTheme(name) => write!(f, "action:settheme:{name}"),
             UiAction::EditTheme => write!(f, "action:edittheme"),
             UiAction::SorterEdit => write!(f, "action:sorteredit"),
+            UiAction::TouchWheelEditor => write!(f, "action:touchwheel"),
             UiAction::Skins => write!(f, "action:skins"),
             UiAction::SetSkin(name) => write!(f, "action:setskin:{name}"),
             UiAction::MakeSkin(name) => write!(f, "action:makeskin:{name}"),
+            UiAction::HarmonySkin(name) => write!(f, "action:harmonyskin:{name}"),
             UiAction::ReloadSkin => write!(f, "action:reloadskin"),
             UiAction::SetPalette => write!(f, "action:setpalette"),
             UiAction::ResetPalette => write!(f, "action:resetpalette"),
@@ -340,6 +387,7 @@ impl std::fmt::Display for UiAction {
             UiAction::WindowList => write!(f, "action:windows"),
             UiAction::CustomWindows => write!(f, "action:customwindows"),
             UiAction::KnownWindows => write!(f, "action:knownwindows"),
+            UiAction::EditIndicators => write!(f, "action:indicators"),
             UiAction::StreamActions(stream) => write!(f, "action:streamacts:{stream}"),
             UiAction::StreamPickWindow(stream) => write!(f, "action:streamwin:{stream}"),
             UiAction::StreamRoute { kind, stream } => {
@@ -352,8 +400,15 @@ impl std::fmt::Display for UiAction {
             UiAction::LoadLayoutToml(name) => write!(f, "action:loadlayout:{name}"),
             UiAction::SaveLayout(None) => write!(f, "action:layout:save"),
             UiAction::SaveLayout(Some(name)) => write!(f, "action:layout:save:{name}"),
-            UiAction::LoadLayout(None) => write!(f, "action:layout:load"),
-            UiAction::LoadLayout(Some(name)) => write!(f, "action:layout:load:{name}"),
+            UiAction::LoadLayout { name: None, .. } => write!(f, "action:layout:load"),
+            UiAction::LoadLayout {
+                name: Some(name),
+                keep_skin: false,
+            } => write!(f, "action:layout:load:{name}"),
+            UiAction::LoadLayout {
+                name: Some(name),
+                keep_skin: true,
+            } => write!(f, "action:layout:load:{name}:keep-skin"),
             UiAction::ListLayouts => write!(f, "action:layout:list"),
             UiAction::ResizeLayout => write!(f, "action:layout:resize"),
             UiAction::SaveSkin(name) => write!(f, "action:saveskin:{name}"),
@@ -361,6 +416,7 @@ impl std::fmt::Display for UiAction {
             UiAction::UiExport(args) => write!(f, "action:uiexport:{}", args.join(" ")),
             UiAction::UiImport(args) if args.is_empty() => write!(f, "action:uiimport"),
             UiAction::UiImport(args) => write!(f, "action:uiimport:{}", args.join(" ")),
+            UiAction::PackEditor => write!(f, "action:packeditor"),
             UiAction::Zone { zone, op } => {
                 write!(f, "action:zone:{}:{}", zone.as_str(), op.as_str())
             }
@@ -368,6 +424,7 @@ impl std::fmt::Display for UiAction {
             UiAction::WebUiOff => write!(f, "action:webui:off"),
             UiAction::WebUiOpen(page) => write!(f, "action:webui:open:{page}"),
             UiAction::SnapDebug => write!(f, "action:snapdebug"),
+            UiAction::PerformanceDump => write!(f, "action:performance:dump"),
         }
     }
 }
@@ -403,6 +460,7 @@ mod tests {
             UiAction::MenuKeybinds,
             UiAction::Controller,
             UiAction::Hotbars,
+            UiAction::JinxPanel,
             UiAction::Streams,
             UiAction::Colors,
             UiAction::AddColor,
@@ -413,9 +471,11 @@ mod tests {
             UiAction::SetTheme("gruvbox".into()),
             UiAction::EditTheme,
             UiAction::SorterEdit,
+            UiAction::TouchWheelEditor,
             UiAction::Skins,
             UiAction::SetSkin("wrayth".into()),
             UiAction::MakeSkin("mine".into()),
+            UiAction::HarmonySkin("mine".into()),
             UiAction::ReloadSkin,
             UiAction::SetPalette,
             UiAction::ResetPalette,
@@ -432,6 +492,7 @@ mod tests {
             UiAction::WindowList,
             UiAction::CustomWindows,
             UiAction::KnownWindows,
+            UiAction::EditIndicators,
             UiAction::StreamActions("speech".into()),
             UiAction::StreamPickWindow("speech".into()),
             UiAction::StreamRoute {
@@ -446,8 +507,18 @@ mod tests {
             UiAction::LoadLayoutToml("combat".into()),
             UiAction::SaveLayout(None),
             UiAction::SaveLayout(Some("combat".into())),
-            UiAction::LoadLayout(None),
-            UiAction::LoadLayout(Some("combat".into())),
+            UiAction::LoadLayout {
+                name: None,
+                keep_skin: false,
+            },
+            UiAction::LoadLayout {
+                name: Some("combat".into()),
+                keep_skin: false,
+            },
+            UiAction::LoadLayout {
+                name: Some("combat".into()),
+                keep_skin: true,
+            },
             UiAction::ListLayouts,
             UiAction::ResizeLayout,
             UiAction::SaveSkin("mine".into()),
@@ -462,6 +533,8 @@ mod tests {
             UiAction::WebUiOff,
             UiAction::WebUiOpen("bigshot".into()),
             UiAction::SnapDebug,
+            UiAction::PerformanceDump,
+            UiAction::PackEditor,
         ]
     }
 

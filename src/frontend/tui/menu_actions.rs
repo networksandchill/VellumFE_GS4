@@ -58,7 +58,13 @@ pub fn handle_ui_action(
     match action {
         // The Layouts menu names TOML layouts explicitly; `.loadlayout`
         // resolves to the same thing in this frontend.
-        UiAction::LoadLayoutToml(layout_name) | UiAction::LoadLayout(Some(layout_name)) => {
+        // The TUI has no skins; `keep_skin` is a GUI-only concern and is
+        // accepted-and-ignored here.
+        UiAction::LoadLayoutToml(layout_name)
+        | UiAction::LoadLayout {
+            name: Some(layout_name),
+            ..
+        } => {
             // Load a layout with proper terminal size
             tracing::info!("[MENU_ACTIONS] Menu action loadlayout: '{}'", layout_name);
             let (width, height) = frontend.size();
@@ -72,12 +78,12 @@ pub fn handle_ui_action(
             }
             app_core.needs_render = true;
         }
-        UiAction::LoadLayout(None) => {
-            // Bare `.loadlayout` historically loaded 'default'.
-            let (width, height) = frontend.size();
-            if let Some((theme_id, theme)) = app_core.load_layout("default", width, height) {
-                frontend.update_theme_cache(theme_id, theme);
-            }
+        UiAction::LoadLayout { name: None, .. } => {
+            // Bare `.loadlayout` shows usage + the saved list, matching the
+            // GUI (it used to load 'default', which silently replaced the
+            // current arrangement on a bare invocation).
+            app_core.add_system_message("Usage: .loadlayout <name>");
+            app_core.list_layouts();
             app_core.needs_render = true;
         }
         UiAction::SaveLayout(name) => {
@@ -416,6 +422,19 @@ pub fn handle_ui_action(
             );
             app_core.needs_render = true;
         }
+        UiAction::EditIndicators => {
+            // The indicator template builder: create/edit every status
+            // indicator, its conditions, and condition-driven icons in one
+            // place. Same editor the `Indicators > Editor` leaf opens, now a
+            // first-class action so it is reachable even with every indicator
+            // already placed.
+            frontend.indicator_template_editor = Some(
+                crate::frontend::tui::indicator_template_editor::IndicatorTemplateEditor::new(),
+            );
+            close_all_menus(&mut app_core.ui_state);
+            app_core.ui_state.input_mode = InputMode::IndicatorTemplateEditor;
+            app_core.needs_render = true;
+        }
         UiAction::Hotbars => {
             // Open the hotbar editor (bars -> buttons -> button form)
             frontend.hotbar_editor = Some(
@@ -507,6 +526,21 @@ pub fn handle_ui_action(
             close_all_menus(&mut app_core.ui_state);
             app_core.ui_state.input_mode = InputMode::SettingsEditor;
         }
+        UiAction::PackEditor => {
+            match crate::config::Config::base_dir() {
+                Ok(base) => {
+                    frontend.pack_editor = Some(
+                        crate::frontend::tui::pack_editor::PackEditorWidget::new(base),
+                    );
+                    close_all_menus(&mut app_core.ui_state);
+                    app_core.ui_state.input_mode = InputMode::PackEditor;
+                }
+                Err(e) => {
+                    app_core.add_system_message(&format!("Pack editor unavailable: {e}"))
+                }
+            }
+            app_core.needs_render = true;
+        }
         UiAction::Themes => {
             // Open theme browser (includes built-in and custom themes)
             frontend.theme_browser =
@@ -535,6 +569,7 @@ pub fn handle_ui_action(
         UiAction::Skins
         | UiAction::SetSkin(_)
         | UiAction::MakeSkin(_)
+        | UiAction::HarmonySkin(_)
         | UiAction::ReloadSkin => {
             // Skins are image-based GUI decoration; the terminal frontend
             // has no image pipeline, so just point the user at the GUI.
@@ -595,6 +630,16 @@ pub fn handle_ui_action(
             }
             app_core.needs_render = true;
         }
+        UiAction::TouchWheelEditor => {
+            // The touch wheel is the phone's long-press ring; it's edited
+            // from the phone or the GUI, which both write the shared config.
+            app_core.add_system_message(
+                "The touch wheel is the phone's long-press radial wheel. \
+                 Edit it from the phone (Settings > Touch wheel) or the \
+                 desktop GUI — both save to the same config.",
+            );
+            app_core.needs_render = true;
+        }
         UiAction::SorterEdit => {
             // TUI parity for the structured editor (rules/order/renames)
             // is planned; the scalar toggles already ride the registry.
@@ -608,6 +653,9 @@ pub fn handle_ui_action(
         // Deliberately GUI-only surfaces — say so instead of the old
         // silent log (four commands died unnoticed behind that silence).
         UiAction::Controller => gui_only(app_core, "The controller editor"),
+        UiAction::JinxPanel => {
+            gui_only(app_core, "The Jinx asset panel (.jinx gui) — use .jinx list/install in the TUI")
+        }
         UiAction::WebUiPicker | UiAction::WebUiOff | UiAction::WebUiOpen(_) => {
             gui_only(app_core, "The Lich WebUI bridge (.webui)")
         }
@@ -615,6 +663,10 @@ pub fn handle_ui_action(
             gui_only(app_core, "Shell zones (.header/.footer/.leftbar/.rightbar)")
         }
         UiAction::SnapDebug => gui_only(app_core, "Snap diagnostics (.snapdebug)"),
+        UiAction::PerformanceDump => {
+            app_core.write_perf_dump(crate::performance::PerfFrontend::Tui, None);
+            app_core.needs_render = true;
+        }
     }
     Ok(())
 }

@@ -110,6 +110,19 @@ pub struct AppCore {
     /// Auto-clear deadlines for highlight-set custom statuses (UPPERCASE
     /// id -> when it switches back off).
     pub custom_status_expiries: std::collections::HashMap<String, std::time::Instant>,
+    /// Cached indicator templates keyed by UPPERCASE id, rebuilt from disk on
+    /// load and after the template editor saves. Status icon resolution
+    /// (indicator windows + dashboards) reads this per frame; the underlying
+    /// `Config::list_indicator_templates()` does file IO, so it must not run
+    /// in the render loop.
+    pub indicator_templates: std::collections::HashMap<String, crate::config::IndicatorTemplateEntry>,
+    /// Latest Jinx catalog (all installable assets across repos), delivered by
+    /// the worker's `Catalog` request and read by the GUI Assets panel. None
+    /// until first fetched; the panel triggers a refresh on open.
+    pub jinx_catalog: Option<Vec<crate::core::jinx::worker::CatalogEntry>>,
+    /// One-shot: emit the "game data is stale" login nudge on the first game
+    /// text of the session. Set true at construction, cleared after firing.
+    jinx_nudge_pending: bool,
     /// Native go2: the walk executor and its outbound command queue.
     pub travel: crate::core::travel::TravelService,
     /// Macro sleep segments (`look\rs2\rhide`): commands waiting out
@@ -209,6 +222,42 @@ pub struct AppCore {
     /// Saved dialog positions loaded from widget_state.toml
     /// Updated when dialogs with save='t' are dragged/resized
     pub saved_dialog_positions: SavedDialogPositions,
+
+    // === Lich WebUI bridge (owned in core so BOTH the GUI and the phone
+    // render the same trees; see core::app_core::webui) ===
+    /// The live bridge socket to Lich's WebUI server. None until a handshake
+    /// starts it; the frontend supplies its tokio Handle to `start_webui`.
+    pub(crate) webui_bridge: Option<crate::webui::WebUiHandle>,
+    /// Raw bridge events from the socket task, drained each tick by
+    /// `pump_webui`. None until the bridge starts.
+    pub(crate) webui_rx: Option<tokio::sync::mpsc::UnboundedReceiver<crate::webui::WebUiEvent>>,
+    /// The sender half, cloned into `fetch_image` calls so results return
+    /// on the same channel `pump_webui` drains.
+    pub(crate) webui_event_tx:
+        Option<tokio::sync::mpsc::UnboundedSender<crate::webui::WebUiEvent>>,
+    /// (host, port, token) for `/files/` image fetches; set at handshake.
+    pub(crate) webui_endpoint: Option<(String, u16, String)>,
+    /// True once a `;ui handshake` has been dispatched this session, so it
+    /// isn't re-sent every tick.
+    pub(crate) webui_handshake_sent: bool,
+    /// Registered pages from the last `hello`/`pages` envelope (mirrored to
+    /// the phone; the GUI reads them for its page picker).
+    pub(crate) webui_pages: Vec<crate::data::webui::WebUiPageDescriptor>,
+    /// Whether Lich WebUI is reachable this session (only when Lich-attached;
+    /// a direct eAccess connection has no Lich, so no WebUI). Advertised to
+    /// the phone so it shows the WebUI affordance only when usable.
+    pub(crate) webui_available: bool,
+    /// GUI re-emit channel: `pump_webui` forwards every bridge event here so
+    /// the GUI can do its GUI-side handling (image textures, window kinds)
+    /// while core owns the socket. None in headless/TUI (no local renderer).
+    pub(crate) webui_gui_tx:
+        Option<tokio::sync::mpsc::UnboundedSender<crate::webui::WebUiEvent>>,
+    /// Raw game commands core queued for the frontend to send (the WebUI
+    /// `;ui handshake` — core has no game socket). Drained each tick.
+    pub(crate) webui_pending_raw: Vec<String>,
+    /// Pages any client has subscribed to; replayed on a fresh socket's Hello
+    /// so renders resume after a reconnect.
+    pub(crate) webui_subscribed: std::collections::HashSet<String>,
 }
 
 impl AppCore {
@@ -283,6 +332,9 @@ impl AppCore {
             map_updater: crate::core::mapdb_update::MapDbUpdater::new(temp.join("mapdb")),
             jinx_worker: crate::core::jinx::worker::JinxWorker::new(None),
             custom_status_expiries: std::collections::HashMap::new(),
+            indicator_templates: std::collections::HashMap::new(),
+            jinx_catalog: None,
+            jinx_nudge_pending: true,
             travel: Default::default(),
             timed_commands: Vec::new(),
             remote_map_cache: None,
@@ -332,6 +384,16 @@ impl AppCore {
             gameobj_data: None,
             foreach: Default::default(),
             saved_dialog_positions,
+            webui_bridge: None,
+            webui_rx: None,
+            webui_event_tx: None,
+            webui_endpoint: None,
+            webui_handshake_sent: false,
+            webui_pages: Vec::new(),
+            webui_available: false,
+            webui_gui_tx: None,
+            webui_pending_raw: Vec::new(),
+            webui_subscribed: std::collections::HashSet::new(),
         }
     }
 
@@ -416,6 +478,9 @@ impl AppCore {
             ),
             jinx_worker: crate::core::jinx::worker::JinxWorker::new(None),
             custom_status_expiries: std::collections::HashMap::new(),
+            indicator_templates: std::collections::HashMap::new(),
+            jinx_catalog: None,
+            jinx_nudge_pending: true,
             travel: Default::default(),
             timed_commands: Vec::new(),
             remote_map_cache: None,
@@ -465,6 +530,16 @@ impl AppCore {
             gameobj_data: None,
             foreach: Default::default(),
             saved_dialog_positions,
+            webui_bridge: None,
+            webui_rx: None,
+            webui_event_tx: None,
+            webui_endpoint: None,
+            webui_handshake_sent: false,
+            webui_pages: Vec::new(),
+            webui_available: false,
+            webui_gui_tx: None,
+            webui_pending_raw: Vec::new(),
+            webui_subscribed: std::collections::HashSet::new(),
         };
 
         for conflict in &app.hotbar_key_conflicts.clone() {
@@ -489,6 +564,7 @@ impl AppCore {
         app.apply_session_cache();
         app.apply_custom_quickbars();
         app.refresh_tts_windows();
+        app.refresh_indicator_templates();
         app.apply_tts_settings();
 
         if let Some((theme_id, _)) = app.apply_layout_theme(layout_theme.as_deref()) {
@@ -500,6 +576,24 @@ impl AppCore {
         app.refresh_map_source();
 
         Ok(app)
+    }
+
+    /// Rebuild the cached indicator-template map (UPPERCASE id -> entry) from
+    /// disk. Call at startup and after the indicator-template editor saves —
+    /// the render loop reads the cache, never the file.
+    pub fn refresh_indicator_templates(&mut self) {
+        self.indicator_templates = crate::config::Config::list_indicator_templates()
+            .into_iter()
+            .map(|entry| (entry.id.to_ascii_uppercase(), entry))
+            .collect();
+    }
+
+    /// Look up a status template by id (case-insensitive) from the cache.
+    pub fn indicator_template(
+        &self,
+        id: &str,
+    ) -> Option<&crate::config::IndicatorTemplateEntry> {
+        self.indicator_templates.get(&id.to_ascii_uppercase())
     }
 
     /// Rebuild the message processor's set of TTS-opted windows from the
@@ -788,6 +882,11 @@ impl AppCore {
                     }
                 },
             },
+            // Stash the catalog for the GUI Assets panel to read; no core
+            // side effect (the panel renders it and drives install/update).
+            Effect::Catalog(entries) => {
+                self.jinx_catalog = Some(entries);
+            }
         }
     }
 
@@ -2211,12 +2310,7 @@ impl AppCore {
                         color: active_color,
                     })
                 }
-                WidgetType::Performance => {
-                    if let crate::config::WindowDef::Performance { data, .. } = window_def {
-                        self.perf_stats.apply_enabled_from(data);
-                    }
-                    WindowContent::Performance
-                }
+                WidgetType::Performance => WindowContent::Performance,
                 WidgetType::Hand => WindowContent::Hand {
                     item: None,
                     link: None,
@@ -2563,12 +2657,7 @@ impl AppCore {
                 last_update: 0,
                 generation: 0,
             }),
-            WidgetType::Performance => {
-                if let crate::config::WindowDef::Performance { data, .. } = window_def {
-                    self.perf_stats.apply_enabled_from(data);
-                }
-                WindowContent::Performance
-            }
+            WidgetType::Performance => WindowContent::Performance,
             WidgetType::Hand => WindowContent::Hand {
                 item: None,
                 link: None,
@@ -2791,6 +2880,51 @@ impl AppCore {
 
     /// Process incoming XML data from server
     pub fn process_server_data(&mut self, data: &str) -> Result<()> {
+        // First game text of the session = a good moment for the one-shot
+        // game-data staleness nudge (every frontend funnels through here).
+        if self.jinx_nudge_pending {
+            self.jinx_nudge_pending = false;
+            self.emit_stale_data_nudge();
+        }
+        // Parse timing lives here so every frontend gets it for free —
+        // runtimes must not also time this call (double counting).
+        let parse_start = std::time::Instant::now();
+        let result = self.process_server_data_inner(data);
+        self.perf_stats.record_parse(parse_start.elapsed());
+        result
+    }
+
+    /// Emit a once-per-session reminder when installed game data is old (or was
+    /// installed before timestamping). Silent when nothing is stale or nothing
+    /// is tracked. Threshold: 30 days. Cheap: reads jinx-installed.toml once.
+    fn emit_stale_data_nudge(&mut self) {
+        const STALE_DAYS: i64 = 30;
+        let Ok(db) = crate::core::jinx::metadata::InstalledDb::load() else {
+            return;
+        };
+        // Only game-data assets drive the nudge (effect-list/gameobj/mapdb) —
+        // art staleness isn't worth nagging about.
+        let now = chrono::Utc::now().timestamp();
+        let mut stale = 0;
+        let mut untracked = 0;
+        for asset in db.assets.values().filter(|a| a.kind == "data") {
+            match asset.last_updated {
+                Some(ts) if (now - ts) / 86_400 >= STALE_DAYS => stale += 1,
+                Some(_) => {}
+                None => untracked += 1,
+            }
+        }
+        if stale + untracked == 0 {
+            return;
+        }
+        let n = stale + untracked;
+        self.add_system_message(&format!(
+            "[jinx] {n} game-data file{} may be out of date — run .jinx auto-update to refresh (or .jinx gui)",
+            if n == 1 { "" } else { "s" }
+        ));
+    }
+
+    fn process_server_data_inner(&mut self, data: &str) -> Result<()> {
         // Handle empty input (blank line from server) - "".lines() yields nothing!
         // Network reads line-by-line, so blank lines arrive as empty strings.
         // We must handle this explicitly since Rust's lines() returns an empty iterator for "".
@@ -3661,6 +3795,40 @@ impl AppCore {
         tracing::info!("Showed window '{}' - added to layout and UI state", name);
     }
 
+    /// Create any window definitions this layout lacks, from a saved layout's
+    /// captured defs. Used by the GUI `.loadlayout`: a named layout saved on
+    /// one character carries the full window definitions, so loading it into a
+    /// fresh profile (which only has the default windows) recreates the missing
+    /// windows before the arrangement is reconciled. Windows already present
+    /// are left untouched — their live content (buffered text, etc.) survives.
+    /// Returns the names actually created.
+    pub fn materialize_missing_windows(
+        &mut self,
+        defs: &[crate::config::WindowDef],
+        terminal_width: u16,
+        terminal_height: u16,
+    ) -> Vec<String> {
+        let mut created = Vec::new();
+        for def in defs {
+            let name = def.name().to_string();
+            if self.ui_state.windows.contains_key(&name) {
+                continue;
+            }
+            // Keep the layout's def list authoritative so a later .savelayout
+            // (or autosave) re-persists the window; add_new_window only writes
+            // ui_state.
+            if !self.layout.windows.iter().any(|w| w.name() == name) {
+                self.layout.windows.push(def.clone());
+            }
+            self.add_new_window(def, terminal_width, terminal_height);
+            created.push(name);
+        }
+        if !created.is_empty() {
+            self.needs_render = true;
+        }
+        created
+    }
+
     /// Process pending window additions from openDialog events.
     /// Called by the frontend each frame with terminal dimensions.
     /// Whether a layout window equivalent to `template_name` already exists,
@@ -4102,9 +4270,21 @@ impl AppCore {
         // Pick the template + binding for this discovery kind.
         let (binding, template) = match d.kind {
             WindowDiscoveryKind::Stream => {
-                // Streams bind to a blank text window that subscribes to
-                // the id ("text_custom" is the addable blank-text template).
-                (WindowBinding::Stream(d.id.clone()), "text_custom")
+                // Most streams bind to a blank text window that subscribes
+                // to the id ("text_custom" is the addable blank-text
+                // template). A few stream ids have a dedicated widget type
+                // whose specialized pipeline (buffer replay, links) only
+                // feeds that widget's content variant — a generic text
+                // window would render empty. Route those to their widget
+                // template so discovery produces the right window type.
+                let template = match d.id.as_str() {
+                    // The spellbook is sent once at login and replayed from
+                    // a buffer into WindowContent::Spells only; a text window
+                    // bound to "Spells" never populates.
+                    "Spells" => "spells",
+                    _ => "text_custom",
+                };
+                (WindowBinding::Stream(d.id.clone()), template)
             }
             WindowDiscoveryKind::DialogPanel => {
                 (WindowBinding::Dialog(d.id.clone()), "dialogpanel")
@@ -4345,25 +4525,8 @@ impl AppCore {
         };
 
         if widget_type == WidgetType::Performance {
-            let cfg = crate::config::PerformanceWidgetData {
-                enabled: true,
-                show_fps: true,
-                show_frame_times: true,
-                show_render_times: true,
-                show_ui_times: true,
-                show_wrap_times: true,
-                show_net: true,
-                show_parse: true,
-                show_events: true,
-                show_memory: true,
-                show_lines: true,
-                show_uptime: true,
-                show_jitter: true,
-                show_frame_spikes: true,
-                show_event_lag: true,
-                show_memory_delta: true,
-            };
-            self.perf_stats.apply_enabled_from(&cfg);
+            // Restart peaks/spike log so they describe this viewing session.
+            self.perf_stats.reset_peaks();
         }
 
         // Create window state
@@ -4828,6 +4991,14 @@ impl AppCore {
                 command: "__SUBMENU__windows".to_string(),
                 disabled: false,
             },
+            // First-class entry to the indicator template builder — reachable
+            // even when every indicator is already placed (the Add/Edit
+            // submenus' "Editor" leaf disappears once none are left to add).
+            crate::data::ui_state::PopupMenuItem {
+                text: "Indicators".to_string(),
+                command: ".indicators".to_string(),
+                disabled: false,
+            },
         ]
     }
 
@@ -5259,6 +5430,14 @@ impl AppCore {
         link: &crate::data::LinkData,
         origin: crate::core::remote::MenuOrigin,
     ) -> Option<String> {
+        if link.exist_id == crate::data::URL_LINK_SENTINEL {
+            // Web link: frontends open the URL on their own side (browser on
+            // desktop, window.open on the phone). Never a game command, and
+            // never a _menu request for a fake exist id.
+            tracing::debug!("URL link activation reached core (frontend opens it): {}", link.noun);
+            return None;
+        }
+
         if link.exist_id == "_direct_" {
             // <d> tag: the noun (cmd attribute) or text IS the command
             let command = if !link.noun.is_empty() {
@@ -5598,6 +5777,8 @@ impl AppCore {
                 self.config.controller_wheels_meta =
                     crate::config::Config::load_controller_wheels_meta(character)
                         .unwrap_or_default();
+                self.config.touch_wheel =
+                    crate::config::Config::load_touch_wheel(character).unwrap_or_default();
                 self.config.controller_overlay =
                     crate::config::Config::load_controller_overlay(character).unwrap_or_default();
                 self.config.controller_rumble =
@@ -7220,6 +7401,36 @@ mod tests {
     }
 
     #[test]
+    fn spells_stream_discovery_creates_a_spells_widget_not_text() {
+        use crate::config::WindowBinding;
+        use crate::data::{WindowDiscovery, WindowDiscoveryKind};
+        let mut core = core_with_layout(vec![]);
+
+        // The game declares its spellbook window via <streamWindow id="Spells">.
+        core.ui_state.pending_window_discoveries.push(WindowDiscovery {
+            id: "Spells".to_string(),
+            title: "Spells".to_string(),
+            kind: WindowDiscoveryKind::Stream,
+            save: false,
+        });
+        core.realize_offered_windows(80, 24);
+
+        // It must be the dedicated spells widget (whose buffer-replay pipeline
+        // populates it), NOT a generic text window that would render empty.
+        let win = core
+            .layout
+            .windows
+            .iter()
+            .find(|w| w.base().binding == Some(WindowBinding::Stream("Spells".to_string())))
+            .expect("Spells stream should register a bound window");
+        assert!(
+            matches!(win, crate::config::WindowDef::Spells { .. }),
+            "Spells stream discovery must produce a spells widget, got {:?}",
+            win.widget_type()
+        );
+    }
+
+    #[test]
     fn enumerate_known_windows_covers_layout_and_ephemeral() {
         use crate::core::known_windows::KnownWindowKind;
         // A bound (discovered) hidden dialog window, an unbound plain
@@ -7287,6 +7498,40 @@ mod tests {
             .map(|w| w.base().visibility.is_shown())
             .unwrap_or(false));
         assert!(core.ui_state.windows.contains_key("compass"));
+    }
+
+    /// Bug #1: a named GUI layout saved on one character carries the full
+    /// window defs; loading it into a profile that only has the default
+    /// windows must recreate the missing ones (in both the layout def list
+    /// and ui_state) while leaving existing windows untouched.
+    #[test]
+    fn materialize_missing_windows_creates_only_the_absent() {
+        let mut core = core_with_layout(vec![positioned_text_def("story", 0, 0, 40, 10)]);
+        core.init_windows(80, 24);
+        assert!(core.ui_state.windows.contains_key("story"));
+
+        let saved_defs = vec![
+            positioned_text_def("story", 0, 0, 40, 10), // already present
+            positioned_text_def("room", 40, 0, 20, 8),  // missing
+            positioned_text_def("map", 60, 0, 20, 8),   // missing
+        ];
+        let created = core.materialize_missing_windows(&saved_defs, 80, 24);
+
+        // Only the two absent windows are created, in order.
+        assert_eq!(created, vec!["room".to_string(), "map".to_string()]);
+        // Both live in ui_state AND the authoritative layout def list.
+        for name in ["room", "map"] {
+            assert!(core.ui_state.windows.contains_key(name), "{name} in ui_state");
+            assert!(
+                core.layout.windows.iter().any(|w| w.name() == name),
+                "{name} in layout defs"
+            );
+        }
+        // The pre-existing window is not duplicated.
+        assert_eq!(
+            core.layout.windows.iter().filter(|w| w.name() == "story").count(),
+            1
+        );
     }
 
     /// A text window subscribed to the main stream.

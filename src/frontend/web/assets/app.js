@@ -16,10 +16,20 @@ const STREAM_LABELS = {
   familiar: "Familiar",
   death: "Deaths",
   logons: "Arrivals",
+  inv: "Inventory",
+  whisper: "Whispers",
+  talk: "Talk",
+  speech: "Speech",
+  lnet: "LNet",
 };
+// Streams that never get a prose chip: duplicates of main, or data that
+// feeds a dedicated widget/drawer section rather than reading as prose.
+// `inv` and the social streams (whisper/talk/speech/lnet) are intentionally
+// NOT hidden — they get chips so a phone-only player can read carried items
+// and social traffic that host routing might otherwise strand.
 const HIDDEN_STREAMS = new Set([
-  "room", "inv", "spells", "percWindow", "bounty", "society", "assess",
-  "speech", "whisper", "talk", "experience",
+  "room", "spells", "percWindow", "bounty", "society", "assess",
+  "experience",
 ]);
 
 const pane = document.getElementById("text-pane");
@@ -431,6 +441,7 @@ function setRoom(room) {
   roomName = room.name || null;
   roomId = room.id || null;
   roomExits = room.exits || [];
+  roomDescription = room.description || [];
   renderTitle();
   renderCompass();
   // Exits are an interact category; keep its focus in sync.
@@ -438,6 +449,20 @@ function setRoom(room) {
     syncInteractFocus();
     renderInteract();
   }
+  // The status drawer shows a Room section fed from here.
+  if (drawerRight.classList.contains("open")) renderStatusDrawer();
+}
+
+// Room description prose (plaintext lines) and the full spellbook — both
+// arrive from the server (RemoteDelta::Room description / RemoteDelta::Spells)
+// so a phone-only player can read the room "look" and their active spells
+// without a desktop window.
+let roomDescription = [];
+let spellbook = [];
+
+function setSpells(lines) {
+  spellbook = lines || [];
+  if (drawerRight.classList.contains("open")) renderStatusDrawer();
 }
 
 // ---- Compass ----------------------------------------------------------------
@@ -712,6 +737,7 @@ function handleSnapshot(d) {
   setHands(d.hands || {});
   setIndicators(d.indicators || {});
   setEffects(d.effects || []);
+  setSpells(d.spellbook || []);
   setInjuries(d.injuries || {});
   setTargets(d.targets || []);
   setRoomEntities(d.entities || {});
@@ -723,6 +749,8 @@ function handleSnapshot(d) {
   // Sidecar servers (TUI/GUI hosting) don't send session info; treat the
   // session as an implicitly-connected one we can't control.
   setSession(d.session || { state: "connected", session_control: false });
+  // WebUI pages ride the snapshot so a connecting client has the picker list.
+  if (Array.isArray(d.webui_pages)) { webuiState.pages = d.webui_pages; webuiState.connected = true; }
   if (autoScroll) scrollToBottom();
 }
 
@@ -750,6 +778,7 @@ function handleMessage(msg) {
     case "hands": setHands(msg.d); break;
     case "indicators": setIndicators(msg.d); break;
     case "effects": setEffects(msg.d); break;
+    case "spells": setSpells(msg.d); break;
     case "rt": setRt(msg.d); break;
     case "menu": handleMenu(msg.d); break;
     case "macros": macros = msg.d; renderMacros(); break;
@@ -770,6 +799,13 @@ function handleMessage(msg) {
     case "colors": handleColorsReply(msg.d); break;
     case "settings": handleSettingsReply(msg.d); break;
     case "streams": handleStreamsReply(msg.d); break;
+    case "touch_wheel": handleTouchWheelReply(msg.d); break;
+    // Lich WebUI (P5): stored here; the panel renderer (P5b) reads webuiState.
+    case "webui_render": handleWebUiRender(msg.d); break;
+    case "webui_pages": webuiState.pages = msg.d.pages || []; renderWebUiIfOpen(); break;
+    case "webui_closed": handleWebUiClosed(msg.d); break;
+    case "webui_notice": handleWebUiNotice(msg.d); break;
+    case "webui_connected": webuiState.connected = !!msg.d.connected; renderWebUiIfOpen(); break;
     case "injuries": setInjuries(msg.d); break;
     case "targets": setTargets(msg.d); break;
     case "entities": setRoomEntities(msg.d); break;
@@ -865,6 +901,9 @@ function setSession(d) {
   const prevState = session.state;
   session = d || { state: "connected", session_control: false };
   if (session.character) setCharacter(session.character);
+  // Lich WebUI is only usable on a Lich-attached session; the affordance
+  // (P5b) shows only when this is set.
+  webuiState.available = !!session.webui_available;
   updateSessionUi(prevState);
 }
 
@@ -1397,6 +1436,10 @@ let gpWheelFired = false;
 // After a wheel closes with the aim stick still deflected, its normal
 // function (scroll / interact cycle) stays suppressed until it recenters.
 let gpAimRecenterNeeded = false;
+// Absolute pixel anchor for the touch wheel's SVG (null = the gamepad
+// wheel, which stays flex-centered). Declared here so renderWheel — which
+// runs for both wheels — can read it without a temporal-dead-zone hazard.
+let touchAnchor = null;
 // Sentinel command/marker for the injected Back slice (wheel-core.js).
 const WHEEL_BACK = WheelCore.WHEEL_BACK;
 
@@ -1422,6 +1465,34 @@ function gpHeldWheelKey() {
   return null;
 }
 
+// ---- Touch wheel -----------------------------------------------------------
+// The phone's OWN wheel (key "touch"), opened by a long-press and aimed with
+// the thumb. Distinct from the gamepad wheels: its top level is client
+// actions (open the drawer sections the P1/P2 feeds populate, the map, the
+// command input) plus a "Commands" folder that descends into the host's
+// default wheel so gamepad commands are thumb-reachable too. A slice with a
+// `client` field runs locally on fire; everything else fires to the host
+// exactly like the gamepad wheel. The host can override this by pushing a
+// `touch` wheel in the `wheels` message.
+const TOUCH_WHEEL_DEFAULT = [
+  { label: "Look", client: "cmd:look" },
+  { label: "Room", client: "open:room" },
+  { label: "Players", client: "open:players" },
+  { label: "Spells", client: "open:spells" },
+  { label: "Inventory", client: "open:inv" },
+  { label: "Map", client: "open:map" },
+  { label: "Commands", slices: "@default" },
+  { label: "Type", client: "focus:input" },
+];
+
+// The touch wheel's top-level ring: the host override if pushed, else the
+// built-in default. A slice whose `slices` is the "@default" sentinel is a
+// folder that descends into the host default wheel.
+function touchWheelTop() {
+  const override = (wheels.named || {}).touch;
+  return Array.isArray(override) ? override : TOUCH_WHEEL_DEFAULT;
+}
+
 // The room's portal commands ("go arch"), pushed by the host for the
 // dynamic "portals" wheel; picks resolve server-side by index.
 let portalCommands = [];
@@ -1443,6 +1514,22 @@ function wheelLevelSlices(key, path) {
         ? command.slice(command.indexOf(" ") + 1)
         : command,
     }));
+  }
+  if (key === "touch") {
+    let level = touchWheelTop();
+    // A "@default" folder descends into the host's default wheel; deeper
+    // levels then resolve within that wheel.
+    let intoDefault = false;
+    for (let i = 0; i < path.length; i++) {
+      if (!intoDefault && level[path[i]] && level[path[i]].slices === "@default") {
+        level = wheels.default;
+        intoDefault = true;
+        continue;
+      }
+      level = (level[path[i]] || {}).slices;
+      if (!Array.isArray(level)) return null;
+    }
+    return Array.isArray(level) ? level : null;
   }
   let level = key ? (wheels.named || {})[key] : wheels.default;
   if (!Array.isArray(level)) return null;
@@ -1473,6 +1560,234 @@ function sendWheelPick(key, path) {
   state.ws.send(JSON.stringify({ t: "wheel_pick", d: { key, path } }));
 }
 
+// Run a client-side wheel action ("open:room", "cmd:look", "focus:input").
+// Returns true if it was a client action (so the caller skips the host pick).
+function runWheelClientAction(action) {
+  if (typeof action !== "string") return false;
+  const [verb, arg] = action.split(":", 2);
+  if (verb === "open") {
+    // "map" opens the map overlay; everything else opens the status drawer
+    // and scrolls its matching section into view. "inv" is a stream chip,
+    // not a drawer section, so it switches to that chip instead.
+    if (arg === "map") { openMapOverlay(); return true; }
+    if (arg === "inv") { setActiveStream("inv"); return true; }
+    openDrawer("right");
+    scrollDrawerToSection(arg);
+    return true;
+  }
+  if (verb === "cmd") { sendCommand(arg); return true; }
+  if (verb === "focus") { if (arg === "input") cmdInput.focus(); return true; }
+  return false;
+}
+
+// Scroll a status-drawer section title into view by its arg ("room" ->
+// "Room", "players" -> "Players", …). No-op if the section isn't present.
+const DRAWER_SECTION_TITLES = {
+  room: "Room", players: "Players", spells: "Spells", injuries: "Injuries",
+};
+function scrollDrawerToSection(arg) {
+  const want = DRAWER_SECTION_TITLES[arg];
+  if (!want) return;
+  const title = [...document.querySelectorAll("#status-content .status-title")]
+    .find((t) => t.textContent === want);
+  if (title) title.scrollIntoView({ block: "start", behavior: "smooth" });
+}
+
+// Fire a touch-wheel leaf: run its client action locally, or fall back to a
+// host wheel_pick (the "Commands" folder descends into the host default
+// wheel, so those leaves resolve server-side by their real path).
+function fireTouchLeaf(path) {
+  const slices = wheelLevelSlices("touch", path.slice(0, -1));
+  const leaf = Array.isArray(slices) ? slices[path[path.length - 1]] : null;
+  if (leaf && runWheelClientAction(leaf.client)) return;
+  // Not a client slice — it's a command from the descended host wheel.
+  // Strip the leading "Commands" folder index so the host resolves the
+  // pick against its own default wheel.
+  wheelFire("", stripTouchCommandsPrefix(path));
+}
+
+// A touch path that descended through the "Commands" folder looks like
+// [commandsIdx, ...hostPath]; the host wants just hostPath against its
+// default wheel. Non-Commands paths never reach wheelFire (client actions).
+function stripTouchCommandsPrefix(path) {
+  const top = touchWheelTop();
+  if (path.length && top[path[0]] && top[path[0]].slices === "@default") {
+    return path.slice(1);
+  }
+  return path;
+}
+
+// ---- Touch wheel input -----------------------------------------------------
+// Long-press anywhere (outside the exclusion list) blooms the touch wheel
+// under the thumb. Dragging toward a slice aims it (the shared wheel-core
+// machine handles descend-on-dwell + the persistence latch); lifting fires
+// the committed leaf (release mode). The wheel re-centers under the thumb on
+// each descend so consecutive submenus stay in comfortable reach.
+const TOUCH_WHEEL_LONGPRESS_MS = 300;
+// Pixel radius from the wheel center at which the thumb reaches full
+// deflection (magnitude 1). Derived from the rendered SVG each open.
+let touchWheelRadiusPx = 120;
+// Screen-space center of the wheel (where the thumb aims from); re-set on
+// each descend for re-center-under-thumb. (touchAnchor is declared up with
+// the gamepad wheel state so renderWheel can read it.)
+let touchWheelCenter = null;
+let touchLongPressTimer = 0;
+let touchActiveId = null; // the pointerId driving the wheel, if open
+let touchLastDepth = 0;   // gpWheel.path.length last frame (detect descend)
+// Last thumb position while the wheel is open, and the dwell-tick timer that
+// re-feeds it. The dwell/commit machine only advances when wheelAim runs; a
+// motionless thumb sends no pointermove, so without this tick a slice held
+// still would never commit or a folder never descend.
+let touchLastPoint = null;
+let touchDwellTick = 0;
+
+// Elements whose own gestures own a long-press (or that shouldn't spawn a
+// wheel): the wheel must not steal from them.
+function touchWheelExcluded(target) {
+  return !!target.closest(
+    "#chips, #macro-rail, .float-btn, .drawer, .drawer-handle, #repeat-btn, " +
+    "span.link, #wheel-overlay, #sheet, #map-overlay, #session-overlay, " +
+    ".overlay, input, textarea, button, a, #interact-bar",
+  );
+}
+
+// Normalize a client point to the aim vector the wheel machine expects:
+// (x right, yUp up), magnitude 0..1 at the deflection radius.
+function touchAimVector(clientX, clientY) {
+  const dx = clientX - touchWheelCenter.x;
+  const dy = clientY - touchWheelCenter.y;
+  const x = dx / touchWheelRadiusPx;
+  const yUp = -dy / touchWheelRadiusPx; // screen y grows down; aim y grows up
+  return { x, yUp };
+}
+
+// Clamp the wheel center inward so a thumb near a screen edge doesn't push
+// the ring off-screen (the aim vector still originates from the real thumb).
+function clampWheelCenter(x, y) {
+  const margin = touchWheelRadiusPx + 12;
+  return {
+    x: Math.min(window.innerWidth - margin, Math.max(margin, x)),
+    y: Math.min(window.innerHeight - margin, Math.max(margin, y)),
+  };
+}
+
+function openTouchWheel(clientX, clientY) {
+  if (gpWheel) return; // a wheel (gamepad or touch) is already up
+  touchWheelCenter = clampWheelCenter(clientX, clientY);
+  touchAnchor = { x: touchWheelCenter.x, y: touchWheelCenter.y };
+  gpWheel = {
+    key: "touch", path: [], aimed: null,
+    candidate: null, candidateSince: 0, rearmUntilCenter: false,
+    peakMagnitude: 0,
+  };
+  touchLastDepth = 0;
+  touchLastPoint = { x: clientX, y: clientY };
+  renderWheel();
+  // Measure the real on-screen deflection radius from the rendered SVG
+  // (outer wedge is 104/110 of the SVG half-size).
+  const svg = wheelOverlay.querySelector("svg");
+  if (svg) {
+    const rect = svg.getBoundingClientRect();
+    touchWheelRadiusPx = (rect.width / 2) * (104 / 110);
+  }
+  // Dwell tick: re-feed the last thumb position so a held-still slice commits
+  // (and folders descend) without needing pointermove jitter.
+  clearInterval(touchDwellTick);
+  touchDwellTick = setInterval(() => {
+    if (gpWheel && gpWheel.key === "touch" && touchLastPoint) {
+      const { x, yUp } = touchAimVector(touchLastPoint.x, touchLastPoint.y);
+      wheelAim(x, yUp);
+    }
+  }, 33);
+}
+
+function closeTouchWheel() {
+  gpWheel = null;
+  touchAnchor = null;
+  touchActiveId = null;
+  touchLastPoint = null;
+  clearInterval(touchDwellTick);
+  touchDwellTick = 0;
+  hideWheel();
+}
+
+// Feed one thumb move into the wheel; re-center under the thumb when a
+// descend just changed the level.
+function touchWheelMove(clientX, clientY) {
+  if (!gpWheel || gpWheel.key !== "touch") return;
+  touchLastPoint = { x: clientX, y: clientY };
+  const before = gpWheel.path.length;
+  const { x, yUp } = touchAimVector(clientX, clientY);
+  wheelAim(x, yUp);
+  // If wheelAim descended/ascended a level, re-center the ring under the
+  // current thumb so the next swipe starts from neutral in easy reach.
+  if (gpWheel && gpWheel.path.length !== before) {
+    touchWheelCenter = clampWheelCenter(clientX, clientY);
+    touchAnchor = { x: touchWheelCenter.x, y: touchWheelCenter.y };
+    renderWheel();
+  }
+}
+
+// Lift the thumb: fire the committed leaf (release mode), then close.
+function touchWheelRelease() {
+  if (!gpWheel || gpWheel.key !== "touch") { closeTouchWheel(); return; }
+  const { path, aimed } = gpWheel;
+  const view = wheelView("touch", path);
+  const real = view ? WheelCore.leafRealAt(view, aimed) : null;
+  closeTouchWheel();
+  if (real != null) fireTouchLeaf([...path, real]);
+}
+
+// Long-press detection: arm a timer on pointerdown, open the wheel if the
+// thumb stays roughly put until it elapses; any real movement or lift before
+// then cancels (it was a tap/scroll, not a wheel gesture).
+document.addEventListener("pointerdown", (ev) => {
+  if (ev.pointerType === "mouse" && ev.button !== 0) return;
+  if (gpWheel) return;
+  if (touchWheelExcluded(ev.target)) return;
+  const startX = ev.clientX;
+  const startY = ev.clientY;
+  const pointerId = ev.pointerId;
+  clearTimeout(touchLongPressTimer);
+  touchLongPressTimer = setTimeout(() => {
+    openTouchWheel(startX, startY);
+    touchActiveId = pointerId;
+  }, TOUCH_WHEEL_LONGPRESS_MS);
+
+  // Cancel the long-press if the thumb wanders before it fires.
+  const onEarlyMove = (mv) => {
+    if (Math.hypot(mv.clientX - startX, mv.clientY - startY) > 10 && !gpWheel) {
+      clearTimeout(touchLongPressTimer);
+      cleanup();
+    }
+  };
+  const cleanup = () => {
+    document.removeEventListener("pointermove", onEarlyMove);
+    document.removeEventListener("pointerup", onEarlyUp);
+    document.removeEventListener("pointercancel", onEarlyUp);
+  };
+  const onEarlyUp = () => { clearTimeout(touchLongPressTimer); cleanup(); };
+  document.addEventListener("pointermove", onEarlyMove);
+  document.addEventListener("pointerup", onEarlyUp);
+  document.addEventListener("pointercancel", onEarlyUp);
+});
+
+// While the touch wheel is up, its pointer drives aiming and lift fires.
+document.addEventListener("pointermove", (ev) => {
+  if (touchActiveId === null || ev.pointerId !== touchActiveId) return;
+  ev.preventDefault();
+  touchWheelMove(ev.clientX, ev.clientY);
+}, { passive: false });
+
+document.addEventListener("pointerup", (ev) => {
+  if (touchActiveId === null || ev.pointerId !== touchActiveId) return;
+  touchWheelRelease();
+});
+document.addEventListener("pointercancel", (ev) => {
+  if (touchActiveId === null || ev.pointerId !== touchActiveId) return;
+  closeTouchWheel();
+});
+
 const wheelOverlay = document.getElementById("wheel-overlay");
 const WHEEL_SVG_NS = "http://www.w3.org/2000/svg";
 
@@ -1487,6 +1802,8 @@ function wheelSvgEl(tag, attrs, style) {
 function hideWheel() {
   wheelOverlay.hidden = true;
   wheelOverlay.replaceChildren();
+  // Clear the touch anchor so a subsequent gamepad wheel renders centered.
+  touchAnchor = null;
 }
 
 // Draw the current wheel level: a ring of wedges around the screen
@@ -1633,6 +1950,15 @@ function renderWheel() {
   hintText.textContent = hint;
   svg.appendChild(hintText);
 
+  // Anchor the wheel under the thumb for the touch wheel; the gamepad wheel
+  // stays flex-centered (touchAnchor null). The overlay flips to absolute
+  // positioning only while anchored.
+  if (touchAnchor) {
+    svg.style.position = "absolute";
+    svg.style.left = `${touchAnchor.x}px`;
+    svg.style.top = `${touchAnchor.y}px`;
+    svg.style.transform = "translate(-50%, -50%)";
+  }
   wheelOverlay.replaceChildren(svg);
   wheelOverlay.hidden = false;
 }
@@ -1728,6 +2054,8 @@ function setRoomEntities(entities) {
     syncInteractFocus();
     renderInteract();
   }
+  // The status drawer shows a Players section fed from here.
+  if (drawerRight.classList.contains("open")) renderStatusDrawer();
 }
 
 /// Entities for one category, in display order: { key, label } plus
@@ -2193,11 +2521,17 @@ function wheelAim(x, yUp) {
 // [controller_tuning] snapshot in the units the machine consumes
 // (magnitudes 0..1, dwells in ms).
 function wheelTimingSnapshot() {
+  // The touch wheel is always release-mode (descend on dwell, fire on lift)
+  // regardless of the host's gamepad fire_mode — an edge/retract touch wheel
+  // would fire mid-drag while the thumb is still navigating. (Tap-slice is a
+  // planned future alternative; this is where that mode would branch.)
+  const fireMode =
+    gpWheel && gpWheel.key === "touch" ? "release" : (wheelTuning.fire_mode || "release");
   return {
     deadzone: wheelDeadzone(),
     aimMs: wheelTuning.aim_dwell_ms || 0,
     navMs: wheelTuning.nav_dwell_ms || 0,
-    fireMode: wheelTuning.fire_mode || "release",
+    fireMode,
     edgeThreshold: Math.min(1, Math.max(0, (wheelTuning.edge_threshold || 0) / 100)),
     retractDelta: Math.min(1, Math.max(0, (wheelTuning.retract_delta || 0) / 100)),
   };
@@ -2862,13 +3196,20 @@ function openSettingsSheet() {
   }
   sheetButton("Client settings (saved on host)", openClientSettings);
   sheetButton("Streams (saved on host)", openStreamsPanel);
+  sheetButton("Touch wheel (long-press ring)", () => openTouchWheelEditor("profile"));
+  // Lich WebUI panels — only on a Lich-attached session.
+  if (webuiState.available) {
+    sheetButton("Lich WebUI panels", openWebUi);
+  }
   sheetButton("Highlight rules (this profile)", () => openHighlightList("profile"));
   sheetButton("Highlight rules (global)", () => openHighlightList("global"));
   sheetButton("Colors (this profile)", () => openColorsEditor("profile"));
   sheetButton("Colors (global)", () => openColorsEditor("global"));
-  for (const file of EDITOR_FILES) {
-    sheetButton(file.label, () => openConfigEditor(file));
-  }
+  // Raw-TOML editing is an escape hatch, not a front door — editing TOML on
+  // a soft keyboard is a footgun and the structured editors above cover the
+  // same ground. Tuck the four file buttons behind one disclosure so they're
+  // reachable for import/export power users without crowding the main sheet.
+  sheetButton("Advanced: edit config files…", openAdvancedConfigSheet);
   // Viewing a desktop server from inside the app shell: the way home.
   // (The shell swaps the WebView back to its embedded login page.)
   if (inShell && location.hostname !== "127.0.0.1") {
@@ -2876,6 +3217,18 @@ function openSettingsSheet() {
       location.href = "vellum://local";
     });
   }
+}
+
+// Advanced raw-TOML config editing, one step removed from the main sheet.
+// Import/export of desktop configs lives here; the structured Highlight and
+// Colors editors on the main sheet are the primary path.
+function openAdvancedConfigSheet() {
+  openSheet("Advanced: config files");
+  sheetNote("Raw TOML — the structured editors are easier and safer.", false);
+  for (const file of EDITOR_FILES) {
+    sheetButton(file.label.replace(/^Advanced:\s*/, ""), () => openConfigEditor(file));
+  }
+  sheetButton("‹ Back to settings", openSettingsSheet);
 }
 
 document.getElementById("settings-btn").addEventListener("click", openSettingsSheet);
@@ -3249,11 +3602,14 @@ function playRemoteSound(d) {
 // usually allow it too; if a strict autoplay policy still rejects play(),
 // nothing appears.
 
-const MUSIC_OFF_KEY = "vellum-login-music-off";
-let musicOff = false;
+// Login music is OPT-IN on the phone: a phone auto-playing the Wizard FE
+// theme on every connect is a surprise-audio liability (public spaces,
+// battery). Stored as an explicit opt-IN flag; absent = off.
+const MUSIC_ON_KEY = "vellum-login-music-on";
+let musicOff = true;
 try {
-  musicOff = !!localStorage.getItem(MUSIC_OFF_KEY);
-} catch { /* default on */ }
+  musicOff = !localStorage.getItem(MUSIC_ON_KEY);
+} catch { /* default off */ }
 
 const musicBar = document.getElementById("music-bar");
 let loginMusic = null; // Audio element while playing
@@ -3271,9 +3627,9 @@ function setMusicOff(off) {
   musicOff = off;
   try {
     if (off) {
-      localStorage.setItem(MUSIC_OFF_KEY, "1");
+      localStorage.removeItem(MUSIC_ON_KEY);
     } else {
-      localStorage.removeItem(MUSIC_OFF_KEY);
+      localStorage.setItem(MUSIC_ON_KEY, "1");
     }
   } catch { /* private mode */ }
   if (off) stopLoginMusic();
@@ -3472,9 +3828,17 @@ document.addEventListener("click", (ev) => {
   closeSheet();
 });
 
-pane.addEventListener("click", (ev) => {
-  const span = ev.target.closest("span.link");
+// Dispatch a tap on a rendered game link (a `span.link` from renderLine).
+// Shared by the text pane and the status drawer's room-prose / spellbook
+// sections so a scenery or spell link works the same wherever it appears.
+function dispatchLinkTap(span) {
   if (!span || !state.ws || state.ws.readyState !== WebSocket.OPEN) return;
+  // Web links (<a href> in game text) open on THIS device, never the host.
+  if (span.dataset.existId === "_url_") {
+    const url = span.dataset.noun || "";
+    if (/^https?:\/\//.test(url)) window.open(url, "_blank", "noopener");
+    return;
+  }
   const requestId = ++menuRequestCounter;
   // Direct links (<d> tags, coord links like exits) execute immediately
   // server-side — no menu will come back, so no sheet.
@@ -3495,6 +3859,18 @@ pane.addEventListener("click", (ev) => {
       coord: span.dataset.coord || null,
     },
   }));
+}
+
+pane.addEventListener("click", (ev) => {
+  dispatchLinkTap(ev.target.closest("span.link"));
+});
+
+// Room-prose scenery + spellbook links live in the status drawer. Delegate
+// on document (the drawer element is declared later in the file) and scope
+// to the right drawer so their taps run the same dispatch as pane links.
+document.addEventListener("click", (ev) => {
+  const span = ev.target.closest("#drawer-right span.link");
+  if (span) dispatchLinkTap(span);
 });
 
 function handleMenu(d) {
@@ -4696,6 +5072,49 @@ function renderStatusDrawer() {
     panel.appendChild(section);
   }
 
+  // Players in the room: a standalone "who's here" list. The data already
+  // rides RemoteDelta::Entities (interact mode consumes it too); each row
+  // opens the player's noun menu via the same link-tap path as a target.
+  if (roomEntities.players.length) {
+    panel.appendChild(sectionTitle("Players"));
+    const section = document.createElement("div");
+    section.className = "status-section";
+    for (const p of roomEntities.players) {
+      const row = document.createElement("button");
+      row.type = "button";
+      row.className = "status-row target-row";
+      const name = document.createElement("span");
+      name.textContent = p.label;
+      row.appendChild(name);
+      row.addEventListener("click", () =>
+        tapCreature({ id: p.id, noun: p.noun, name: p.label }));
+      section.appendChild(row);
+    }
+    panel.appendChild(section);
+  }
+
+  // Room: name + description prose so a phone-only player can read the
+  // "look" without a desktop room window. Fed by RemoteDelta::Room; the
+  // description is styled (renderLine keeps its color + clickable scenery).
+  if (roomName || roomDescription.length) {
+    panel.appendChild(sectionTitle("Room"));
+    const section = document.createElement("div");
+    section.className = "status-section";
+    if (roomName) {
+      const nameRow = document.createElement("div");
+      nameRow.className = "status-row status-wrap";
+      nameRow.style.fontWeight = "600";
+      nameRow.textContent = roomName;
+      section.appendChild(nameRow);
+    }
+    for (const line of roomDescription) {
+      const row = renderLine(line);
+      row.classList.add("status-row", "status-wrap");
+      section.appendChild(row);
+    }
+    panel.appendChild(section);
+  }
+
   // Doll: skinned (base art + dots at calibrated anchors) when the active
   // skin ships doll art, the built-in vector figure otherwise.
   const skinned = !!(dollSkin && dollNatural);
@@ -4789,6 +5208,22 @@ function renderStatusDrawer() {
     panel.appendChild(section);
   }
 
+  // Spellbook: the full active-spell list (the "Spells" stream), fed by
+  // RemoteDelta::Spells. The effect pills above are live countdowns; this is
+  // the complete list a caster audits. Styled (renderLine) so spell colors
+  // and links match the desktop Spells window.
+  if (spellbook.length) {
+    panel.appendChild(sectionTitle("Spells"));
+    const section = document.createElement("div");
+    section.className = "status-section";
+    for (const line of spellbook) {
+      const row = renderLine(line);
+      row.classList.add("status-row", "status-wrap");
+      section.appendChild(row);
+    }
+    panel.appendChild(section);
+  }
+
   // Active effects with countdowns
   for (const cat of effectCategories) {
     if (!cat.effects.length) continue;
@@ -4834,6 +5269,7 @@ setInterval(() => {
 // helpers, no privileged actions) for both.
 window.vellumDebug = {
   setRoom, setTargets, setCharInfo, setInjuries, setEffects, setSession,
+  setSpells,
 };
 
 
@@ -5593,6 +6029,783 @@ function renderStreamsPanel() {
     group.appendChild(stRow(entry, stCatalog.windows || [], stCatalog.fallback || "main"));
   }
   stList.appendChild(group);
+}
+
+// ---- Touch-wheel editor ----------------------------------------------------
+// Edit the phone's touch wheel (the long-press ring). Slices are the
+// top-level ring; each is a client action (open a panel, focus input) or a
+// game command. Saved to the host per character and re-broadcast, so the
+// wheel updates live and follows the character to other devices. Nested
+// folders are edited on the desktop (kept out of the phone form for focus).
+
+const twOverlay = document.createElement("div");
+twOverlay.id = "tw-overlay";
+twOverlay.hidden = true;
+twOverlay.innerHTML = `
+  <div id="tw-card">
+    <div id="tw-titlebar">
+      <span id="tw-title">Touch wheel</span>
+      <button type="button" id="tw-close">Close</button>
+    </div>
+    <p id="tw-note">Long-press the screen to open this wheel. Drag to a
+      slice and lift to fire. Changes save to your character and apply live.</p>
+    <div id="tw-list"></div>
+    <div id="tw-actions">
+      <button type="button" id="tw-add">+ Add slice</button>
+      <button type="button" id="tw-save">Save</button>
+    </div>
+    <p id="tw-status" hidden></p>
+  </div>`;
+document.body.appendChild(twOverlay);
+const twList = twOverlay.querySelector("#tw-list");
+const twStatus = twOverlay.querySelector("#tw-status");
+
+let twScope = "profile";
+let twSlices = [];        // working copy: [{ label, kind, value }]
+let twCatalog = null;     // { client_actions:[{action,label}], slice_kinds }
+let twRequestCounter = 0;
+let twPendingGet = null;
+let twPendingPut = null;
+
+twOverlay.querySelector("#tw-close").addEventListener("click", () => {
+  twOverlay.hidden = true;
+  twPendingGet = null;
+});
+
+function twStatusMsg(text, isError) {
+  twStatus.textContent = text;
+  twStatus.classList.toggle("editor-error", !!isError);
+  twStatus.hidden = !text;
+}
+
+// Wire slices ({label, client?, command?, slices?}) -> editor rows
+// ({label, kind, value}). Folders are shown read-only (edit on desktop).
+function twSliceToRow(slice) {
+  if ((slice.slices || []).length) return { label: slice.label || "", kind: "folder", value: "" };
+  if (slice.client) return { label: slice.label || "", kind: "client", value: slice.client };
+  return { label: slice.label || "", kind: "command", value: slice.command || "" };
+}
+
+// Editor rows -> wire slices for touch_wheel_put. Folder rows are dropped
+// from the phone save (they weren't editable here); a desktop edit manages
+// them. Blank-label rows are skipped.
+function twRowsToSlices(rows) {
+  return rows
+    .filter((r) => r.kind !== "folder" && r.label.trim())
+    .map((r) => {
+      const slice = { label: r.label.trim() };
+      if (r.kind === "client") slice.client = r.value;
+      else slice.command = r.value;
+      return slice;
+    });
+}
+
+function openTouchWheelEditor(scope) {
+  twScope = scope || "profile";
+  twOverlay.hidden = false;
+  twList.replaceChildren(Object.assign(document.createElement("p"), {
+    className: "hl-empty", textContent: "Loading…",
+  }));
+  twStatusMsg("", false);
+  twPendingGet = ++twRequestCounter;
+  sendJson("touch_wheel_get", { request_id: twPendingGet, scope: twScope });
+}
+
+function handleTouchWheelReply(d) {
+  if (d.request_id === twPendingGet) {
+    twPendingGet = null;
+    if (d.error) { twStatusMsg(d.error, true); return; }
+    twCatalog = d.catalog || { client_actions: [], slice_kinds: [] };
+    const slices = Array.isArray(d.slices) ? d.slices : [];
+    // Empty = unset: seed the editor from the client's built-in default so
+    // the user starts from the familiar ring rather than a blank wheel.
+    const source = slices.length ? slices : touchWheelTop();
+    twSlices = source.map(twSliceToRow);
+    renderTouchWheelEditor();
+    return;
+  }
+  if (d.request_id === twPendingPut) {
+    twPendingPut = null;
+    if (d.error) { twStatusMsg(d.error, true); return; }
+    if (d.saved) twStatusMsg("Saved — applied live.", false);
+    return;
+  }
+}
+
+function renderTouchWheelEditor() {
+  twList.replaceChildren();
+  if (!twSlices.length) {
+    twList.appendChild(Object.assign(document.createElement("p"), {
+      className: "hl-empty", textContent: "No slices yet — add one below.",
+    }));
+    return;
+  }
+  twSlices.forEach((row, i) => twList.appendChild(twRowEl(row, i)));
+}
+
+function twRowEl(row, index) {
+  const el = document.createElement("div");
+  el.className = "tw-row";
+
+  const label = document.createElement("input");
+  label.type = "text";
+  label.className = "tw-label";
+  label.placeholder = "Label";
+  label.value = row.label;
+  label.addEventListener("input", () => { row.label = label.value; });
+  el.appendChild(label);
+
+  if (row.kind === "folder") {
+    const tag = document.createElement("span");
+    tag.className = "tw-folder-tag";
+    tag.textContent = "folder — edit on desktop";
+    el.appendChild(tag);
+  } else {
+    // Kind picker: client action vs game command.
+    const kind = document.createElement("select");
+    kind.className = "tw-kind";
+    for (const [val, txt] of [["client", "Open / focus"], ["command", "Game command"]]) {
+      kind.appendChild(new Option(txt, val));
+    }
+    kind.value = row.kind;
+    el.appendChild(kind);
+
+    // Value control: a dropdown of client actions, or a command text field.
+    const valueWrap = document.createElement("span");
+    valueWrap.className = "tw-value";
+    const buildValue = () => {
+      valueWrap.replaceChildren();
+      if (row.kind === "client") {
+        const sel = document.createElement("select");
+        for (const a of (twCatalog.client_actions || [])) {
+          sel.appendChild(new Option(a.label, a.action));
+        }
+        if (!(twCatalog.client_actions || []).some((a) => a.action === row.value)) {
+          row.value = (twCatalog.client_actions || [])[0]?.action || "";
+        }
+        sel.value = row.value;
+        sel.addEventListener("change", () => { row.value = sel.value; });
+        valueWrap.appendChild(sel);
+      } else {
+        const txt = document.createElement("input");
+        txt.type = "text";
+        txt.placeholder = "e.g. look";
+        txt.value = row.value;
+        txt.addEventListener("input", () => { row.value = txt.value; });
+        valueWrap.appendChild(txt);
+      }
+    };
+    kind.addEventListener("change", () => { row.kind = kind.value; row.value = ""; buildValue(); });
+    buildValue();
+    el.appendChild(valueWrap);
+  }
+
+  // Reorder + delete controls.
+  const controls = document.createElement("span");
+  controls.className = "tw-controls";
+  const mk = (txt, fn, disabled) => {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.textContent = txt;
+    b.disabled = !!disabled;
+    b.addEventListener("click", fn);
+    return b;
+  };
+  controls.appendChild(mk("↑", () => twMove(index, -1), index === 0));
+  controls.appendChild(mk("↓", () => twMove(index, 1), index === twSlices.length - 1));
+  controls.appendChild(mk("✕", () => { twSlices.splice(index, 1); renderTouchWheelEditor(); }));
+  el.appendChild(controls);
+  return el;
+}
+
+function twMove(index, delta) {
+  const target = index + delta;
+  if (target < 0 || target >= twSlices.length) return;
+  [twSlices[index], twSlices[target]] = [twSlices[target], twSlices[index]];
+  renderTouchWheelEditor();
+}
+
+twOverlay.querySelector("#tw-add").addEventListener("click", () => {
+  const first = (twCatalog?.client_actions || [])[0]?.action || "";
+  twSlices.push({ label: "", kind: "client", value: first });
+  renderTouchWheelEditor();
+});
+
+twOverlay.querySelector("#tw-save").addEventListener("click", () => {
+  const slices = twRowsToSlices(twSlices);
+  twStatusMsg("Saving…", false);
+  twPendingPut = ++twRequestCounter;
+  sendJson("touch_wheel_put", { request_id: twPendingPut, scope: twScope, slices });
+});
+
+// ---- Lich WebUI (P5) -------------------------------------------------------
+// The phone renders Lich WebUI component trees so a Lich-attached player can
+// use script panels without a desktop. P5a lands the wire + this store; the
+// full node renderer is P5b. `subscribed` are the pages we've opened (renders
+// for other pages are dropped); `trees` holds the latest tree per page.
+const webuiState = {
+  available: false,   // set from session.webui_available
+  connected: false,   // bridge up?
+  pages: [],          // [{id,title,script,kind,bare,size}]
+  subscribed: new Set(),
+  trees: new Map(),   // page -> { seq, tree }
+  seqs: new Map(),    // page -> last applied seq
+};
+
+function handleWebUiRender(d) {
+  const { page, seq, tree } = d;
+  if (!webuiState.subscribed.has(page)) return; // not open here
+  const last = webuiState.seqs.get(page) || 0;
+  if (seq < last) return; // stale / out of order
+  webuiState.seqs.set(page, seq);
+  webuiState.trees.set(page, { seq, tree });
+  renderWebUiIfOpen(page);
+}
+
+function handleWebUiClosed(d) {
+  webuiState.trees.delete(d.page);
+  webuiState.seqs.delete(d.page);
+  renderWebUiIfOpen(d.page);
+}
+
+function handleWebUiNotice(d) {
+  // Surface as a system line for now; P5b may show it inline in the panel.
+  appendText(++webuiNoticeSeq * -1, "main",
+    { segments: [{ text: `[WebUI ${d.level || "info"}] ${d.text || ""}` }] });
+}
+let webuiNoticeSeq = 0;
+
+// Subscribe/unsubscribe a WebUI page (open/close its phone panel).
+function webuiSubscribe(page) {
+  webuiState.subscribed.add(page);
+  sendJson("webui_subscribe", { page });
+}
+function webuiUnsubscribe(page) {
+  webuiState.subscribed.delete(page);
+  webuiState.trees.delete(page);
+  sendJson("webui_unsubscribe", { page });
+}
+// Send a component interaction back to Lich (button/input/row).
+function webuiSendEvent(page, cid, value) {
+  sendJson("webui_event", { page, cid, value: value ?? null });
+}
+
+// ---- WebUI panel overlay + node renderer (P5b) -----------------------------
+// One page is shown at a time in a full-screen overlay (phone real estate).
+// A picker lists registered pages; opening one subscribes, closing
+// unsubscribes. The node renderer reproduces the desktop widget set; edit
+// state (in-progress input text) lives naturally in the DOM elements.
+
+const webuiOverlay = document.createElement("div");
+webuiOverlay.id = "webui-overlay";
+webuiOverlay.hidden = true;
+webuiOverlay.innerHTML = `
+  <div id="webui-card">
+    <div id="webui-titlebar">
+      <button type="button" id="webui-back" title="Pages">‹</button>
+      <span id="webui-title">Lich WebUI</span>
+      <button type="button" id="webui-close">Close</button>
+    </div>
+    <div id="webui-body"></div>
+  </div>`;
+document.body.appendChild(webuiOverlay);
+const webuiBody = webuiOverlay.querySelector("#webui-body");
+const webuiTitle = webuiOverlay.querySelector("#webui-title");
+let webuiOpenPage = null; // page id currently shown, or null = picker
+
+webuiOverlay.querySelector("#webui-close").addEventListener("click", closeWebUi);
+webuiOverlay.querySelector("#webui-back").addEventListener("click", () => {
+  if (webuiOpenPage) { webuiUnsubscribe(webuiOpenPage); webuiOpenPage = null; renderWebUi(); }
+  else closeWebUi();
+});
+
+function openWebUi() {
+  if (!webuiState.available) return;
+  webuiOverlay.hidden = false;
+  webuiOpenPage = null;
+  renderWebUi();
+}
+function closeWebUi() {
+  if (webuiOpenPage) webuiUnsubscribe(webuiOpenPage);
+  webuiOpenPage = null;
+  webuiOverlay.hidden = true;
+}
+function openWebUiPage(page) {
+  webuiOpenPage = page;
+  webuiSubscribe(page);
+  renderWebUi();
+}
+
+// The message dispatch calls this on every webui delta; only repaint if the
+// change concerns what's on screen.
+function renderWebUiIfOpen(page) {
+  if (webuiOverlay.hidden) return;
+  if (page && webuiOpenPage && page !== webuiOpenPage) return;
+  renderWebUi();
+}
+
+function renderWebUi() {
+  webuiBody.replaceChildren();
+  const backBtn = webuiOverlay.querySelector("#webui-back");
+  if (!webuiState.connected && !webuiOpenPage) {
+    webuiTitle.textContent = "Lich WebUI";
+    backBtn.hidden = true;
+    webuiBody.appendChild(Object.assign(document.createElement("p"), {
+      className: "hl-empty",
+      textContent: webuiState.available ? "Connecting to Lich…" : "Lich WebUI needs a Lich session.",
+    }));
+    return;
+  }
+  if (!webuiOpenPage) {
+    // Page picker.
+    webuiTitle.textContent = "Lich WebUI";
+    backBtn.hidden = true;
+    if (!webuiState.pages.length) {
+      webuiBody.appendChild(Object.assign(document.createElement("p"), {
+        className: "hl-empty", textContent: "No WebUI pages registered.",
+      }));
+      return;
+    }
+    for (const p of webuiState.pages) {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "webui-page-item";
+      btn.textContent = p.title || p.id;
+      btn.addEventListener("click", () => openWebUiPage(p.id));
+      webuiBody.appendChild(btn);
+    }
+    return;
+  }
+  // A page is open: render its latest tree.
+  backBtn.hidden = false;
+  const desc = webuiState.pages.find((p) => p.id === webuiOpenPage);
+  webuiTitle.textContent = desc ? (desc.title || desc.id) : webuiOpenPage;
+  const entry = webuiState.trees.get(webuiOpenPage);
+  if (!entry || !entry.tree) {
+    webuiBody.appendChild(Object.assign(document.createElement("p"), {
+      className: "hl-empty", textContent: "Loading…",
+    }));
+    return;
+  }
+  webuiBody.appendChild(renderWebUiNode(webuiOpenPage, entry.tree));
+}
+
+// Render one node into a DOM element. `page` threads through for event cids.
+function renderWebUiNode(page, node) {
+  const t = node.t || "";
+  const emit = (value) => webuiSendEvent(page, node.cid || "", value);
+  switch (t) {
+    case "page": {
+      const el = document.createElement("div");
+      el.className = "webui-page";
+      for (const c of node.children || []) el.appendChild(renderWebUiNode(page, c));
+      return el;
+    }
+    case "header": {
+      const el = document.createElement("h3");
+      el.className = "webui-header";
+      el.textContent = node.text || "";
+      return el;
+    }
+    case "text": {
+      const el = document.createElement("div");
+      el.className = "webui-text";
+      el.textContent = node.text || "";
+      return el;
+    }
+    case "markdown": {
+      const el = document.createElement("div");
+      el.className = "webui-text";
+      renderWebUiMarkdown(el, node.text || "");
+      return el;
+    }
+    case "divider": {
+      return document.createElement("hr");
+    }
+    case "button": return webuiButton(page, node, emit);
+    case "text_input":
+    case "password_input": return webuiTextInput(page, node, emit, t === "password_input");
+    case "textarea": return webuiTextarea(page, node, emit);
+    case "select": return webuiSelect(page, node, emit);
+    case "radio": return webuiRadio(page, node, emit);
+    case "checkbox": return webuiCheckbox(page, node, emit);
+    case "slider":
+    case "number_input": return webuiNumber(page, node, emit, t === "slider");
+    case "log": return webuiLog(node);
+    case "progress": return webuiProgress(node);
+    case "table": return webuiTable(page, node, emit);
+    case "expander": return webuiExpander(page, node);
+    case "columns": return webuiColumns(page, node);
+    case "col": case "tab": case "cell": {
+      const el = document.createElement("div");
+      el.className = "webui-container";
+      for (const c of node.children || []) el.appendChild(renderWebUiNode(page, c));
+      return el;
+    }
+    case "grid": return webuiGrid(page, node);
+    case "tabs": return webuiTabs(page, node);
+    case "image": return webuiImage(node);
+    case "image_map": return webuiImageMap(page, node, emit);
+    default: {
+      const el = document.createElement("div");
+      el.className = "webui-text webui-unsupported";
+      el.textContent = `[unsupported component: ${t}]`;
+      return el;
+    }
+  }
+}
+
+// Two-step confirm: first tap arms (swaps label, colored); second fires.
+function webuiButton(page, node, emit) {
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "webui-btn";
+  if (node.variant === "danger") btn.classList.add("danger");
+  btn.disabled = !!node.disabled;
+  let armed = false;
+  let armTimer = 0;
+  const label = node.label || "";
+  const paint = () => {
+    btn.textContent = armed ? (node.confirm || label) : label;
+    btn.classList.toggle("armed", armed);
+  };
+  paint();
+  btn.addEventListener("click", () => {
+    if (node.confirm && !armed) {
+      armed = true; paint();
+      clearTimeout(armTimer);
+      armTimer = setTimeout(() => { armed = false; paint(); }, 3000);
+    } else {
+      armed = false; clearTimeout(armTimer); paint();
+      emit(null);
+    }
+  });
+  return btn;
+}
+
+// text/password: the DOM element IS the edit buffer. Adopt a changed server
+// value only when NOT focused; commit on blur or Enter.
+function webuiTextInput(page, node, emit, isPassword) {
+  const wrap = document.createElement("label");
+  wrap.className = "webui-field";
+  if (node.label) wrap.append(Object.assign(document.createElement("span"), { textContent: node.label }));
+  const input = document.createElement("input");
+  input.type = isPassword ? "password" : "text";
+  input.value = webuiValueStr(node);
+  if (node.placeholder) input.placeholder = node.placeholder;
+  const commit = () => {
+    if (isPassword || input.value !== webuiValueStr(node)) emit(input.value);
+  };
+  input.addEventListener("blur", commit);
+  input.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); input.blur(); } });
+  wrap.appendChild(input);
+  return wrap;
+}
+
+function webuiTextarea(page, node, emit) {
+  const wrap = document.createElement("label");
+  wrap.className = "webui-field webui-field-col";
+  if (node.label) wrap.append(Object.assign(document.createElement("span"), { textContent: node.label }));
+  const ta = document.createElement("textarea");
+  ta.value = webuiValueStr(node);
+  if (node.placeholder) ta.placeholder = node.placeholder;
+  if (node.rows_hint) ta.rows = node.rows_hint;
+  ta.addEventListener("blur", () => { if (ta.value !== webuiValueStr(node)) emit(ta.value); });
+  wrap.appendChild(ta);
+  return wrap;
+}
+
+function webuiSelect(page, node, emit) {
+  const wrap = document.createElement("label");
+  wrap.className = "webui-field";
+  if (node.label) wrap.append(Object.assign(document.createElement("span"), { textContent: node.label }));
+  const sel = document.createElement("select");
+  for (const opt of node.options || []) sel.appendChild(new Option(opt, opt));
+  sel.value = webuiValueStr(node);
+  sel.addEventListener("change", () => emit(sel.value));
+  wrap.appendChild(sel);
+  return wrap;
+}
+
+function webuiRadio(page, node, emit) {
+  const group = document.createElement("div");
+  group.className = "webui-radio";
+  if (node.label) group.append(Object.assign(document.createElement("div"), { className: "webui-radio-label", textContent: node.label }));
+  const current = webuiValueStr(node);
+  const name = `webui_radio_${node.cid || Math.random()}`;
+  for (const opt of node.options || []) {
+    const lbl = document.createElement("label");
+    const r = document.createElement("input");
+    r.type = "radio"; r.name = name; r.value = opt; r.checked = opt === current;
+    r.addEventListener("change", () => emit(opt));
+    lbl.append(r, document.createTextNode(" " + opt));
+    group.appendChild(lbl);
+  }
+  return group;
+}
+
+function webuiCheckbox(page, node, emit) {
+  const lbl = document.createElement("label");
+  lbl.className = "webui-check";
+  const box = document.createElement("input");
+  box.type = "checkbox"; box.checked = !!node.checked;
+  box.addEventListener("change", () => emit(box.checked));
+  lbl.append(box, document.createTextNode(" " + (node.label || "")));
+  return lbl;
+}
+
+function webuiNumber(page, node, emit, isSlider) {
+  const wrap = document.createElement("label");
+  wrap.className = "webui-field";
+  if (node.label) wrap.append(Object.assign(document.createElement("span"), { textContent: node.label }));
+  const input = document.createElement("input");
+  input.type = isSlider ? "range" : "number";
+  if (node.min != null) input.min = node.min;
+  if (node.max != null) input.max = node.max;
+  if (node.step != null) input.step = node.step;
+  const v = webuiValueNum(node);
+  if (v != null) input.value = v;
+  // Commit on release (range) / change (number) — matches desktop's
+  // commit-on-drag-release, not every intermediate value.
+  const commit = () => { const n = parseFloat(input.value); if (!Number.isNaN(n)) emit(n); };
+  input.addEventListener("change", commit);
+  wrap.appendChild(input);
+  if (isSlider) {
+    const out = document.createElement("output");
+    out.textContent = v != null ? v : "";
+    input.addEventListener("input", () => { out.textContent = input.value; });
+    wrap.appendChild(out);
+  }
+  return wrap;
+}
+
+function webuiLog(node) {
+  const box = document.createElement("div");
+  box.className = "webui-log";
+  if (node.max_height) box.style.maxHeight = `${node.max_height}px`;
+  for (const line of node.lines || []) {
+    const row = document.createElement("div");
+    renderWebUiMarkdown(row, line);
+    box.appendChild(row);
+  }
+  return box;
+}
+
+function webuiProgress(node) {
+  const wrap = document.createElement("div");
+  wrap.className = "webui-progress-wrap";
+  const bar = document.createElement("div");
+  bar.className = "webui-progress";
+  const frac = Math.max(0, Math.min(1, webuiValueNum(node) ?? 0));
+  const fill = document.createElement("div");
+  fill.className = "webui-progress-fill";
+  fill.style.width = `${(frac * 100).toFixed(1)}%`;
+  bar.appendChild(fill);
+  wrap.appendChild(bar);
+  if (node.label) wrap.append(Object.assign(document.createElement("span"), { className: "webui-progress-label", textContent: node.label }));
+  return wrap;
+}
+
+function webuiTable(page, node, emit) {
+  const scroll = document.createElement("div");
+  scroll.className = "webui-table-scroll";
+  const table = document.createElement("table");
+  table.className = "webui-table";
+  if (node.headings && node.headings.length) {
+    const thead = document.createElement("thead");
+    const tr = document.createElement("tr");
+    for (const h of node.headings) tr.append(Object.assign(document.createElement("th"), { textContent: h }));
+    thead.appendChild(tr); table.appendChild(thead);
+  }
+  const tbody = document.createElement("tbody");
+  (node.rows || []).forEach((row, i) => {
+    const tr = document.createElement("tr");
+    if (node.selected === i) tr.classList.add("selected");
+    for (const cell of row) tr.append(Object.assign(document.createElement("td"), { textContent: cell }));
+    if (node.clickable) {
+      tr.classList.add("clickable");
+      // Emit the UNSORTED row index (desktop contract).
+      tr.addEventListener("click", () => emit(i));
+    }
+    tbody.appendChild(tr);
+  });
+  table.appendChild(tbody);
+  scroll.appendChild(table);
+  return scroll;
+}
+
+function webuiExpander(page, node) {
+  const det = document.createElement("details");
+  det.className = "webui-expander";
+  det.open = !!node.open; // open state is client-local
+  const sum = document.createElement("summary");
+  sum.textContent = node.label || "";
+  det.appendChild(sum);
+  for (const c of node.children || []) det.appendChild(renderWebUiNode(page, c));
+  return det;
+}
+
+function webuiColumns(page, node) {
+  const el = document.createElement("div");
+  el.className = "webui-columns";
+  const cols = (node.children || []);
+  const weights = node.weights || [];
+  cols.forEach((c, i) => {
+    const colEl = renderWebUiNode(page, c);
+    colEl.style.flex = `${weights[i] || 1} 1 0`;
+    el.appendChild(colEl);
+  });
+  return el;
+}
+
+function webuiGrid(page, node) {
+  const el = document.createElement("div");
+  el.className = "webui-grid";
+  el.style.gridTemplateColumns = `repeat(${node.cols || 1}, 1fr)`;
+  for (const c of node.children || []) el.appendChild(renderWebUiNode(page, c));
+  return el;
+}
+
+// Tabs: active index is client-local (never sent to server).
+function webuiTabs(page, node) {
+  const el = document.createElement("div");
+  el.className = "webui-tabs";
+  const strip = document.createElement("div");
+  strip.className = "webui-tab-strip";
+  const panel = document.createElement("div");
+  panel.className = "webui-tab-panel";
+  const tabs = node.children || [];
+  let active = 0;
+  const paint = () => {
+    panel.replaceChildren();
+    if (tabs[active]) panel.appendChild(renderWebUiNode(page, tabs[active]));
+    [...strip.children].forEach((b, i) => b.classList.toggle("active", i === active));
+  };
+  tabs.forEach((tab, i) => {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "webui-tab";
+    b.textContent = tab.label || `Tab ${i + 1}`;
+    b.addEventListener("click", () => { active = i; paint(); });
+    strip.appendChild(b);
+  });
+  el.append(strip, panel);
+  paint();
+  return el;
+}
+
+function webuiImage(node) {
+  const img = document.createElement("img");
+  img.className = "webui-image";
+  img.alt = node.alt || "";
+  img.src = webuiImageSrc(node.src || "");
+  if (node.scale) img.style.width = `calc(var(--webui-img-w, 0px))`;
+  return img;
+}
+
+// image_map: an image with clickable marker boxes; a tap emits the unscaled
+// pixel coords + modifiers + topmost marker id (desktop payload).
+function webuiImageMap(page, node, emit) {
+  const wrap = document.createElement("div");
+  wrap.className = "webui-imagemap";
+  const img = document.createElement("img");
+  img.src = webuiImageSrc(node.src || "");
+  img.alt = node.alt || "";
+  const scale = node.scale || 1;
+  wrap.appendChild(img);
+  const markers = node.markers || [];
+  const hitAt = (px, py) => {
+    // topmost marker whose box contains the unscaled point
+    for (let i = markers.length - 1; i >= 0; i--) {
+      const m = markers[i];
+      if (px >= m.x1 && px <= m.x2 && py >= m.y1 && py <= m.y2) return m.id;
+    }
+    return null;
+  };
+  const fire = (ev, right) => {
+    ev.preventDefault();
+    const rect = img.getBoundingClientRect();
+    const px = Math.round((ev.clientX - rect.left) / scale);
+    const py = Math.round((ev.clientY - rect.top) / scale);
+    emit({ x: px, y: py, shift: ev.shiftKey, ctrl: ev.ctrlKey || ev.metaKey, right, marker: hitAt(px, py) });
+    if (right && node.popup) openWebUiPage(node.popup);
+  };
+  img.addEventListener("click", (ev) => fire(ev, false));
+  img.addEventListener("contextmenu", (ev) => fire(ev, true));
+  // Draw marker outlines scaled to display size.
+  for (const m of markers) {
+    const box = document.createElement("div");
+    box.className = `webui-marker webui-marker-${m.kind || "marker"}`;
+    box.style.left = `${m.x1 * scale}px`;
+    box.style.top = `${m.y1 * scale}px`;
+    box.style.width = `${(m.x2 - m.x1) * scale}px`;
+    box.style.height = `${(m.y2 - m.y1) * scale}px`;
+    if (m.label) box.title = m.label;
+    wrap.appendChild(box);
+  }
+  return wrap;
+}
+
+// /files/ images fetch over the bridge (cookie-authed) on desktop; on the
+// phone the token is in the URL fragment, not a usable cookie for a
+// cross-path GET, so route through the same /sounds-style token query the
+// phone already uses. Data URIs pass through untouched.
+function webuiImageSrc(src) {
+  if (src.startsWith("data:")) return src;
+  if (src.startsWith("/files/")) return `${src}?token=${encodeURIComponent(pairingToken)}`;
+  return src;
+}
+
+function webuiValueStr(node) {
+  const v = node.value;
+  return typeof v === "string" ? v : (v == null ? "" : String(v));
+}
+function webuiValueNum(node) {
+  const v = node.value;
+  return typeof v === "number" ? v : (v == null ? null : parseFloat(v));
+}
+
+// Inline markdown subset matching the desktop: {{color:text}}, **bold**,
+// *italic*, `code`, bare http(s) URLs. Appends styled spans into `el`.
+const WEBUI_PALETTE = {
+  red: "#c05050", green: "#2aa02a", blue: "#4a7ad0", yellow: "#b0902a",
+  orange: "#c86400", cyan: "#2aa0a8", magenta: "#a840a8", gray: "#8c8c8c", grey: "#8c8c8c",
+};
+function renderWebUiMarkdown(el, input) {
+  let rest = input;
+  const push = (text, style) => {
+    if (!text) return;
+    const span = document.createElement(style && style.link ? "a" : "span");
+    if (style) {
+      if (style.bold) span.style.fontWeight = "bold";
+      if (style.italic) span.style.fontStyle = "italic";
+      if (style.code) span.className = "webui-code";
+      if (style.color) span.style.color = WEBUI_PALETTE[style.color] || style.color;
+      if (style.link) { span.href = text; span.target = "_blank"; span.rel = "noopener"; }
+    }
+    span.textContent = text;
+    el.appendChild(span);
+  };
+  // Greedy left-to-right scan for the earliest marker.
+  const patterns = [
+    { re: /\{\{(\w+):([^}]*)\}\}/, fn: (m) => push(m[2], { color: m[1] }) },
+    { re: /\*\*([^*]+)\*\*/, fn: (m) => push(m[1], { bold: true }) },
+    { re: /\*([^*]+)\*/, fn: (m) => push(m[1], { italic: true }) },
+    { re: /`([^`]+)`/, fn: (m) => push(m[1], { code: true }) },
+    { re: /(https?:\/\/[^\s]+)/, fn: (m) => push(m[1], { link: true }) },
+  ];
+  let guard = 0;
+  while (rest && guard++ < 5000) {
+    let best = null, bestPat = null;
+    for (const p of patterns) {
+      const m = p.re.exec(rest);
+      if (m && (best === null || m.index < best.index)) { best = m; bestPat = p; }
+    }
+    if (!best) { push(rest); break; }
+    if (best.index > 0) push(rest.slice(0, best.index));
+    bestPat.fn(best);
+    rest = rest.slice(best.index + best[0].length);
+  }
 }
 
 // ---- Roaming phone prefs (per-character, server-side) ----------------------

@@ -121,9 +121,13 @@ pub(crate) const COMMAND_HELP: &[CommandHelpSection] = &[
                 "[name]",
                 "Save current layout (default: 'default')"
             ),
-            entry!(&["loadlayout"], "[name]", "Load a saved layout"),
+            entry!(
+                &["loadlayout"],
+                "[name] [--keep-skin]",
+                "Load a saved layout (--keep-skin keeps your skin/theme)"
+            ),
             entry!(&["layouts"], "", "List available layouts"),
-            entry!(&["resize"], "", "Resize layout to current terminal (TUI)"),
+            entry!(&["resize"], "", "Refit windows to the current window/terminal size"),
         ],
     },
     CommandHelpSection {
@@ -248,6 +252,14 @@ pub(crate) const COMMAND_HELP: &[CommandHelpSection] = &[
         )],
     },
     CommandHelpSection {
+        title: "INDICATORS",
+        entries: &[entry!(
+            &["indicators", "indicator"],
+            "",
+            "Open the indicator builder (create/edit all status indicators, conditions, and icons)"
+        )],
+    },
+    CommandHelpSection {
         title: "COLORS",
         entries: &[
             entry!(
@@ -277,6 +289,11 @@ pub(crate) const COMMAND_HELP: &[CommandHelpSection] = &[
                 "",
                 "Reset terminal palette to defaults (TUI)"
             ),
+            entry!(
+                &["harmony"],
+                "[scheme|schemes|skin <name>]",
+                "Generate preset colors from the active theme; 'skin' writes matching panel/frame images"
+            ),
         ],
     },
     CommandHelpSection {
@@ -304,14 +321,19 @@ pub(crate) const COMMAND_HELP: &[CommandHelpSection] = &[
         title: "SHARING",
         entries: &[
             entry!(
+                &["packs", "packeditor"],
+                "",
+                "Open the pack editor: guided export/import of shareable UI packs"
+            ),
+            entry!(
                 &["uiexport"],
                 "<name> [parts]",
-                "Export layout/highlights/keybinds/hotbars/colors/macros/skin as a shareable pack"
+                "Export layout/highlights/keybinds/hotbars/colors/macros/skin/theme/sounds/quickbars/settings as a shareable pack"
             ),
             entry!(
                 &["uiimport"],
                 "<name|file>",
-                "Preview a shared UI pack; add 'apply' to install (with backups)"
+                "Preview a shared UI pack; add 'apply [parts...]' to install (with backups)"
             ),
         ],
     },
@@ -339,6 +361,11 @@ pub(crate) const COMMAND_HELP: &[CommandHelpSection] = &[
                 &["snapdebug"],
                 "",
                 "Toggle the snap-engine trace in vellum-fe.log (GUI)"
+            ),
+            entry!(
+                &["performance", "perf"],
+                "[dump]",
+                "Toggle the performance monitor; 'dump' writes a diagnostic report file"
             ),
         ],
     },

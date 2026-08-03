@@ -34,6 +34,20 @@ async fn main() {
         sink.set_session_control(true);
     }
 
+    // Scripted Lich WebUI: advertise availability + a registered page, and
+    // mark the bridge connected, so the phone's WebUI panel + picker work
+    // without a real Lich. The render tree is served on subscribe below.
+    sink.set_webui_available(true);
+    sink.push_webui_pages(vec![vellum_fe::data::webui::WebUiPageDescriptor {
+        id: "demo/panel".into(),
+        title: "Demo Panel".into(),
+        script: "demo".into(),
+        kind: Some("panel".into()),
+        bare: true,
+        size: None,
+    }]);
+    sink.push_webui_connected(true);
+
     let base: MacrosConfig = toml::from_str(
         r##"
         [[group]]
@@ -226,6 +240,49 @@ async fn main() {
             // Portal commands for the dynamic "portals" wheel (also used
             // by the wheel_pick resolver below, like AppCore's).
             snap.portals = scripted_portals();
+        }
+        // Scripted room name + description prose so the status drawer's Room
+        // section has a "look" to render, and a spellbook so the Spells
+        // section is populated (both P2 feeds). Both ride the wire as styled
+        // lines; the room prose carries a clickable scenery link so the
+        // phone's tap-to-interact path can be exercised.
+        {
+            use vellum_fe::data::widget::{LinkData, StyledLine, TextSegment};
+            let seg = |text: &str| TextSegment {
+                text: text.into(),
+                ..Default::default()
+            };
+            let link_seg = |text: &str, exist: &str, noun: &str| TextSegment {
+                text: text.into(),
+                link_data: Some(LinkData {
+                    exist_id: exist.into(),
+                    noun: noun.into(),
+                    text: text.into(),
+                    coord: None,
+                }),
+                ..Default::default()
+            };
+            let line = |segments: Vec<TextSegment>| StyledLine {
+                segments,
+                stream: "room".into(),
+                timestamp: None,
+            };
+            snap.room_name = Some("Harness Town, Town Square".into());
+            snap.room_description = vec![line(vec![
+                seg("A cobbled square opens beneath a bright sky. A "),
+                link_seg("marble fountain", "555", "fountain"),
+                seg(" bubbles at its center, and shops line the surrounding streets."),
+            ])];
+            let spell = |text: &str| StyledLine {
+                segments: vec![seg(text)],
+                stream: "Spells".into(),
+                timestamp: None,
+            };
+            snap.spellbook = vec![
+                spell("Elemental Defense III (503)   00:14:59"),
+                spell("Mana Leech (516)   00:29:42"),
+                spell("Haste (506)   00:05:11"),
+            ];
         }
         snap.map_scene = RemoteMapSceneRef(Some(scene));
         snap.map_state = RemoteMapState {
@@ -641,6 +698,38 @@ async fn main() {
                 println!("EVENT colors_put: scope={scope:?} sections={sections:?} body={colors}");
                 sink.push_colors(client_id, request_id, scope, serde_json::Value::Null, None, true);
             }
+            RemoteEvent::TouchWheelGet {
+                client_id,
+                request_id,
+                scope,
+            } => {
+                println!("EVENT touch_wheel_get: scope={scope:?}");
+                // Reply with a small scripted ring + the real catalog so the
+                // editor renders its action picker from the true vocabulary.
+                let slices = serde_json::json!([
+                    { "label": "Room", "client": "open:room" },
+                    { "label": "Look", "command": "look" },
+                ]);
+                let catalog = vellum_fe::config::touch_wheel_action_catalog();
+                sink.push_touch_wheel(client_id, request_id, scope, slices, catalog, None, false);
+            }
+            RemoteEvent::TouchWheelPut {
+                client_id,
+                request_id,
+                scope,
+                slices,
+            } => {
+                println!("EVENT touch_wheel_put: scope={scope:?} slices={slices}");
+                sink.push_touch_wheel(
+                    client_id,
+                    request_id,
+                    scope,
+                    serde_json::Value::Null,
+                    serde_json::Value::Null,
+                    None,
+                    true,
+                );
+            }
             RemoteEvent::Command(text) => {
                 println!("EVENT cmd: {text:?}");
                 // `echo <text>` / `echot <text>` / `echod <text>` send the
@@ -734,6 +823,36 @@ async fn main() {
                 println!("EVENT macro_delete: {group:?} {label:?}");
                 local.delete_button(group.as_deref(), &label);
                 sink.set_macros(&MacrosConfig::merge(base.clone(), local.clone()));
+            }
+            RemoteEvent::WebUiSubscribe { page } => {
+                println!("EVENT webui_subscribe: page={page:?}");
+                // Reply with a render tree exercising many node types so the
+                // phone renderer can be verified end to end.
+                let tree: vellum_fe::data::webui::WebUiNode = serde_json::from_value(serde_json::json!({
+                    "t": "page", "title": "Demo Panel", "bare": true, "children": [
+                        { "t": "header", "cid": "h0", "text": "Creatures" },
+                        { "t": "text", "cid": "t0", "text": "A kobold lurks nearby." },
+                        { "t": "markdown", "cid": "m0", "text": "Status: {{green:healthy}} — **ready** to *fight*." },
+                        { "t": "divider" },
+                        { "t": "button", "cid": "attack", "label": "Attack", "variant": "danger" },
+                        { "t": "button", "cid": "flee", "label": "Flee", "confirm": "Confirm flee?" },
+                        { "t": "text_input", "cid": "note", "label": "Note", "value": "hi", "placeholder": "type…" },
+                        { "t": "checkbox", "cid": "auto", "label": "Auto-attack", "checked": true },
+                        { "t": "select", "cid": "stance", "label": "Stance", "options": ["offensive","defensive"], "value": "defensive" },
+                        { "t": "slider", "cid": "vol", "label": "Volume", "min": 0.0, "max": 100.0, "value": 40.0 },
+                        { "t": "progress", "cid": "hp", "value": 0.6, "label": "HP 60%" },
+                        { "t": "table", "cid": "tbl", "headings": ["Name","HP"], "rows": [["kobold","12"],["orc","40"]], "clickable": true, "selected": 1 },
+                        { "t": "expander", "cid": "adv", "label": "Advanced", "open": false, "children": [
+                            { "t": "text", "cid": "adv0", "text": "hidden detail" } ] },
+                        { "t": "tabs", "cid": "tabs", "children": [
+                            { "t": "tab", "cid": "ta", "label": "One", "children": [ { "t": "text", "cid": "x", "text": "tab one" } ] },
+                            { "t": "tab", "cid": "tb", "label": "Two", "children": [ { "t": "text", "cid": "y", "text": "tab two" } ] } ] }
+                    ]
+                })).unwrap();
+                sink.push_webui_render(page, 1, tree);
+            }
+            RemoteEvent::WebUiEvent { page, cid, value } => {
+                println!("EVENT webui_event: page={page:?} cid={cid:?} value={value}");
             }
             other => println!("EVENT other: {other:?}"),
         }

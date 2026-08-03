@@ -1055,12 +1055,23 @@ impl VellumGuiApp {
         }
 
         let bar_height = config.bar_height.clamp(8.0, 60.0);
+        // egui's ProgressBar paints its trough with extreme_bg_color, so a
+        // configured depleted color is applied by overriding the visuals of
+        // the Ui the bars render into. styled_progress_bar also reads it for
+        // empty-bar fill and text contrast, which keeps those consistent.
+        let depleted_bg = config
+            .depleted_color
+            .as_deref()
+            .and_then(super::theme::resolve_color);
         match config.orientation {
             VitalsOrientation::Horizontal => {
                 ui.columns(bars.len(), |columns| {
                     for (column, (id, fraction, text, fill)) in
                         columns.iter_mut().zip(bars.into_iter())
                     {
+                        if let Some(depleted) = depleted_bg {
+                            column.visuals_mut().extreme_bg_color = depleted;
+                        }
                         let fraction = Self::animated_fraction(column, id, fraction);
                         let bar = Self::styled_progress_bar(column, settings, fraction, fill, text);
                         column.add_sized([column.available_width().max(40.0), bar_height], bar);
@@ -1068,6 +1079,9 @@ impl VellumGuiApp {
                 });
             }
             VitalsOrientation::Vertical => {
+                if let Some(depleted) = depleted_bg {
+                    ui.visuals_mut().extreme_bg_color = depleted;
+                }
                 for (id, fraction, text, fill) in bars {
                     let fraction = Self::animated_fraction(ui, id, fraction);
                     let bar = Self::styled_progress_bar(ui, settings, fraction, fill, text);
@@ -1388,36 +1402,60 @@ impl VellumGuiApp {
         indicator: &crate::data::IndicatorData,
         skin_art: Option<&crate::frontend::gui::skin::SkinWidgetArt>,
         gray_inactive: bool,
+        resolved: &crate::core::conditions::ResolvedStatusArt,
     ) {
         let text = if label.is_empty() {
             &indicator.indicator_id
         } else {
             label
         };
-        // TUI defaults: #00ff00 when active, #555555 when off.
-        let color = if indicator.active {
-            indicator
-                .color
-                .as_deref()
-                .and_then(parse_hex_color)
-                .unwrap_or(Color32::from_rgb(0x00, 0xff, 0x00))
-        } else {
-            Color32::from_rgb(0x55, 0x55, 0x55)
-        };
-        // Skin sprite first, then the built-in pictogram (dimmed when
-        // inactive, Wrayth-style); custom ids without art keep the text.
-        // "Gray when inactive" swaps the inactive sprite for its grayscale
-        // twin at full strength instead of the alpha dim.
-        let mut grayed = false;
-        let sprite = skin_art.and_then(|art| {
-            if !indicator.active && gray_inactive {
-                if let Some(icon) = art.icon_gray(&indicator.indicator_id) {
-                    grayed = true;
-                    return Some(icon);
+        // A matched state's color wins; then the per-window color; then the
+        // TUI defaults (#00ff00 active, #555555 off).
+        let color = resolved
+            .color
+            .as_deref()
+            .and_then(parse_hex_color)
+            .unwrap_or_else(|| {
+                if indicator.active {
+                    indicator
+                        .color
+                        .as_deref()
+                        .and_then(parse_hex_color)
+                        .unwrap_or(Color32::from_rgb(0x00, 0xff, 0x00))
+                } else {
+                    Color32::from_rgb(0x55, 0x55, 0x55)
                 }
-            }
-            art.icon(&indicator.indicator_id)
-        });
+            });
+        // Icon precedence: a resolved IconRef (state icon or template active
+        // icon) via the skin/pool, then — only when ACTIVE — the id-keyed skin
+        // sprite and the built-in pictogram; custom ids without art keep the
+        // text. When INACTIVE with no configured inactive icon (resolved.icon
+        // is None), render NOTHING: inactive art is opt-in, never a dimmed
+        // copy or a fallback pictogram. "Gray when inactive" still applies to
+        // a configured inactive sprite.
+        let inactive_blank = !indicator.active && resolved.icon.is_none();
+        // Nothing to draw and no active pictogram to fall back to: leave the
+        // cell blank (inactive with no configured inactive icon).
+        if inactive_blank {
+            return;
+        }
+        let mut grayed = false;
+        let sprite = match &resolved.icon {
+            Some(icon) => skin_art.and_then(|art| {
+                if !indicator.active && gray_inactive {
+                    // Grayscale twin of the configured inactive sprite, if any.
+                    if let Some(gray) = art.icon_gray(&indicator.indicator_id) {
+                        grayed = true;
+                        return Some(gray);
+                    }
+                }
+                art.resolve_icon_ref(icon, &indicator.indicator_id)
+            }),
+            // Active + no explicit icon: fall through to the id-keyed skin
+            // sprite (and the built-in pictogram below) so "Default (by id)"
+            // shows the built-in art.
+            None => skin_art.and_then(|art| art.icon(&indicator.indicator_id)),
+        };
         if sprite.is_some() || super::status_icons::supported(&indicator.indicator_id) {
             let side = ui
                 .available_width()
@@ -1960,9 +1998,13 @@ impl VellumGuiApp {
         } else {
             item_text.to_string()
         };
-        // The row grows with the configured icon size so bigger art gets
-        // real pixels instead of being squeezed into the text row height.
-        let icon_size = icon_size.clamp(16.0, 48.0);
+        // The icon fills the window's height, so a taller hand window means a
+        // bigger icon (drag to 2/4 "lines" for big art) and a short one a small
+        // icon. The configured hand_icon_size is the floor so a freshly-placed
+        // hand isn't tiny; available height (capped) sets the ceiling.
+        let floor = icon_size.clamp(16.0, 48.0);
+        let avail = ui.available_height().max(1.0);
+        let icon_size = avail.clamp(floor.min(avail), 512.0);
         let row_height = ui.spacing().interact_size.y.max(16.0).max(icon_size);
         let icon_width = icon_size;
         let icon_gap = 4.0;
@@ -3082,103 +3124,29 @@ impl VellumGuiApp {
     }
 
     pub(super) fn render_performance_content(app_core: &AppCore, ui: &mut egui::Ui) {
+        use crate::performance::{PerfFrontend, PerfMetric, PerfSeverity, PERF_METRICS};
+
         let cfg = app_core.perf_overlay_data(true);
         let stats = &app_core.perf_stats;
 
-        let mut rows: Vec<(&str, String)> = Vec::new();
-        if cfg.show_fps {
-            rows.push(("FPS", format!("{:.1}", stats.fps())));
-        }
-        if cfg.show_frame_times {
-            rows.push((
-                "Frame",
-                format!(
-                    "{:.2} ms ({:.2}-{:.2})",
-                    stats.avg_frame_time_ms(),
-                    stats.min_frame_time_ms(),
-                    stats.max_frame_time_ms()
-                ),
-            ));
-        }
-        if cfg.show_render_times {
-            rows.push(("Render", format!("{:.2} ms", stats.avg_render_time_ms())));
-        }
-        if cfg.show_ui_times {
-            rows.push(("UI", format!("{:.2} ms", stats.avg_ui_render_time_ms())));
-        }
-        if cfg.show_wrap_times {
-            rows.push(("Wrap", format!("{:.1} us", stats.avg_text_wrap_time_us())));
-        }
-        if cfg.show_net {
-            rows.push((
-                "Net",
-                format!(
-                    "{} B/s in, {} B/s out",
-                    stats.bytes_received_per_sec(),
-                    stats.bytes_sent_per_sec()
-                ),
-            ));
-        }
-        if cfg.show_parse {
-            rows.push((
-                "Parse",
-                format!(
-                    "{:.1} us, {} elem/s",
-                    stats.avg_parse_time_us(),
-                    stats.elements_per_sec()
-                ),
-            ));
-        }
-        if cfg.show_events {
-            rows.push((
-                "Events",
-                format!(
-                    "{:.1} us, queue {}",
-                    stats.avg_event_process_time_us(),
-                    stats.last_event_queue_depth()
-                ),
-            ));
-        }
-        if cfg.show_memory {
-            rows.push((
-                "Memory",
-                format!(
-                    "{:.1} MB rss, {:.1} MB est",
-                    stats.process_rss_mb(),
-                    stats.estimated_memory_mb()
-                ),
-            ));
-        }
-        if cfg.show_lines {
-            rows.push((
-                "Lines",
-                format!(
-                    "{} in {} windows",
-                    stats.total_lines_buffered(),
-                    stats.active_window_count()
-                ),
-            ));
-        }
-        if cfg.show_uptime {
-            rows.push(("Uptime", stats.uptime_formatted()));
-        }
-        if cfg.show_jitter {
-            rows.push(("Jitter", format!("{:.2} ms", stats.frame_jitter_ms())));
-        }
-        if cfg.show_frame_spikes {
-            rows.push(("Spikes", stats.frame_spike_count().to_string()));
-        }
-        if cfg.show_event_lag {
-            rows.push(("Event lag", format!("{:.1} ms", stats.event_lag_ms())));
-        }
-        if cfg.show_memory_delta {
-            rows.push(("Mem delta", format!("{:+.1} MB", stats.memory_delta_mb())));
-        }
+        // Rows derive from the shared metric table, filtered to what the
+        // GUI actually records — a metric this frontend can't measure
+        // never renders as a confident-looking zero.
+        let visible: Vec<&PerfMetric> = PERF_METRICS
+            .iter()
+            .filter(|metric| metric.in_scope(PerfFrontend::Gui))
+            .filter(|metric| metric.enabled_in(&cfg))
+            .collect();
 
-        if rows.is_empty() {
+        if visible.is_empty() {
             ui.weak("All performance metrics are disabled in settings.");
             return;
         }
+
+        // Keep the numbers live at ~1 Hz while the monitor is visible,
+        // without repainting fast enough to distort what it measures.
+        ui.ctx()
+            .request_repaint_after(std::time::Duration::from_secs(1));
 
         let max_height = ui.available_height().max(1.0);
         egui::ScrollArea::vertical()
@@ -3187,63 +3155,290 @@ impl VellumGuiApp {
             .min_scrolled_height(max_height)
             .max_height(max_height)
             .show(ui, |ui| {
-                for (name, value) in rows {
-                    ui.label(RichText::new(format!("{:<10} {}", name, value)).monospace());
+                for metric in visible {
+                    let severity = metric.severity.map(|f| f(stats));
+                    let value_color = match severity {
+                        Some(PerfSeverity::Crit) => egui::Color32::from_rgb(235, 90, 90),
+                        Some(PerfSeverity::Warn) => egui::Color32::from_rgb(230, 175, 60),
+                        _ => ui.visuals().text_color(),
+                    };
+                    let value = (metric.format)(stats);
+                    let mut lines = value.lines();
+                    let first = lines.next().unwrap_or("");
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new(format!("{:<8}", metric.label))
+                                .monospace()
+                                .color(ui.visuals().weak_text_color()),
+                        );
+                        ui.label(RichText::new(first).monospace().color(value_color));
+                        if cfg.sparklines {
+                            if let Some(spark) = metric.spark {
+                                Self::draw_perf_sparkline(ui, &spark(stats));
+                            }
+                        }
+                    });
+                    for line in lines {
+                        ui.label(
+                            RichText::new(format!("{:<8} {}", "", line))
+                                .monospace()
+                                .color(value_color),
+                        );
+                    }
                 }
             });
     }
 
+    /// Small trend polyline next to a performance row, normalized to the
+    /// series max.
+    fn draw_perf_sparkline(ui: &mut egui::Ui, values: &[f32]) {
+        if values.len() < 2 {
+            return;
+        }
+        let height = ui.text_style_height(&egui::TextStyle::Monospace).max(8.0);
+        let (rect, _) =
+            ui.allocate_exact_size(egui::vec2(64.0, height), egui::Sense::hover());
+        let max = values.iter().cloned().fold(0.0f32, f32::max);
+        if max <= 0.0 {
+            return;
+        }
+        let n = values.len();
+        let points: Vec<egui::Pos2> = values
+            .iter()
+            .enumerate()
+            .map(|(i, v)| {
+                let x = rect.left() + rect.width() * i as f32 / (n - 1) as f32;
+                let y = rect.bottom() - (v / max).clamp(0.0, 1.0) * (rect.height() - 1.0);
+                egui::pos2(x, y)
+            })
+            .collect();
+        ui.painter().add(egui::Shape::line(
+            points,
+            egui::Stroke::new(1.0, ui.visuals().weak_text_color()),
+        ));
+    }
+
     pub(super) fn render_dashboard_content(
+        app_core: &AppCore,
         ui: &mut egui::Ui,
         indicators: &[(String, u8)],
+        data: Option<&crate::config::DashboardWidgetData>,
         skin_art: Option<&crate::frontend::gui::skin::SkinWidgetArt>,
     ) {
-        // Matches the TUI dashboard default of hiding inactive indicators.
-        let active: Vec<&(String, u8)> = indicators
-            .iter()
-            .filter(|(_, value)| *value > 0)
-            .collect();
-        if active.is_empty() {
+        use crate::config::DashboardLayout;
+
+        // Config-driven, matching the TUI: layout, spacing, hide_inactive.
+        // Missing config = flow layout, default spacing, hide inactive.
+        let layout = data
+            .map(|d| DashboardLayout::from_str(&d.layout))
+            .unwrap_or(DashboardLayout::Flow);
+        let hide_inactive = data.map(|d| d.hide_inactive).unwrap_or(true);
+        let spacing_chars = data.map(|d| d.spacing).unwrap_or(1);
+
+        let now_server =
+            chrono::Utc::now().timestamp() + app_core.message_processor.server_time_offset;
+
+        // Candidate ids in config order (the authored set + arrangement),
+        // then any runtime-only ids the server sent that the config omits.
+        // A grouped/swapping cell (e.g. one POSTURE entry with per-posture
+        // states) lives in the config with an id the server never flips, so
+        // iterating the config — not just the runtime list — is what lets it
+        // appear at all.
+        let mut candidate_ids: Vec<String> = Vec::new();
+        if let Some(d) = data {
+            for def in &d.indicators {
+                candidate_ids.push(def.id.clone());
+            }
+        }
+        for (id, _) in indicators {
+            if !candidate_ids.iter().any(|c| c.eq_ignore_ascii_case(id)) {
+                candidate_ids.push(id.clone());
+            }
+        }
+
+        // Stack-group tag per id (config only): entries sharing a non-empty
+        // `stack` layer into one square. Case-insensitive lookup, empty = none.
+        let stack_of = |id: &str| -> String {
+            data.and_then(|d| {
+                d.indicators
+                    .iter()
+                    .find(|def| def.id.eq_ignore_ascii_case(id))
+                    .map(|def| def.stack.clone())
+            })
+            .unwrap_or_default()
+        };
+
+        // Resolve each candidate once. A layer is visible when hide_inactive is
+        // off, OR its runtime value > 0, OR (for a states-driven layer) any
+        // state currently matches — so a posture group shows whichever posture
+        // is active even though its own id never gets a runtime value.
+        struct Layer {
+            id: String,
+            value: u8,
+            resolved: crate::core::conditions::ResolvedStatusArt,
+            visible: bool,
+        }
+        // A cell is either one standalone layer or a stack group of layers,
+        // all painted into the same square. Cells keep first-seen order.
+        struct Cell {
+            stack: String,
+            layers: Vec<Layer>,
+        }
+        let mut cells: Vec<Cell> = Vec::new();
+        for id in candidate_ids {
+            let value = indicators
+                .iter()
+                .find(|(rid, _)| rid.eq_ignore_ascii_case(&id))
+                .map(|(_, v)| *v)
+                .unwrap_or(0);
+            let resolved = app_core
+                .indicator_template(&id)
+                .filter(|t| !t.states.is_empty() || t.icon_ref.is_some())
+                .map(|t| {
+                    crate::core::conditions::resolve_status(
+                        t,
+                        value > 0,
+                        &app_core.game_state,
+                        now_server,
+                        app_core.gameobj_data_cached(),
+                    )
+                })
+                .unwrap_or_default();
+            let visible = !hide_inactive || value > 0 || resolved.state_matched;
+            let stack = stack_of(&id);
+            let layer = Layer { id, value, resolved, visible };
+            // Merge into an existing stack cell of the same (non-empty) name;
+            // otherwise open a new cell.
+            match cells
+                .iter_mut()
+                .find(|c| !stack.is_empty() && c.stack.eq_ignore_ascii_case(&stack))
+            {
+                Some(cell) => cell.layers.push(layer),
+                None => cells.push(Cell { stack, layers: vec![layer] }),
+            }
+        }
+        // Drop cells with no visible layer.
+        cells.retain(|cell| cell.layers.iter().any(|l| l.visible));
+        if cells.is_empty() {
             ui.weak("No active status.");
             return;
         }
-        // Icons scale with the window's text size. Skin sprites win over
-        // the built-in pictograms; ids with neither keep the text label.
+
+        // Icons scale with the window's text size. Spacing (in "chars") maps
+        // to a fraction of the icon size so it reads similarly to the TUI.
         let icon_side = (ui.text_style_height(&egui::TextStyle::Body) * 1.5).clamp(14.0, 64.0);
-        ui.horizontal_wrapped(|ui| {
-            for (id, value) in active {
-                let color = match value {
+        let gap = (spacing_chars as f32) * icon_side * 0.35;
+
+        // Paint one visible layer into `rect`. Returns true if it drew art (so
+        // a stack can fall back to a text label only when nothing drew).
+        let paint_layer = |ui: &mut egui::Ui, rect: Rect, layer: &Layer| -> bool {
+            let id = layer.id.as_str();
+            let value = layer.value.max(if layer.resolved.state_matched { 1 } else { 0 });
+            let color = layer
+                .resolved
+                .color
+                .as_deref()
+                .and_then(parse_hex_color)
+                .unwrap_or_else(|| match value {
                     1 => Color32::from_rgb(0x55, 0xb8, 0x6c),
                     2 => Color32::from_rgb(0xff, 0x88, 0x00),
                     _ => Color32::from_rgb(0xcd, 0x4d, 0x4d),
-                };
-                let sprite = skin_art.and_then(|art| art.icon(id));
-                if sprite.is_some() || super::status_icons::supported(id) {
-                    let (rect, response) = ui
-                        .allocate_exact_size(Vec2::splat(icon_side), egui::Sense::hover());
-                    if let Some(sprite) = sprite {
-                        let dest = crate::frontend::gui::skin::icon_dest(&sprite, rect);
-                        crate::frontend::gui::skin::paint_icon(
-                            ui.painter(),
-                            dest,
-                            &sprite,
-                            Color32::WHITE,
-                        );
-                    } else {
-                        super::status_icons::paint(
-                            ui.painter(),
-                            rect,
-                            id,
-                            color,
-                            ui.visuals().window_fill(),
-                        );
-                    }
-                    response.on_hover_text(super::status_icons::display_name(id));
-                } else {
-                    ui.label(RichText::new(id).color(color).strong());
+                });
+            let sprite = match &layer.resolved.icon {
+                Some(icon) => skin_art.and_then(|art| art.resolve_icon_ref(icon, id)),
+                None => skin_art.and_then(|art| art.icon(id)),
+            };
+            if let Some(sprite) = sprite {
+                let dest = crate::frontend::gui::skin::icon_dest(&sprite, rect);
+                crate::frontend::gui::skin::paint_icon(ui.painter(), dest, &sprite, Color32::WHITE);
+                true
+            } else if super::status_icons::supported(id) {
+                super::status_icons::paint(ui.painter(), rect, id, color, ui.visuals().window_fill());
+                true
+            } else {
+                false
+            }
+        };
+
+        // One cell: allocate a square and paint every visible layer into it,
+        // overlaid (authored art positions each within the square). A single
+        // artless layer falls back to a text label, as before.
+        let paint_cell = |ui: &mut egui::Ui, cell: &Cell| {
+            let visible_layers: Vec<&Layer> = cell.layers.iter().filter(|l| l.visible).collect();
+            let (rect, response) =
+                ui.allocate_exact_size(Vec2::splat(icon_side), egui::Sense::hover());
+            let mut drew_any = false;
+            let mut names: Vec<String> = Vec::new();
+            for layer in &visible_layers {
+                if paint_layer(ui, rect, layer) {
+                    drew_any = true;
+                }
+                names.push(super::status_icons::display_name(&layer.id));
+            }
+            if !drew_any {
+                // No art resolved for any layer: text label of the first
+                // visible layer's id (single-status cells keep the old look).
+                if let Some(first) = visible_layers.first() {
+                    let value = first.value.max(if first.resolved.state_matched { 1 } else { 0 });
+                    let color = first
+                        .resolved
+                        .color
+                        .as_deref()
+                        .and_then(parse_hex_color)
+                        .unwrap_or_else(|| match value {
+                            1 => Color32::from_rgb(0x55, 0xb8, 0x6c),
+                            2 => Color32::from_rgb(0xff, 0x88, 0x00),
+                            _ => Color32::from_rgb(0xcd, 0x4d, 0x4d),
+                        });
+                    ui.painter().text(
+                        rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        &first.id,
+                        egui::FontId::proportional(icon_side * 0.5),
+                        color,
+                    );
                 }
             }
-        });
+            response.on_hover_text(names.join(", "));
+        };
+
+        ui.spacing_mut().item_spacing = Vec2::splat(gap);
+        match layout {
+            DashboardLayout::Horizontal => {
+                ui.horizontal(|ui| {
+                    for cell in &cells {
+                        paint_cell(ui, cell);
+                    }
+                });
+            }
+            DashboardLayout::Flow => {
+                ui.horizontal_wrapped(|ui| {
+                    for cell in &cells {
+                        paint_cell(ui, cell);
+                    }
+                });
+            }
+            DashboardLayout::Vertical => {
+                ui.vertical(|ui| {
+                    for cell in &cells {
+                        paint_cell(ui, cell);
+                    }
+                });
+            }
+            DashboardLayout::Grid { cols, .. } => {
+                let cols = cols.max(1);
+                egui::Grid::new(ui.id().with("dashboard_grid"))
+                    .spacing(Vec2::splat(gap))
+                    .show(ui, |ui| {
+                        for (index, cell) in cells.iter().enumerate() {
+                            paint_cell(ui, cell);
+                            if (index + 1) % cols == 0 {
+                                ui.end_row();
+                            }
+                        }
+                    });
+            }
+        }
     }
 
     /// Wrayth-style room window: one flowing block inside a single scroll
@@ -4659,12 +4854,31 @@ impl VellumGuiApp {
                     })
                     .copied()
                     .unwrap_or(settings.gray_inactive_icons);
+                // Resolve the status template's condition-driven art (state
+                // icon/color) from the cached templates; empty when the id has
+                // no template or no states (falls back to id-keyed art).
+                let resolved = app_core
+                    .indicator_template(&indicator.indicator_id)
+                    .filter(|t| !t.states.is_empty() || t.icon_ref.is_some())
+                    .map(|template| {
+                        let now_server = chrono::Utc::now().timestamp()
+                            + app_core.message_processor.server_time_offset;
+                        crate::core::conditions::resolve_status(
+                            template,
+                            indicator.active,
+                            &app_core.game_state,
+                            now_server,
+                            app_core.gameobj_data_cached(),
+                        )
+                    })
+                    .unwrap_or_default();
                 Self::render_indicator_content(
                     ui,
                     &tab.id.title,
                     indicator,
                     settings.skin_art.as_deref(),
                     gray,
+                    &resolved,
                 );
                 None
             }
@@ -4678,7 +4892,25 @@ impl VellumGuiApp {
                 None
             }
             WindowContent::Dashboard { indicators } => {
-                Self::render_dashboard_content(ui, indicators, settings.skin_art.as_deref());
+                // Read this dashboard's config (layout/spacing/hide_inactive +
+                // per-id icon/colors via the status templates), matching the
+                // TUI. Missing config falls back to flow + hide-inactive.
+                let data = app_core
+                    .layout
+                    .windows
+                    .iter()
+                    .find(|def| def.name() == window.name)
+                    .and_then(|def| match def {
+                        crate::config::WindowDef::Dashboard { data, .. } => Some(data.clone()),
+                        _ => None,
+                    });
+                Self::render_dashboard_content(
+                    app_core,
+                    ui,
+                    indicators,
+                    data.as_ref(),
+                    settings.skin_art.as_deref(),
+                );
                 None
             }
             WindowContent::GS4Experience => {

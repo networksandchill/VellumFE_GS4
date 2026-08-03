@@ -74,6 +74,10 @@ struct RoomPayload {
     exits: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     id: Option<String>,
+    /// Room description prose as styled lines (color + scenery links);
+    /// empty when unknown.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    description: Vec<crate::data::widget::StyledLine>,
 }
 
 #[derive(Serialize)]
@@ -113,12 +117,16 @@ struct SnapshotPayload {
     indicators: StatusInfo,
     rt: RtPayload,
     effects: Vec<ActiveEffectsContent>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    spellbook: Vec<crate::data::widget::StyledLine>,
     injuries: std::collections::HashMap<String, u8>,
     targets: Vec<RemoteTarget>,
     entities: RemoteRoomEntities,
     portals: Vec<String>,
     char_info: RemoteCharInfo,
     session: RemoteSessionInfo,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    webui_pages: Vec<crate::data::webui::WebUiPageDescriptor>,
     #[serde(skip_serializing_if = "Option::is_none")]
     map_scene: Option<Arc<crate::core::remote::RemoteMapScene>>,
     map_state: crate::core::remote::RemoteMapState,
@@ -159,6 +167,7 @@ pub fn snapshot(
             name: state.room_name.clone(),
             exits: state.exits.clone(),
             id: state.room_id.clone(),
+            description: state.room_description.clone(),
         },
         hands: HandsPayload {
             left: state.left_hand.clone(),
@@ -171,12 +180,14 @@ pub fn snapshot(
             server_time: state.server_time,
         },
         effects: state.effects.clone(),
+        spellbook: state.spellbook.clone(),
         injuries: state.injuries.clone(),
         targets: state.targets.clone(),
         entities: state.entities.clone(),
         portals: state.portals.clone(),
         char_info: state.char_info.clone(),
         session: state.session.clone(),
+        webui_pages: state.webui_pages.clone(),
         map_scene: state.map_scene.0.clone(),
         map_state: state.map_state.clone(),
         text: lines
@@ -204,13 +215,19 @@ pub fn delta(delta: &RemoteDelta, last_seq: u64) -> String {
             },
         ),
         RemoteDelta::Vitals(v) => encode("vitals", last_seq, v.clone()),
-        RemoteDelta::Room { name, exits, id } => encode(
+        RemoteDelta::Room {
+            name,
+            exits,
+            id,
+            description,
+        } => encode(
             "room",
             last_seq,
             RoomPayload {
                 name: name.clone(),
                 exits: exits.clone(),
                 id: id.clone(),
+                description: description.clone(),
             },
         ),
         RemoteDelta::Hands { left, right } => encode(
@@ -253,6 +270,7 @@ pub fn delta(delta: &RemoteDelta, last_seq: u64) -> String {
         RemoteDelta::Macros(m) => macros(m, last_seq),
         RemoteDelta::Wheels(w) => wheels(w, last_seq),
         RemoteDelta::Effects(effects) => encode("effects", last_seq, effects),
+        RemoteDelta::Spells(lines) => encode("spells", last_seq, lines),
         RemoteDelta::Session(info) => encode("session", last_seq, info),
         RemoteDelta::Injuries(injuries) => encode("injuries", last_seq, injuries),
         RemoteDelta::Targets(targets) => encode("targets", last_seq, targets),
@@ -306,6 +324,26 @@ pub fn delta(delta: &RemoteDelta, last_seq: u64) -> String {
                 "request_id": request_id,
                 "scope": scope,
                 "colors": colors,
+                "error": error,
+                "saved": saved,
+            }),
+        ),
+        RemoteDelta::TouchWheel {
+            request_id,
+            scope,
+            slices,
+            catalog,
+            error,
+            saved,
+            ..
+        } => encode(
+            "touch_wheel",
+            last_seq,
+            serde_json::json!({
+                "request_id": request_id,
+                "scope": scope,
+                "slices": slices,
+                "catalog": catalog,
                 "error": error,
                 "saved": saved,
             }),
@@ -389,6 +427,29 @@ pub fn delta(delta: &RemoteDelta, last_seq: u64) -> String {
                 "error": error,
                 "saved": saved,
             }),
+        ),
+        // Lich WebUI broadcasts. The phone renders only pages it subscribed
+        // to; it drops renders for pages it hasn't opened.
+        RemoteDelta::WebUiRender { page, seq, tree } => encode(
+            "webui_render",
+            last_seq,
+            serde_json::json!({ "page": page, "seq": seq, "tree": tree }),
+        ),
+        RemoteDelta::WebUiPages(pages) => {
+            encode("webui_pages", last_seq, serde_json::json!({ "pages": pages }))
+        }
+        RemoteDelta::WebUiPageClosed { page } => {
+            encode("webui_closed", last_seq, serde_json::json!({ "page": page }))
+        }
+        RemoteDelta::WebUiNotice { level, text } => encode(
+            "webui_notice",
+            last_seq,
+            serde_json::json!({ "level": level, "text": text }),
+        ),
+        RemoteDelta::WebUiConnected { connected } => encode(
+            "webui_connected",
+            last_seq,
+            serde_json::json!({ "connected": connected }),
         ),
     }
 }
@@ -562,6 +623,27 @@ pub enum ClientMessage {
         request_id: u64,
         scope: String,
         colors: serde_json::Value,
+    },
+    /// The touch wheel's slice list + the client-action vocabulary catalog,
+    /// for the phone's wheel editor.
+    TouchWheelGet { request_id: u64, scope: String },
+    /// Validate + write the touch wheel's slice list, then hot-reload and
+    /// re-broadcast the `wheels` message so it applies live.
+    TouchWheelPut {
+        request_id: u64,
+        scope: String,
+        slices: serde_json::Value,
+    },
+    /// The phone opened a Lich WebUI panel: subscribe to the page so renders
+    /// flow. Core forwards a `subscribe` to Lich.
+    WebUiSubscribe { page: String },
+    /// The phone closed a WebUI panel: unsubscribe.
+    WebUiUnsubscribe { page: String },
+    /// A phone WebUI interaction (button/input/row); core forwards it to Lich.
+    WebUiEvent {
+        page: String,
+        cid: String,
+        value: serde_json::Value,
     },
 }
 
@@ -858,6 +940,39 @@ pub fn parse_client_message(raw: &str) -> Option<ClientMessage> {
                 colors,
             })
         }
+        "touch_wheel_get" => {
+            let request_id = msg.d.get("request_id")?.as_u64()?;
+            let scope = msg.d.get("scope")?.as_str()?.to_string();
+            Some(ClientMessage::TouchWheelGet { request_id, scope })
+        }
+        "touch_wheel_put" => {
+            let request_id = msg.d.get("request_id")?.as_u64()?;
+            let scope = msg.d.get("scope")?.as_str()?.to_string();
+            let slices = msg.d.get("slices")?.clone();
+            if !slices.is_array() {
+                return None;
+            }
+            Some(ClientMessage::TouchWheelPut {
+                request_id,
+                scope,
+                slices,
+            })
+        }
+        "webui_subscribe" => {
+            let page = msg.d.get("page")?.as_str()?.to_string();
+            Some(ClientMessage::WebUiSubscribe { page })
+        }
+        "webui_unsubscribe" => {
+            let page = msg.d.get("page")?.as_str()?.to_string();
+            Some(ClientMessage::WebUiUnsubscribe { page })
+        }
+        "webui_event" => {
+            let page = msg.d.get("page")?.as_str()?.to_string();
+            let cid = msg.d.get("cid")?.as_str()?.to_string();
+            // value is component-specific; null is valid (button clicks).
+            let value = msg.d.get("value").cloned().unwrap_or(serde_json::Value::Null);
+            Some(ClientMessage::WebUiEvent { page, cid, value })
+        }
         "highlight_delete" => {
             let request_id = msg.d.get("request_id")?.as_u64()?;
             let scope = msg.d.get("scope")?.as_str()?.to_string();
@@ -1012,6 +1127,7 @@ mod tests {
             attempt: Some(3),
             error: None,
             session_control: true,
+            webui_available: false,
         };
         let json: serde_json::Value =
             serde_json::from_str(&delta(&RemoteDelta::Session(info.clone()), 5)).unwrap();
@@ -1071,6 +1187,7 @@ mod tests {
             default: vec![
                 RemoteWheelSlice {
                     label: "look".to_string(),
+                    client: None,
                     color: None,
                     span: None,
                     inner: Some(65),
@@ -1079,12 +1196,14 @@ mod tests {
                 },
                 RemoteWheelSlice {
                     label: "stance".to_string(),
+                    client: None,
                     color: Some("#2e8b57".to_string()),
                     span: Some(120.0),
                     inner: None,
                     back: false,
                     slices: vec![RemoteWheelSlice {
                         label: "defensive".to_string(),
+                        client: None,
                         color: None,
                         span: None,
                         inner: None,

@@ -490,6 +490,194 @@ async fn entities_flow_in_snapshot_and_deltas() {
 }
 
 #[tokio::test]
+async fn room_description_and_spellbook_flow_in_snapshot_and_deltas() {
+    use vellum_fe::core::remote::RemoteStateSnapshot;
+    let (mut sink, _event_rx, addr) = start_server(100).await;
+
+    // A styled line helper: room prose and the spellbook ride the wire as
+    // StyledLine (segments with color/links), the same shape as text deltas.
+    let styled = |text: &str| vellum_fe::data::widget::StyledLine {
+        segments: vec![vellum_fe::data::widget::TextSegment {
+            text: text.to_string(),
+            ..Default::default()
+        }],
+        stream: "room".to_string(),
+        timestamp: None,
+    };
+
+    // Initial state: a room with prose and two active spells.
+    let mut snap = RemoteStateSnapshot::default();
+    snap.room_name = Some("Town Square".to_string());
+    snap.room_description = vec![styled("A fountain bubbles at the center.")];
+    snap.spellbook = vec![
+        styled("Elemental Defense III (503)   00:14:59"),
+        styled("Mana Leech (516)   00:29:42"),
+    ];
+    sink.flush_state(snap.clone());
+
+    let (mut client, snapshot) = connect_and_sync(addr, 0).await;
+    // Room prose rides the room payload as styled lines; spellbook likewise.
+    // The phone renders these through the same renderLine path as text, so
+    // the wire carries `segments`, not bare strings.
+    assert_eq!(
+        snapshot["d"]["room"]["description"][0]["segments"][0]["text"],
+        "A fountain bubbles at the center."
+    );
+    assert_eq!(
+        snapshot["d"]["spellbook"][0]["segments"][0]["text"],
+        "Elemental Defense III (503)   00:14:59"
+    );
+    assert_eq!(snapshot["d"]["spellbook"].as_array().unwrap().len(), 2);
+
+    // Walking to a new room changes both: a `room` delta carries the new
+    // prose, and a `spells` delta carries the updated list.
+    snap.room_name = Some("Dark Alcove".to_string());
+    snap.room_description = vec![styled("Shadows pool in the corners.")];
+    snap.spellbook = vec![styled("Elemental Defense III (503)   00:13:12")];
+    sink.flush_state(snap);
+
+    // Deltas arrive in flush order (room before spells).
+    let room = read_json_timeout(&mut client).await;
+    assert_eq!(room["t"], "room");
+    assert_eq!(room["d"]["name"], "Dark Alcove");
+    assert_eq!(
+        room["d"]["description"][0]["segments"][0]["text"],
+        "Shadows pool in the corners."
+    );
+
+    let spells = read_json_timeout(&mut client).await;
+    assert_eq!(spells["t"], "spells");
+    assert_eq!(spells["d"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        spells["d"][0]["segments"][0]["text"],
+        "Elemental Defense III (503)   00:13:12"
+    );
+}
+
+#[tokio::test]
+async fn webui_subscribe_and_event_arrive_as_remote_events() {
+    let (_sink, mut event_rx, addr) = start_server(100).await;
+    let (mut client, _) = connect_and_sync(addr, 0).await;
+
+    // Opening a WebUI panel subscribes to its page.
+    client
+        .send_text(r#"{"t":"webui_subscribe","d":{"page":"creaturebar/main"}}"#)
+        .await;
+    let event = tokio::time::timeout(std::time::Duration::from_secs(5), event_rx.recv())
+        .await
+        .expect("timed out")
+        .expect("channel open");
+    let RemoteEvent::WebUiSubscribe { page } = event else {
+        panic!("expected WebUiSubscribe, got {event:?}");
+    };
+    assert_eq!(page, "creaturebar/main");
+
+    // A button tap forwards as a WebUiEvent carrying page/cid/value.
+    client
+        .send_text(
+            r#"{"t":"webui_event","d":{"page":"creaturebar/main","cid":"button:2","value":null}}"#,
+        )
+        .await;
+    let event = tokio::time::timeout(std::time::Duration::from_secs(5), event_rx.recv())
+        .await
+        .expect("timed out")
+        .expect("channel open");
+    let RemoteEvent::WebUiEvent { page, cid, value } = event else {
+        panic!("expected WebUiEvent, got {event:?}");
+    };
+    assert_eq!(page, "creaturebar/main");
+    assert_eq!(cid, "button:2");
+    assert_eq!(value, serde_json::Value::Null);
+}
+
+#[tokio::test]
+async fn webui_render_broadcasts_the_serialized_tree() {
+    use vellum_fe::data::webui::WebUiNode;
+    let (mut sink, _event_rx, addr) = start_server(100).await;
+    let (mut client, _) = connect_and_sync(addr, 0).await;
+
+    // A page render broadcasts the serialized component tree to phone clients.
+    let tree: WebUiNode = serde_json::from_str(
+        r#"{ "t": "page", "title": "Creatures", "children": [
+            { "t": "button", "cid": "button:2", "label": "Attack", "variant": "danger" }
+        ] }"#,
+    )
+    .unwrap();
+    sink.push_webui_render("creaturebar/main".to_string(), 7, tree);
+
+    let delta = read_json_timeout(&mut client).await;
+    assert_eq!(delta["t"], "webui_render");
+    assert_eq!(delta["d"]["page"], "creaturebar/main");
+    assert_eq!(delta["d"]["seq"], 7);
+    assert_eq!(delta["d"]["tree"]["t"], "page");
+    assert_eq!(delta["d"]["tree"]["children"][0]["label"], "Attack");
+    assert_eq!(delta["d"]["tree"]["children"][0]["variant"], "danger");
+    // Lean wire: absent optional fields aren't serialized as nulls.
+    assert!(delta["d"]["tree"].get("markers").is_none());
+}
+
+#[tokio::test]
+async fn touch_wheel_get_and_put_arrive_as_addressed_events() {
+    let (_sink, mut event_rx, addr) = start_server(100).await;
+    let (mut editor, _) = connect_and_sync(addr, 0).await;
+
+    // A get carries the scope through as a TouchWheelGet event.
+    editor
+        .send_text(r#"{"t":"touch_wheel_get","d":{"request_id":3,"scope":"profile"}}"#)
+        .await;
+    let event = tokio::time::timeout(std::time::Duration::from_secs(5), event_rx.recv())
+        .await
+        .expect("timed out waiting for touch_wheel_get")
+        .expect("event channel open");
+    let RemoteEvent::TouchWheelGet {
+        request_id, scope, ..
+    } = event
+    else {
+        panic!("expected TouchWheelGet event, got {event:?}");
+    };
+    assert_eq!(request_id, 3);
+    assert_eq!(scope, "profile");
+
+    // A put carries the slice array through as a TouchWheelPut event.
+    editor
+        .send_text(
+            r#"{"t":"touch_wheel_put","d":{"request_id":4,"scope":"profile","slices":[{"label":"Room","client":"open:room"},{"label":"Look","command":"look"}]}}"#,
+        )
+        .await;
+    let event = tokio::time::timeout(std::time::Duration::from_secs(5), event_rx.recv())
+        .await
+        .expect("timed out waiting for touch_wheel_put")
+        .expect("event channel open");
+    let RemoteEvent::TouchWheelPut {
+        request_id,
+        scope,
+        slices,
+        ..
+    } = event
+    else {
+        panic!("expected TouchWheelPut event, got {event:?}");
+    };
+    assert_eq!(request_id, 4);
+    assert_eq!(scope, "profile");
+    let arr = slices.as_array().expect("slices is an array");
+    assert_eq!(arr.len(), 2);
+    assert_eq!(arr[0]["label"], "Room");
+    assert_eq!(arr[0]["client"], "open:room");
+    assert_eq!(arr[1]["command"], "look");
+
+    // A malformed put (slices not an array) is rejected client-side and
+    // produces no event.
+    editor
+        .send_text(r#"{"t":"touch_wheel_put","d":{"request_id":5,"scope":"profile","slices":"nope"}}"#)
+        .await;
+    let timed_out =
+        tokio::time::timeout(std::time::Duration::from_millis(300), event_rx.recv())
+            .await
+            .is_err();
+    assert!(timed_out, "a non-array touch_wheel_put must not emit an event");
+}
+
+#[tokio::test]
 async fn wheels_flow_definitions_out_picks_in() {
     let (mut sink, mut event_rx, addr) = start_server(100).await;
 

@@ -160,6 +160,10 @@ impl Supervisor {
             attempt: (self.reconnect_attempt > 0).then_some(self.reconnect_attempt),
             error: None,
             session_control: true,
+            // Set from the live AppCore flag by flush_state's session overlay;
+            // this constructor doesn't know the connection mode, so default
+            // false and let the sink overlay the real value.
+            webui_available: false,
         }
     }
 }
@@ -357,6 +361,11 @@ pub async fn async_run(
         phase_started: None,
         first_text_seen: false,
     };
+
+    // Lich WebUI is reachable only on a Lich-attached session (a direct
+    // eAccess connection bypasses Lich). Advertise it to phone clients so
+    // they show the WebUI affordance only when it will work.
+    app_core.set_webui_available(!is_direct);
 
     // Auto-connect only when the CLI asked for a session (--direct / --key);
     // otherwise idle on the login screen.
@@ -668,6 +677,20 @@ pub async fn async_run(
             }
         }
 
+        // Lich WebUI tick: drain the bridge (fans renders to phone clients),
+        // send any queued `;ui handshake` to the game, and start the bridge
+        // once its reply arrives. Only meaningful on a Lich-attached session
+        // (webui_available); a direct eAccess connection has no Lich.
+        app_core.pump_webui();
+        for raw in app_core.take_webui_pending_raw() {
+            if let Some(conn) = supervisor.connection.as_ref() {
+                let _ = conn.command_tx.send(format!("{raw}\n"));
+            }
+        }
+        if let Some(handshake) = app_core.take_webui_handshake() {
+            app_core.start_webui(&tokio::runtime::Handle::current(), &handshake);
+        }
+
         // Apply session-control requests from web clients.
         for request in session_requests {
             match request {
@@ -779,6 +802,10 @@ fn dispatch_command(
                     "This pack also carries a GUI layout — run the import in the GUI to install it.",
                 );
             }
+            false
+        }
+        Ok(crate::data::CommandOutcome::Ui(crate::data::UiAction::PerformanceDump)) => {
+            app_core.write_perf_dump(crate::performance::PerfFrontend::Headless, None);
             false
         }
         Ok(crate::data::CommandOutcome::Ui(_)) => {
@@ -1032,6 +1059,41 @@ fn handle_remote_event(
             app_core.handle_remote_colors_put(client_id, request_id, scope, colors);
             true
         }
+        RemoteEvent::TouchWheelGet {
+            client_id,
+            request_id,
+            scope,
+        } => {
+            app_core.handle_remote_touch_wheel_get(client_id, request_id, scope);
+            true
+        }
+        RemoteEvent::TouchWheelPut {
+            client_id,
+            request_id,
+            scope,
+            slices,
+        } => {
+            app_core.handle_remote_touch_wheel_put(client_id, request_id, scope, slices);
+            true
+        }
+        RemoteEvent::WebUiSubscribe { page } => {
+            // First subscription starts the bridge: trigger the handshake if
+            // it isn't up yet (the raw `;ui handshake` drains next tick, the
+            // reply starts the socket, then the subscribe replays via Hello).
+            if !app_core.webui_is_active() {
+                app_core.request_webui_handshake();
+            }
+            app_core.webui_subscribe(&page);
+            true
+        }
+        RemoteEvent::WebUiUnsubscribe { page } => {
+            app_core.webui_unsubscribe(&page);
+            true
+        }
+        RemoteEvent::WebUiEvent { page, cid, value } => {
+            app_core.webui_send_event(page, cid, value);
+            true
+        }
         RemoteEvent::MapLocations {
             client_id,
             request_id,
@@ -1066,11 +1128,10 @@ fn handle_server_message(app_core: &mut AppCore, msg: ServerMessage) -> bool {
             app_core
                 .perf_stats
                 .record_bytes_received((line.len() + 1) as u64);
-            let parse_start = Instant::now();
+            // Parse timing is recorded inside process_server_data.
             if let Err(e) = app_core.process_server_data(&line) {
                 tracing::error!("Error processing server data: {}", e);
             }
-            app_core.perf_stats.record_parse(parse_start.elapsed());
 
             // Content-driven sizing still runs: it feeds stream routing
             // decisions, not just TUI pane geometry.
