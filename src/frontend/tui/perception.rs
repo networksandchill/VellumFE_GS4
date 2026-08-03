@@ -17,6 +17,8 @@ pub struct PerceptionWindow {
     title: String,
     show_border: bool,
     border_color: Option<Color>,
+    /// Title color override; None paints the title in the border color.
+    title_color: Option<String>,
     text_color: Option<Color>,
     background_color: Option<Color>,
     entries: Vec<PerceptionEntry>,
@@ -36,6 +38,7 @@ impl PerceptionWindow {
             title,
             show_border: true,
             border_color: None,
+            title_color: None,
             text_color: None,
             background_color: None,
             entries: Vec::new(),
@@ -100,6 +103,11 @@ impl PerceptionWindow {
     }
 
     /// Set the border color
+    /// Set the title color; None makes the title follow the border color.
+    pub fn set_title_color(&mut self, title_color: Option<String>) {
+        self.title_color = title_color;
+    }
+
     pub fn set_border_color(&mut self, color: Option<String>) {
         self.border_color = color.and_then(|c| super::colors::parse_color_to_ratatui(&c));
     }
@@ -123,6 +131,13 @@ impl PerceptionWindow {
         let mut block = Block::default();
         if self.show_border {
             block = block.borders(Borders::ALL).title(self.title.as_str());
+            if let Some(color) = self
+                .title_color
+                .as_deref()
+                .and_then(super::colors::parse_color_to_ratatui)
+            {
+                block = block.title_style(Style::default().fg(color));
+            }
             if let Some(color) = self.border_color {
                 block = block.border_style(Style::default().fg(color));
             }

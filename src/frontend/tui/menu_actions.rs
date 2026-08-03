@@ -125,10 +125,14 @@ pub fn handle_ui_action(
                         &app_core.layout,
                     ),
                 );
+                // The menu that launched this is done: leaving it live paints
+                // a stale popup over the editor that no longer takes clicks.
+                close_all_menus(&mut app_core.ui_state);
                 app_core.ui_state.input_mode = InputMode::WindowEditor;
             } else {
                 tracing::warn!("No template found for widget type: {}", widget_type);
             }
+            app_core.needs_render = true;
         }
         UiAction::EditWindow(Some(window_name)) => {
             // Edit an existing window
@@ -149,10 +153,14 @@ pub fn handle_ui_action(
                         &app_core.layout,
                     ),
                 );
+                // Same here: the window title-bar right-click menu's "Edit
+                // Window..." must not outlive the click that used it.
+                close_all_menus(&mut app_core.ui_state);
                 app_core.ui_state.input_mode = InputMode::WindowEditor;
             } else {
                 tracing::warn!("Window not found for editing: {}", window_name);
             }
+            app_core.needs_render = true;
         }
         UiAction::EditWindow(None) => {
             let parent_pos = app_core
@@ -640,3 +648,50 @@ fn open_streams_menu(app_core: &mut AppCore, select: Option<&str>) {
 // layout sync) live on AppCore (core/app_core/streams.rs), shared with
 // the GUI's Streams & Custom Windows panel; only the menu plumbing above
 // is TUI-specific.
+
+#[cfg(test)]
+mod tests {
+    /// A menu pick that opens a modal (editor/browser/form) has to take the
+    /// menu down with it — otherwise the popup stays painted over the modal
+    /// while clicks route elsewhere, and the only way out is to reopen the
+    /// menu and click off it. Two arms shipped that way (CreateWindow and
+    /// EditWindow), so this reads the dispatcher back and holds the line for
+    /// every arm added later.
+    #[test]
+    fn modal_opening_arms_close_their_menus() {
+        let src = include_str!("menu_actions.rs");
+        let arm_starts: Vec<usize> = src
+            .match_indices("\n        UiAction::")
+            .map(|(i, _)| i + 1)
+            .collect();
+
+        let mut offenders = Vec::new();
+        for (idx, &start) in arm_starts.iter().enumerate() {
+            let end = arm_starts.get(idx + 1).copied().unwrap_or(src.len());
+            let body = &src[start..end];
+            let head = body.lines().next().unwrap_or("").trim();
+
+            let Some(mode_at) = body.find("input_mode = InputMode::") else {
+                continue;
+            };
+            let mode: String = body[mode_at + "input_mode = InputMode::".len()..]
+                .chars()
+                .take_while(|c| c.is_alphanumeric())
+                .collect();
+            // Menu/Normal are the non-modal outcomes: the menu either stays
+            // up by design or the arm already handed control back.
+            if mode == "Menu" || mode == "Normal" {
+                continue;
+            }
+            if !body.contains("close_all_menus") && !body.contains("popup_menu = None") {
+                offenders.push(format!("{head} -> InputMode::{mode}"));
+            }
+        }
+
+        assert!(
+            offenders.is_empty(),
+            "these menu actions open a modal without closing the menu behind it:\n  {}",
+            offenders.join("\n  ")
+        );
+    }
+}

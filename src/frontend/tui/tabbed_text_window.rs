@@ -49,6 +49,8 @@ pub struct TabbedTextWindow {
     show_border: bool,
     border_style: Option<String>,
     border_color: Option<String>,
+    /// Title color override; None paints the title in the border color.
+    title_color: Option<String>,
     border_sides: crate::config::BorderSides,
     title: String,
     transparent_background: bool,
@@ -77,6 +79,7 @@ impl TabbedTextWindow {
             show_border: true,
             border_style: Some("single".to_string()),
             border_color: Some("#808080".to_string()),
+            title_color: None,
             border_sides: crate::config::BorderSides::default(),
             title: title.to_string(),
             transparent_background: false,
@@ -580,6 +583,11 @@ impl TabbedTextWindow {
             .and_then(|tab| tab.window.search_info())
     }
 
+    /// Set the title color; None makes the title follow the border color.
+    pub fn set_title_color(&mut self, title_color: Option<String>) {
+        self.title_color = title_color;
+    }
+
     pub fn set_border_config(&mut self, show: bool, style: Option<String>, color: Option<String>) {
         self.show_border = show;
         self.border_style = style;
@@ -802,6 +810,7 @@ impl TabbedTextWindow {
             border_style,
             &self.title,
             self.title_position,
+            self.title_color.as_deref().map(Self::parse_color),
         );
 
         // Split inner area for tab bar and content (unless the tab bar was

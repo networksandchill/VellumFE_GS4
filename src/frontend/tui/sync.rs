@@ -68,6 +68,7 @@ impl TuiFrontend {
                             Some(def.base().border_style.clone()),
                             colors.border.clone(),
                         );
+                        tw.set_title_color(colors.title.clone());
                         tw.set_border_sides(def.base().border_sides.clone());
                         tw.set_background_color(colors.background.clone());
                         tw.set_text_color(colors.text.clone());
@@ -110,6 +111,7 @@ impl TuiFrontend {
                             Some(def.base().border_style.clone()),
                             colors.border.clone(),
                         );
+                        text_window.set_title_color(colors.title.clone());
                         text_window.set_border_sides(def.base().border_sides.clone());
                         text_window.set_background_color(colors.background.clone());
                         text_window.set_text_color(colors.text.clone());
@@ -331,6 +333,16 @@ impl TuiFrontend {
                     Some(base.border_style.clone()),
                     border_color,
                 );
+                cmd_input.set_title_color(
+                    normalize_color(&base.title_color).or_else(|| {
+                        app_core
+                            .config
+                            .colors
+                            .ui
+                            .user_title_color()
+                            .map(|c| c.to_string())
+                    }),
+                );
                 cmd_input.set_border_sides(base.border_sides.clone());
                 cmd_input.set_show_title(base.show_title);
                 let background_color = if base.transparent_background {
@@ -414,6 +426,7 @@ impl TuiFrontend {
                     if let Some(def) = window_def {
                         let colors = resolve_window_colors(def.base(), &app_core.config.colors.ui, theme);
                         inv_window.set_border_config(def.base().show_border, colors.border.clone());
+                        inv_window.set_title_color(colors.title.clone());
                         inv_window.set_transparent_background(def.base().transparent_background);
                         inv_window.set_background_color(colors.background.clone());
                         inv_window.set_text_color(colors.text.clone());
@@ -498,6 +511,7 @@ impl TuiFrontend {
                             Some(def.base().border_style.clone()),
                             colors.border.clone(),
                         );
+                        spells_window.set_title_color(colors.title.clone());
                         spells_window.set_transparent_background(def.base().transparent_background);
                         spells_window.set_background_color(colors.background.clone());
                         spells_window.set_text_color(colors.text.clone());
@@ -611,6 +625,7 @@ impl TuiFrontend {
                             colors.border.clone(),
                             def.base().border_sides.clone(),
                         );
+                        progress_bar.set_title_color(colors.title.clone());
 
                         // Update title visibility
                         if def.base().show_title {
@@ -728,6 +743,7 @@ impl TuiFrontend {
                             Some(def.base().border_style.clone()),
                             colors.border.clone(),
                         );
+                        countdown_widget.set_title_color(colors.title.clone());
                         countdown_widget.set_border_sides(def.base().border_sides.clone());
                         let title_text = if def.base().show_title {
                             def.base().title.clone().unwrap_or_default()
@@ -836,6 +852,7 @@ impl TuiFrontend {
                             Some(def.base().border_style.clone()),
                             colors.border.clone(),
                         );
+                        widget.set_title_color(colors.title.clone());
                         widget.set_border_sides(def.base().border_sides.clone());
                         let title_text = if def.base().show_title {
                             def.base().title.clone().unwrap_or_default()
@@ -928,6 +945,7 @@ impl TuiFrontend {
                         Some(def.base().border_style.clone()),
                         colors.border.clone(),
                     );
+                    quickbar_widget.set_title_color(colors.title.clone());
                     quickbar_widget.set_border_sides(def.base().border_sides.clone());
                     quickbar_widget.set_background_color(colors.background.clone());
                     quickbar_widget.set_text_color(colors.text.clone());
@@ -1002,6 +1020,7 @@ impl TuiFrontend {
                         Some(def.base().border_style.clone()),
                         colors.border.clone(),
                     );
+                    bar_widget.set_title_color(colors.title.clone());
                     bar_widget.set_border_sides(def.base().border_sides.clone());
                     bar_widget.set_background_color(colors.background.clone());
                     bar_widget.set_text_color(colors.text.clone());
@@ -1055,6 +1074,7 @@ impl TuiFrontend {
                             Some(window_def.base().border_style.clone()),
                             colors.border.clone(),
                         );
+                        indicator_widget.set_title_color(colors.title.clone());
                         indicator_widget.set_border_sides(window_def.base().border_sides.clone());
                         let title_text = if let crate::config::WindowDef::Indicator { data, .. } = window_def
                         {
@@ -1169,9 +1189,11 @@ impl TuiFrontend {
                             Some(window_def.base().border_style.clone()),
                             colors.border.clone(),
                         );
+                        widget.set_title_color(colors.title.clone());
                         widget.set_border_sides(window_def.base().border_sides.clone());
                         widget.set_background_color(colors.background.clone());
                         widget.set_border_color(colors.border.clone());
+                        widget.set_title_color(colors.title.clone());
 
                         // Use monsterbold preset as default text color for creatures,
                         // unless user explicitly set text_color in window config.
@@ -1305,6 +1327,7 @@ impl TuiFrontend {
                             window_def.base().show_border,
                             colors.border.clone(),
                         );
+                        widget.set_title_color(colors.title.clone());
                         widget.set_background_color(colors.background.clone());
                         widget.set_text_color(colors.text.clone());
                         widget.set_transparent_background(window_def.base().transparent_background);
@@ -1375,6 +1398,7 @@ impl TuiFrontend {
                             Some(window_def.base().border_style.clone()),
                             colors.border.clone(),
                         );
+                        widget.set_title_color(colors.title.clone());
                         widget.set_border_sides(window_def.base().border_sides.clone());
                         widget.set_background_color(colors.background.clone());
                         widget.set_text_color(colors.text.clone());
@@ -1436,6 +1460,7 @@ impl TuiFrontend {
                             Some(window_def.base().border_style.clone()),
                             colors.border.clone(),
                         );
+                        widget.set_title_color(colors.title.clone());
                         widget.set_border_sides(window_def.base().border_sides.clone());
                         widget.set_background_color(colors.background.clone());
                         widget.set_text_color(colors.text.clone());
@@ -1486,6 +1511,7 @@ impl TuiFrontend {
                             Some(window_def.base().border_style.clone()),
                             colors.border.clone(),
                         );
+                        widget.set_title_color(colors.title.clone());
                         widget.set_border_sides(window_def.base().border_sides.clone());
                         widget.set_transparent_background(window_def.base().transparent_background);
                         widget.set_background_color(colors.background.clone());
@@ -1607,6 +1633,7 @@ impl TuiFrontend {
                                 Some(def.base().border_style.clone()),
                                 colors.border.clone(),
                             );
+                            widget.set_title_color(colors.title.clone());
                             widget.set_border_sides(def.base().border_sides.clone());
                             widget.set_transparent_background(def.base().transparent_background);
                             widget.set_background_color(colors.background.clone());
@@ -1767,6 +1794,7 @@ impl TuiFrontend {
                             Some(window_def.base().border_style.clone()),
                             colors.border.clone(),
                         );
+                        widget.set_title_color(colors.title.clone());
                         widget.set_border_sides(window_def.base().border_sides.clone());
                         widget.set_transparent_background(window_def.base().transparent_background);
                         widget.set_background_color(colors.background.clone());
@@ -1839,6 +1867,7 @@ impl TuiFrontend {
                             Some(window_def.base().border_style.clone()),
                             colors.border.clone(),
                         );
+                        widget.set_title_color(colors.title.clone());
                         widget.set_border_sides(window_def.base().border_sides.clone());
                         widget.set_transparent_background(window_def.base().transparent_background);
                         widget.set_background_color(colors.background.clone());
@@ -2011,6 +2040,7 @@ impl TuiFrontend {
                             Some(window_def.base().border_style.clone()),
                             colors.border.clone(),
                         );
+                        hand_widget.set_title_color(colors.title.clone());
                         hand_widget.set_border_sides(window_def.base().border_sides.clone());
                         let title_text = if window_def.base().show_title {
                             window_def.base().title.clone().unwrap_or_default()
@@ -2129,6 +2159,22 @@ impl TuiFrontend {
                     Some(window_def.base().border_style.clone()),
                     colors.border.clone(),
                 );
+                // An explicit title color wins; otherwise the title keeps
+                // matching the frame (with the roomName preset filling in for
+                // a window that has no border color of its own).
+                let room_title_fg = colors.title.clone().or_else(|| {
+                    window_def
+                        .base()
+                        .border_color
+                        .clone()
+                        .map(|c| app_core.config.resolve_palette_color(&c))
+                        .or_else(|| {
+                            app_core.config.colors.presets.get("roomName").and_then(|p| {
+                                p.fg.as_ref().map(|c| app_core.config.resolve_palette_color(c))
+                            })
+                        })
+                });
+                room_window.set_title_colors(room_title_fg, None);
                 room_window.set_border_sides(window_def.base().border_sides.clone());
                 room_window.set_background_color(colors.background.clone());
                 room_window.set_text_color(colors.text.clone());
@@ -2334,6 +2380,7 @@ impl TuiFrontend {
                         let colors = resolve_window_colors(def.base(), &app_core.config.colors.ui, theme);
                         perception_window.set_show_border(def.base().show_border);
                         perception_window.set_border_color(colors.border.clone());
+                        perception_window.set_title_color(colors.title.clone());
                         perception_window.set_background_color(colors.background.clone());
                         perception_window.set_text_color(colors.text.clone());
 
@@ -2452,6 +2499,7 @@ impl TuiFrontend {
                     if let Some(border_color) = &colors.border {
                         if let Ok(c) = parse_hex_color(border_color) {
                             experience_widget.set_border_color(c);
+                            experience_widget.set_title_color(colors.title.clone());
                         }
                     }
                     if let Some(text_color) = &colors.text {
@@ -2521,6 +2569,7 @@ impl TuiFrontend {
                     if let Some(border_color) = &colors.border {
                         if let Ok(c) = parse_hex_color(border_color) {
                             gs4_exp_widget.set_border_color(c);
+                            gs4_exp_widget.set_title_color(colors.title.clone());
                         }
                     }
                     if let Some(text_color) = &colors.text {
@@ -2626,6 +2675,7 @@ impl TuiFrontend {
                     if let Some(border_color) = &colors.border {
                         if let Ok(c) = parse_hex_color(border_color) {
                             enc_widget.set_border_color(c);
+                            enc_widget.set_title_color(colors.title.clone());
                         }
                     }
                     if let Some(text_color) = &colors.text {
@@ -2728,6 +2778,7 @@ impl TuiFrontend {
                     if let Some(border_color) = &colors.border {
                         if let Ok(c) = parse_hex_color(border_color) {
                             mv_widget.set_border_color(c);
+                            mv_widget.set_title_color(colors.title.clone());
                         }
                     }
                     if let Some(text_color) = &colors.text {
@@ -2820,6 +2871,7 @@ impl TuiFrontend {
                     if let Some(border_color) = &colors.border {
                         if let Ok(c) = parse_hex_color(border_color) {
                             betrayer_widget.set_border_color(c);
+                            betrayer_widget.set_title_color(colors.title.clone());
                         }
                     }
                     if let Some(text_color) = &colors.text {

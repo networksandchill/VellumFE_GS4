@@ -121,6 +121,8 @@ pub struct UiColors {
     pub border_color: String, // Default border color for all widgets
     #[serde(default = "default_focused_border_color")]
     pub focused_border_color: String, // Border color for focused/active windows
+    #[serde(default = "default_title_color_default")]
+    pub title_color: String, // Default title color for all widgets ("-" = follow the border)
     #[serde(default = "default_text_color_default")]
     pub text_color: String, // Default text color for all widgets
     #[serde(default = "default_background_color")]
@@ -156,6 +158,13 @@ impl UiColors {
         )
     }
 
+    /// The user's chosen title color, or None to follow the border color.
+    /// Unlike the others there is no theme fallback: "-" means "paint the
+    /// title in whatever the border is", which is the historical look.
+    pub fn user_title_color(&self) -> Option<&str> {
+        Self::user_value(&self.title_color, &super::default_title_color_default())
+    }
+
     pub fn user_text_color(&self) -> Option<&str> {
         Self::user_value(&self.text_color, &super::default_text_color_default())
     }
@@ -189,6 +198,7 @@ impl Default for UiColors {
             system_message_color: default_system_message_color(),
             border_color: default_border_color_default(),
             focused_border_color: default_focused_border_color(),
+            title_color: default_title_color_default(),
             text_color: default_text_color_default(),
             background_color: default_background_color(),
             selection_bg_color: default_selection_bg_color(),

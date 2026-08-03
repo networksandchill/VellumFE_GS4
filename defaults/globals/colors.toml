@@ -80,6 +80,10 @@ command_echo_color = "#ffffff"
 system_message_color = "#8fbc8f"
 border_color = "#00ffff"
 focused_border_color = "#ffff00"
+# Window title text. "-" keeps titles painted in each window's border color
+# (the historical look); set a color here to break every title away from the
+# frame, or override one window at a time with title_color in layout.toml.
+title_color = "-"
 text_color = "#ffffff"
 background_color = "#000000"
 selection_bg_color = "#4a4a4a"

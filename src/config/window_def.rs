@@ -722,6 +722,7 @@ mod blank_tests {
             border_style: "single".to_string(),
             border_sides: BorderSides::default(),
             border_color: None,
+            title_color: None,
             show_title: true,
             title: Some("test".to_string()),
             title_position: "top-left".to_string(),

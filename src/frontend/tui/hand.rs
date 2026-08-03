@@ -23,6 +23,8 @@ pub struct Hand {
     show_border: bool,
     border_style: Option<String>,
     border_color: Option<Color>,
+    /// Title color override; None paints the title in the border color.
+    title_color: Option<String>,
     border_sides: crate::config::BorderSides,
     text_color: Option<Color>,
     content_highlight_color: Option<Color>,
@@ -56,6 +58,7 @@ impl Hand {
             show_border: false,
             border_style: None,
             border_color: None,
+            title_color: None,
             border_sides: crate::config::BorderSides::default(),
             text_color: None, // Will use global default
             content_highlight_color: None,
@@ -68,6 +71,11 @@ impl Hand {
 
     pub fn set_highlights(&mut self, highlights: Vec<crate::config::HighlightPattern>) {
         self.highlight_engine.update_if_changed(highlights);
+    }
+
+    /// Set the title color; None makes the title follow the border color.
+    pub fn set_title_color(&mut self, title_color: Option<String>) {
+        self.title_color = title_color;
     }
 
     pub fn set_border_config(
@@ -211,6 +219,13 @@ impl Hand {
             // Only set title if label is non-empty (avoids empty title affecting layout)
             if !self.label.is_empty() {
                 block = block.title(self.label.as_str());
+                if let Some(color) = self
+                    .title_color
+                    .as_deref()
+                    .and_then(super::colors::parse_color_to_ratatui)
+                {
+                    block = block.title_style(Style::default().fg(color));
+                }
             }
 
             inner_area = block.inner(area);

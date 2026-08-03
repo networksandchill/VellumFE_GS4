@@ -1228,6 +1228,7 @@ border_color = "#807f80"
                 border_style: "single".to_string(),
                 border_sides: BorderSides::default(),
                 border_color: None,
+                title_color: None,
                 show_title: false,
                 title: None,
                 background_color: None,

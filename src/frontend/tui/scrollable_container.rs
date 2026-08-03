@@ -35,6 +35,8 @@ pub struct ScrollableContainer {
     show_border: bool,
     border_style: Option<String>,
     border_color: Option<Color>,
+    /// Title color override; None paints the title in the border color.
+    title_color: Option<String>,
     border_sides: crate::config::BorderSides, // Which borders to show
     bar_color: String,
     transparent_background: bool,
@@ -60,6 +62,7 @@ impl ScrollableContainer {
             show_border: true,
             border_style: None,
             border_color: None,
+            title_color: None,
             border_sides: crate::config::BorderSides::default(), // Default: all borders
             bar_color: "#808080".to_string(),
             transparent_background: false,
@@ -150,6 +153,11 @@ impl ScrollableContainer {
         self.items.clear();
         self.item_order.clear();
         self.scroll_offset = 0;
+    }
+
+    /// Set the title color; None makes the title follow the border color.
+    pub fn set_title_color(&mut self, title_color: Option<String>) {
+        self.title_color = title_color;
     }
 
     pub fn set_border_config(
@@ -265,6 +273,13 @@ impl ScrollableContainer {
             // Only set title if label is non-empty (avoids empty title affecting layout)
             if !self.label.is_empty() {
                 block = block.title(self.label.as_str());
+                if let Some(color) = self
+                    .title_color
+                    .as_deref()
+                    .and_then(super::colors::parse_color_to_ratatui)
+                {
+                    block = block.title_style(ratatui::style::Style::default().fg(color));
+                }
             }
 
             inner_area = block.inner(area);

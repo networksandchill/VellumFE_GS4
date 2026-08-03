@@ -80,6 +80,8 @@ pub struct TextWindow {
     show_border: bool,
     border_style: Option<String>,
     border_color: Option<String>,
+    /// Title color override; None paints the title in the border color.
+    title_color: Option<String>,
     border_sides: crate::config::BorderSides,
     background_color: Option<Color>,
     default_text_color: Option<Color>,
@@ -123,6 +125,7 @@ impl Clone for TextWindow {
             show_border: self.show_border,
             border_style: self.border_style.clone(),
             border_color: self.border_color.clone(),
+            title_color: self.title_color.clone(),
             border_sides: self.border_sides.clone(),
             background_color: self.background_color,
             default_text_color: self.default_text_color,
@@ -160,6 +163,7 @@ impl TextWindow {
             show_border: true,
             border_style: None,
             border_color: None,
+            title_color: None,
             border_sides: crate::config::BorderSides::default(),
             background_color: None,
             default_text_color: None,
@@ -202,6 +206,11 @@ impl TextWindow {
         self.show_border = show_border;
         self.border_style = border_style;
         self.border_color = border_color;
+    }
+
+    /// Set the title color; None makes the title follow the border color.
+    pub fn set_title_color(&mut self, title_color: Option<String>) {
+        self.title_color = title_color;
     }
 
     pub fn set_border_sides(&mut self, border_sides: crate::config::BorderSides) {
@@ -1600,6 +1609,7 @@ impl TextWindow {
             border_style,
             &title,
             self.title_position,
+            self.title_color.as_deref().and_then(Self::parse_hex_color),
         );
 
         if total_lines == 0 {

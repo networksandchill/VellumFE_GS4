@@ -461,6 +461,12 @@ fn default_focused_border_color() -> String {
     "#ffff00".to_string() // yellow
 }
 
+/// Window titles default to "unset", which paints them in each window's
+/// border color — the behavior from before titles were separable.
+fn default_title_color_default() -> String {
+    "-".to_string()
+}
+
 fn default_text_color_default() -> String {
     "#ffffff".to_string() // white
 }

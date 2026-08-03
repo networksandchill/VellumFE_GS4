@@ -72,6 +72,7 @@ enum FieldRef {
     MaxCols,
     BgColor,
     BorderColor,
+    TitleColor,
     BorderStyle,
     Streams,
     BufferSize,
@@ -204,6 +205,7 @@ impl FieldRef {
             FieldRef::BorderRight => 19,
             FieldRef::BgColor => 20,
             FieldRef::BorderColor => 21,
+            FieldRef::TitleColor => 122,
             FieldRef::Streams => 22,
             FieldRef::TextColor => 23,
             FieldRef::CursorColor => 24,
@@ -1371,6 +1373,7 @@ pub struct WindowEditor {
     max_cols_input: TextArea<'static>,
     bg_color_input: TextArea<'static>,
     border_color_input: TextArea<'static>,
+    title_color_input: TextArea<'static>,
     streams_input: TextArea<'static>,
     buffer_size_input: TextArea<'static>,
     text_wordwrap: bool,
@@ -1661,6 +1664,7 @@ impl WindowEditor {
             FieldRef::BorderRight,
             FieldRef::BgColor,
             FieldRef::BorderColor,
+            FieldRef::TitleColor,
         ];
 
         // Special section fields appended at end
@@ -1921,6 +1925,10 @@ impl WindowEditor {
         let mut border_color_input = Self::create_textarea();
         if let Some(ref border_color) = window_def.base().border_color {
             border_color_input.insert_str(border_color);
+        }
+        let mut title_color_input = Self::create_textarea();
+        if let Some(ref title_color) = window_def.base().title_color {
+            title_color_input.insert_str(title_color);
         }
 
         let mut streams_input = Self::create_textarea();
@@ -2339,6 +2347,7 @@ impl WindowEditor {
             max_cols_input,
             bg_color_input,
             border_color_input,
+            title_color_input,
             streams_input,
             buffer_size_input,
             text_wordwrap,
@@ -2479,6 +2488,7 @@ impl WindowEditor {
             border_style: "single".to_string(),
             border_sides: BorderSides::default(),
             border_color: None,
+            title_color: None,
             show_title: false,
             title: None,
             title_position: "top-left".to_string(),
@@ -2584,6 +2594,7 @@ impl WindowEditor {
         let max_cols_input = Self::create_textarea();
         let bg_color_input = Self::create_textarea();
         let border_color_input = Self::create_textarea();
+        let title_color_input = Self::create_textarea();
         let streams_input = Self::create_textarea();
         let mut buffer_size_input = Self::create_textarea();
         buffer_size_input.insert_str("10000");
@@ -2691,6 +2702,7 @@ impl WindowEditor {
             max_cols_input,
             bg_color_input,
             border_color_input,
+            title_color_input,
             streams_input,
             buffer_size_input,
             text_wordwrap,
@@ -3505,6 +3517,9 @@ impl WindowEditor {
             }
             _ if id == FieldRef::BgColor.legacy_field_id() => {
                 self.bg_color_input.input(input);
+            }
+            _ if id == FieldRef::TitleColor.legacy_field_id() => {
+                self.title_color_input.input(input);
             }
             _ if id == FieldRef::BorderColor.legacy_field_id() => {
                 self.border_color_input.input(input);
@@ -4559,6 +4574,8 @@ impl WindowEditor {
             Some(self.bg_color_input.lines()[0].to_string()).filter(|s| !s.is_empty());
         self.window_def.base_mut().border_color =
             Some(self.border_color_input.lines()[0].to_string()).filter(|s| !s.is_empty());
+        self.window_def.base_mut().title_color =
+            Some(self.title_color_input.lines()[0].to_string()).filter(|s| !s.is_empty());
         if matches!(self.window_def, crate::config::WindowDef::Progress { .. }) {
             self.window_def.base_mut().text_color =
                 Some(self.text_color_input.lines()[0].to_string()).filter(|s| !s.is_empty());
@@ -6176,6 +6193,20 @@ impl WindowEditor {
             is_focus(FieldRef::BorderColor, self.focused_field),
         );
         self.field_click_areas.push((right_y, right_x, FieldRef::BorderColor));
+        right_y += 1;
+
+        self.render_color_field(
+            FieldRef::TitleColor.legacy_field_id(),
+            "Title",
+            &self.title_color_input,
+            right_x,
+            right_y,
+            8,
+            buf,
+            theme,
+            is_focus(FieldRef::TitleColor, self.focused_field),
+        );
+        self.field_click_areas.push((right_y, right_x, FieldRef::TitleColor));
 
         // Special section
         let special_y = left_y.max(right_y) + 1;
@@ -7663,6 +7694,7 @@ mod tests {
             border_style: "single".to_string(),
             border_sides: crate::config::BorderSides::default(),
             border_color: None,
+            title_color: None,
             show_title: true,
             title: None,
             background_color: None,
@@ -7799,6 +7831,7 @@ mod tests {
                 border_style: "single".to_string(),
                 border_sides: crate::config::BorderSides::default(),
                 border_color: None,
+                title_color: None,
                 show_title: false,
                 title: None,
                 background_color: None,

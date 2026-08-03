@@ -64,6 +64,8 @@ pub struct Dashboard {
     show_border: bool,
     border_style: Option<String>,
     border_color: Option<String>,
+    /// Title color override; None paints the title in the border color.
+    title_color: Option<String>,
     border_sides: crate::config::BorderSides,
     background_color: Option<String>,
     content_align: Option<String>,
@@ -82,6 +84,7 @@ impl Dashboard {
             show_border: true,
             border_style: Some("single".to_string()),
             border_color: Some("#808080".to_string()),
+            title_color: None,
             border_sides: crate::config::BorderSides::default(),
             background_color: None,
             content_align: None,
@@ -130,6 +133,11 @@ impl Dashboard {
 
     pub fn set_content_align(&mut self, align: Option<String>) {
         self.content_align = align;
+    }
+
+    /// Set the title color; None makes the title follow the border color.
+    pub fn set_title_color(&mut self, title_color: Option<String>) {
+        self.title_color = title_color;
     }
 
     pub fn set_border_config(&mut self, show: bool, style: Option<String>, color: Option<String>) {
@@ -198,6 +206,13 @@ impl Dashboard {
             // Only set title if label is non-empty (avoids empty title affecting layout)
             if !self.label.is_empty() {
                 block = block.title(self.label.clone());
+                if let Some(color) = self
+                    .title_color
+                    .as_deref()
+                    .and_then(super::colors::parse_color_to_ratatui)
+                {
+                    block = block.title_style(Style::default().fg(color));
+                }
             }
 
             let inner = block.inner(area);

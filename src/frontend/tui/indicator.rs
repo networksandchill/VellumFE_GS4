@@ -21,6 +21,8 @@ pub struct Indicator {
     show_border: bool,
     border_style: Option<String>,
     border_color: Option<String>,
+    /// Title color override; None paints the title in the border color.
+    title_color: Option<String>,
     border_sides: crate::config::BorderSides,
     off_color: String, // Color when inactive
     on_color: String,  // Color when active
@@ -36,12 +38,18 @@ impl Indicator {
             show_border: false, // Indicators typically don't have borders
             border_style: None,
             border_color: None,
+            title_color: None,
             border_sides: crate::config::BorderSides::default(),
             off_color: "#555555".to_string(), // Dark gray when off
             on_color: "#00ff00".to_string(),  // Green when on
             background_color: None,
             transparent_background: false,
         }
+    }
+
+    /// Set the title color; None makes the title follow the border color.
+    pub fn set_title_color(&mut self, title_color: Option<String>) {
+        self.title_color = title_color;
     }
 
     pub fn set_border_config(
@@ -132,6 +140,13 @@ impl Indicator {
             // Only set title if label is non-empty (avoids empty title affecting layout)
             if !self.label.is_empty() {
                 block = block.title(self.label.as_str());
+                if let Some(color) = self
+                    .title_color
+                    .as_deref()
+                    .and_then(super::colors::parse_color_to_ratatui)
+                {
+                    block = block.title_style(Style::default().fg(color));
+                }
             }
 
             inner_area = block.inner(area);

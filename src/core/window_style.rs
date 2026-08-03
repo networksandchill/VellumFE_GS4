@@ -21,6 +21,10 @@ pub struct WindowColors {
     pub border: Option<String>,
     pub background: Option<String>,
     pub text: Option<String>,
+    /// Title text color, or None to paint the title in `border`. There is
+    /// deliberately no theme fallback: titles have always inherited the
+    /// frame, so only an explicit window or colors.toml value moves them.
+    pub title: Option<String>,
 }
 
 /// Format an RGB triple as a lowercase hex string (matches the TUI's
@@ -88,10 +92,14 @@ pub fn resolve_window_colors(
             ))
         });
 
+    let title = normalize_color(&base.title_color, &parse_color)
+        .or_else(|| ui_layer(ui.user_title_color()));
+
     WindowColors {
         border,
         background,
         text,
+        title,
     }
 }
 
@@ -140,6 +148,38 @@ mod tests {
         base.background_color = background.map(String::from);
         base.text_color = text.map(String::from);
         base
+    }
+
+    #[test]
+    fn title_color_falls_back_to_the_border_not_the_theme() {
+        // Unset everywhere: None means "paint the title in the border color",
+        // which is how titles rendered before they were separable. A theme
+        // fallback here would silently recolor every existing layout.
+        let base = base_with(None, None, None);
+        let ui = UiColors::default();
+        let theme = AppTheme::default();
+        assert_eq!(resolve_window_colors(&base, &ui, &theme, test_parse).title, None);
+
+        // colors.toml supplies a default for every window...
+        let mut ui = UiColors::default();
+        ui.title_color = "#808081".to_string();
+        assert_eq!(
+            resolve_window_colors(&base, &ui, &theme, test_parse).title.as_deref(),
+            Some("#808081")
+        );
+
+        // ...and the window definition overrides it (names resolve too).
+        let mut base = base_with(None, None, None);
+        base.title_color = Some("red".to_string());
+        assert_eq!(
+            resolve_window_colors(&base, &ui, &theme, test_parse).title.as_deref(),
+            Some("#cd0000")
+        );
+
+        // The "-" sentinel reads as unset, back to following the border.
+        base.title_color = Some("-".to_string());
+        let ui = UiColors::default();
+        assert_eq!(resolve_window_colors(&base, &ui, &theme, test_parse).title, None);
     }
 
     #[test]

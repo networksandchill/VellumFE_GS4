@@ -38,6 +38,8 @@ pub struct Compass {
     show_border: bool,
     border_style: Option<String>,
     border_color: Option<Color>,
+    /// Title color override; None paints the title in the border color.
+    title_color: Option<String>,
     border_sides: crate::config::BorderSides,
     active_color: Option<Color>,
     inactive_color: Option<Color>,
@@ -54,6 +56,7 @@ impl Compass {
             show_border: false,
             border_style: None,
             border_color: None,
+            title_color: None,
             border_sides: crate::config::BorderSides::default(),
             active_color: Some(Color::Green),
             inactive_color: Some(Color::DarkGray),
@@ -61,6 +64,11 @@ impl Compass {
             background_color: None,
             transparent_background: false,
         }
+    }
+
+    /// Set the title color; None makes the title follow the border color.
+    pub fn set_title_color(&mut self, title_color: Option<String>) {
+        self.title_color = title_color;
     }
 
     pub fn set_border_config(
@@ -165,6 +173,13 @@ impl Compass {
             // Only set title if label is non-empty (avoids empty title affecting layout)
             if !self.label.is_empty() {
                 block = block.title(self.label.as_str());
+                if let Some(color) = self
+                    .title_color
+                    .as_deref()
+                    .and_then(super::colors::parse_color_to_ratatui)
+                {
+                    block = block.title_style(Style::default().fg(color));
+                }
             }
         }
 

@@ -21,6 +21,8 @@ pub struct Experience {
     generation: u64,
     /// Border color
     border_color: Color,
+    /// Title color override; None paints the title in the border color.
+    title_color: Option<String>,
     /// Text color
     text_color: Color,
     /// Background color (from theme)
@@ -41,12 +43,18 @@ impl Experience {
             lines: Vec::new(),
             generation: 0,
             border_color: Color::White,
+            title_color: None,
             text_color: Color::White,
             background_color: None,
         }
     }
 
     /// Set the border color
+    /// Set the title color; None makes the title follow the border color.
+    pub fn set_title_color(&mut self, title_color: Option<String>) {
+        self.title_color = title_color;
+    }
+
     pub fn set_border_color(&mut self, color: Color) {
         self.border_color = color;
     }
@@ -102,10 +110,17 @@ impl Experience {
         }
 
         // Create block with border and title
-        let block = Block::default()
+        let mut block = Block::default()
             .title(self.title.as_str())
             .borders(Borders::ALL)
             .border_style(Style::default().fg(self.border_color));
+        if let Some(color) = self
+            .title_color
+            .as_deref()
+            .and_then(super::colors::parse_color_to_ratatui)
+        {
+            block = block.title_style(Style::default().fg(color));
+        }
 
         let inner = block.inner(area);
         block.render(area, buf);

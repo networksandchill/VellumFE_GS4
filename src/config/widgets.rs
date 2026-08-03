@@ -329,6 +329,11 @@ pub struct WindowBase {
     pub show_title: bool,
     #[serde(default)]
     pub title: Option<String>,
+    /// Title text color. Unset (None or "-") means the title paints in the
+    /// window's border color, which is how titles have always rendered —
+    /// set this only to break the title away from the frame.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title_color: Option<String>,
     #[serde(default = "default_title_position")]
     pub title_position: String,
     #[serde(default)]

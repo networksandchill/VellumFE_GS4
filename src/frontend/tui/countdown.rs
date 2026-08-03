@@ -21,6 +21,8 @@ pub struct Countdown {
     show_border: bool,
     border_style: Option<String>,
     border_color: Option<String>,
+    /// Title color override; None paints the title in the border color.
+    title_color: Option<String>,
     border_sides: crate::config::BorderSides,
     title_position: TitlePosition,
     text_color: Option<String>,
@@ -39,6 +41,7 @@ impl Countdown {
             show_border: true,
             border_style: None,
             border_color: None,
+            title_color: None,
             border_sides: crate::config::BorderSides::default(),
             title_position: TitlePosition::TopLeft,
             text_color: None,
@@ -51,6 +54,11 @@ impl Countdown {
 
     pub fn set_icon(&mut self, icon: char) {
         self.icon = icon;
+    }
+
+    /// Set the title color; None makes the title follow the border color.
+    pub fn set_title_color(&mut self, title_color: Option<String>) {
+        self.title_color = title_color;
     }
 
     pub fn set_border_config(
@@ -189,6 +197,7 @@ impl Countdown {
             border_style,
             &self.label,
             self.title_position,
+            self.title_color.as_deref().and_then(Self::parse_color_opt),
         );
 
         // If inner area collapsed to zero, keep borders visible but skip content

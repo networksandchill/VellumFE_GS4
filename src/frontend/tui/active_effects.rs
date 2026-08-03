@@ -83,6 +83,11 @@ impl ActiveEffects {
         self.container.restore_scroll_position(offset);
     }
 
+    /// Set the title color; None makes the title follow the border color.
+    pub fn set_title_color(&mut self, title_color: Option<String>) {
+        self.container.set_title_color(title_color);
+    }
+
     pub fn set_border_config(&mut self, show: bool, style: Option<String>, color: Option<String>) {
         self.container.set_border_config(show, style, color);
     }

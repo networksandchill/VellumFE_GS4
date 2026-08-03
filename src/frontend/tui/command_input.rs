@@ -28,6 +28,8 @@ pub struct CommandInput {
     show_border: bool,
     border_style: Option<String>,
     border_color: Option<String>,
+    /// Title color override; None paints the title in the border color.
+    title_color: Option<String>,
     show_title: bool,
     border_sides: BorderSides,
     title: String,
@@ -48,6 +50,7 @@ impl CommandInput {
             show_border: true,
             border_style: None,
             border_color: None,
+            title_color: None,
             show_title: true,
             border_sides: BorderSides::default(),
             title: "Command".to_string(),
@@ -59,6 +62,11 @@ impl CommandInput {
             prompt_icon: None,
             prompt_icon_color: None,
         }
+    }
+
+    /// Set the title color; None makes the title follow the border color.
+    pub fn set_title_color(&mut self, title_color: Option<String>) {
+        self.title_color = title_color;
     }
 
     pub fn set_border_config(
@@ -266,6 +274,9 @@ impl CommandInput {
             border_style,
             &title_text,
             self.title_position,
+            self.title_color
+                .as_deref()
+                .and_then(|c| self.parse_color(c)),
         );
 
         // Calculate horizontal scroll to keep cursor visible (account for optional icon)
@@ -526,6 +537,7 @@ impl CommandInput {
             border_style,
             "", // No title in search mode
             self.title_position,
+            None,
         );
 
         // Build search prompt with match info

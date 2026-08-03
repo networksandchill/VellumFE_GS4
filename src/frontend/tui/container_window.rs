@@ -132,6 +132,11 @@ impl ContainerWindow {
     }
 
     /// Set border configuration
+    /// Set the title color; None makes the title follow the border color.
+    pub fn set_title_color(&mut self, title_color: Option<String>) {
+        self.widget.set_title_color(title_color);
+    }
+
     pub fn set_border_config(&mut self, show_border: bool, border_color: Option<String>) {
         self.widget
             .set_border_config(show_border, None, border_color);

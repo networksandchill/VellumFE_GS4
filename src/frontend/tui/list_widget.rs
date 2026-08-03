@@ -33,6 +33,8 @@ pub struct ListWidget {
     show_border: bool,
     border_style: Option<String>,
     border_color: Option<Color>,
+    /// Title color override; None paints the title in the border color.
+    title_color: Option<String>,
     border_sides: crate::config::BorderSides,
 
     /// Color configuration
@@ -67,6 +69,7 @@ impl ListWidget {
             show_border: true,
             border_style: None,
             border_color: None,
+            title_color: None,
             border_sides: crate::config::BorderSides::default(),
             background_color: None,
             transparent_background: false,
@@ -288,6 +291,11 @@ impl ListWidget {
     }
 
     /// Set border configuration
+    /// Set the title color; None makes the title follow the border color.
+    pub fn set_title_color(&mut self, title_color: Option<String>) {
+        self.title_color = title_color;
+    }
+
     pub fn set_border_config(
         &mut self,
         show_border: bool,
@@ -597,6 +605,13 @@ impl ListWidget {
 
             if !self.title.is_empty() {
                 block = block.title(self.title.as_str());
+                if let Some(color) = self
+                    .title_color
+                    .as_deref()
+                    .and_then(super::colors::parse_color_to_ratatui)
+                {
+                    block = block.title_style(Style::default().fg(color));
+                }
             }
         }
 

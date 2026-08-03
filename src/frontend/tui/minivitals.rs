@@ -58,6 +58,8 @@ pub struct MiniVitals {
     generation: u64,
     /// Border color
     border_color: Color,
+    /// Title color override; None paints the title in the border color.
+    title_color: Option<String>,
     /// Colors for each vital
     health_color: Color,
     mana_color: Color,
@@ -94,6 +96,7 @@ impl MiniVitals {
             spirit_text: String::new(),
             generation: 0,
             border_color: Color::White,
+            title_color: None,
             health_color: Color::Rgb(110, 2, 2),     // #6e0202
             mana_color: Color::Rgb(8, 8, 109),       // #08086d
             stamina_color: Color::Rgb(189, 123, 0),  // #bd7b00
@@ -111,6 +114,11 @@ impl MiniVitals {
     }
 
     /// Set the border color
+    /// Set the title color; None makes the title follow the border color.
+    pub fn set_title_color(&mut self, title_color: Option<String>) {
+        self.title_color = title_color;
+    }
+
     pub fn set_border_color(&mut self, color: Color) {
         self.border_color = color;
     }
@@ -338,6 +346,13 @@ impl MiniVitals {
                 .border_style(Style::default().fg(self.border_color));
             if self.show_title {
                 block = block.title(self.title.as_str());
+                if let Some(color) = self
+                    .title_color
+                    .as_deref()
+                    .and_then(super::colors::parse_color_to_ratatui)
+                {
+                    block = block.title_style(Style::default().fg(color));
+                }
             }
             let inner = block.inner(area);
             block.render(area, buf);

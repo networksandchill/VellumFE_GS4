@@ -52,6 +52,7 @@ pub fn render_block_with_title(
     border_style: Style,
     title: &str,
     title_position: TitlePosition,
+    title_color: Option<Color>,
 ) -> Rect {
     // Compute inner area first so callers always get consistent geometry
     let block = Block::default()
@@ -142,16 +143,65 @@ pub fn render_block_with_title(
         }
     }
 
+    // The title paints in the border color unless the window overrides it.
+    let title_fg = title_color.unwrap_or(border_color);
+
     for (idx, ch) in title_chars.into_iter().enumerate() {
         let x = start_x + idx as u16;
         if x < area.x + area.width {
             buf[(x, title_y)].set_char(ch).set_style(
                 Style::default()
-                    .fg(border_color)
+                    .fg(title_fg)
                     .add_modifier(border_style.add_modifier),
             );
         }
     }
 
     inner
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Render a bordered window titled "Room" and report the fg of the
+    /// title's first cell alongside a plain border cell.
+    fn title_and_border_fg(title_color: Option<Color>) -> (Option<Color>, Option<Color>) {
+        let area = Rect::new(0, 0, 12, 4);
+        let mut buf = Buffer::empty(area);
+        render_block_with_title(
+            area,
+            &mut buf,
+            true,
+            Borders::ALL,
+            &BorderSides::default(),
+            BorderType::Plain,
+            Style::default().fg(Color::Rgb(0x00, 0xff, 0xff)),
+            "Room",
+            TitlePosition::TopLeft,
+            title_color,
+        );
+        // Title starts one cell in (left border); the left edge at y=1 is
+        // border only.
+        (buf[(1, 0)].fg.into(), buf[(0, 1)].fg.into())
+    }
+
+    #[test]
+    fn title_follows_the_border_color_when_unset() {
+        let (title, border) = title_and_border_fg(None);
+        assert_eq!(title, Some(Color::Rgb(0x00, 0xff, 0xff)));
+        assert_eq!(border, Some(Color::Rgb(0x00, 0xff, 0xff)));
+    }
+
+    #[test]
+    fn title_color_overrides_only_the_title() {
+        let grey = Color::Rgb(0x80, 0x80, 0x81);
+        let (title, border) = title_and_border_fg(Some(grey));
+        assert_eq!(title, Some(grey), "title takes the override");
+        assert_eq!(
+            border,
+            Some(Color::Rgb(0x00, 0xff, 0xff)),
+            "the frame keeps its own color"
+        );
+    }
 }
